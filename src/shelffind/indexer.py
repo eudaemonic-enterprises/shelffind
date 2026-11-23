@@ -2,9 +2,10 @@
 """Inventory first. Commit extracted text per document and OCR per page.
 
 Between the inventory and the reading, the files are compared with the documents already known:
-a file that holds what a known document holds joins it and is not read again. Every comparison
-is of content (see `store`), and each is made once for a file as it is: `files.print` and
-`files.sum` keep what was measured.
+a file that holds what a known document holds joins it and is not read again. A comparison is
+a measure of the whole file, its MD5 and SHA-256 (see `store`): the storage of a folder gives
+the first without any reading when the folder has an rclone twin, and a full reading gives
+both. Each is made once for a file as it is; `files.sum` keeps the result.
 """
 import datetime
 import hashlib
@@ -17,10 +18,9 @@ from pathlib import Path
 
 from . import extract, fuzzy, link, store
 
-BLOCK = 64 * 1024
-SAMPLES = 8
 ASKED = 400             # files in one question to the storage of a folder
 CHANGED = "File changed during indexing; run index again"
+FILE = "f.id,f.rel,f.size,f.mtime,f.format"
 
 
 class AnotherDocument(Exception):
@@ -38,44 +38,17 @@ def check_stamp(path, row, same=None):
     return itself
 
 
-def fingerprint(path, fmt):
-    """A key drawn from the content of a file: all of it up to 4 MiB; for a larger file its
-    size, its first and last 64 KiB and eight samples between. Two files of one format with
-    the same key are taken for the same document. The format belongs to the key because a
-    document is read by the reader of its format."""
-    size = path.stat().st_size
-    digest = hashlib.sha256(str(size).encode())
-    with path.open("rb") as source:
-        if size <= store.WHOLE:
-            while block := source.read(1 << 20):
-                digest.update(block)
-        else:
-            step = (size - 2 * BLOCK) // (SAMPLES + 1)
-            for offset in (0, *(BLOCK + number * step for number in range(1, SAMPLES + 1)), size - BLOCK):
-                source.seek(offset)
-                digest.update(source.read(BLOCK))
-    return f"fp:{size}:{digest.hexdigest()[:32]}:{fmt}"
-
-
-def proven(path, row, same=None):
-    """The fingerprint of a file that stayed as the inventory saw it, and itself, while it was
-    read."""
+def whole_checksums(path, row, same=None):
+    """The MD5 and the SHA-256 of a file read in full, which stayed as the inventory saw it,
+    and itself, while it was read."""
     same = check_stamp(path, row, same)
-    key = fingerprint(path, row["format"])
-    check_stamp(path, row, same)
-    return key
-
-
-def whole_checksums(path, row):
-    """The MD5 and the SHA-256 of a file read in full, which stayed as the inventory saw it."""
-    same = check_stamp(path, row)
-    sums = hashlib.md5(), hashlib.sha256()
+    found = hashlib.md5(), hashlib.sha256()
     with path.open("rb") as source:
         while block := source.read(1 << 20):
-            for one in sums:
+            for one in found:
                 one.update(block)
     check_stamp(path, row, same)
-    return [f"md5:{sums[0].hexdigest()}", f"sha256:{sums[1].hexdigest()}"]
+    return [f"md5:{found[0].hexdigest()}", f"sha256:{found[1].hexdigest()}"]
 
 
 def storage(arguments, listing, remote, seconds):
@@ -88,150 +61,144 @@ def storage(arguments, listing, remote, seconds):
     return done.stdout if done.returncode == 0 else None
 
 
+def listed(remote, listing, wanted):
+    """The files of `wanted` that the storage holds with the size and the instant the inventory
+    saw, as address -> (size, instant); None when the storage gives no answer."""
+    told = storage(["lsjson", "-R", "--files-only", "--no-mimetype"], listing, remote, 900)
+    try:
+        entries = json.loads(told) if told is not None else None
+    except ValueError:
+        entries = None
+    if not isinstance(entries, list):
+        return None
+    agreeing = {}
+    for entry in entries:
+        row = wanted.get(entry.get("Path")) if isinstance(entry, dict) else None
+        if row is None or entry.get("Size") != row["size"]:
+            continue
+        try:                                    # an instant with its offset, whatever the time zone it is written in
+            moment = datetime.datetime.fromisoformat(str(entry.get("ModTime")))
+        except ValueError:
+            continue
+        if moment.tzinfo is not None and math.floor(moment.timestamp()) == row["mtime"] // 1_000_000_000:
+            agreeing[entry["Path"]] = (entry["Size"], moment.timestamp())
+    return agreeing
+
+
 def stored_checksums(remote, rows):
     """The MD5 that the storage of a folder gives for some of its files, as address -> key,
     without any of them being read; None when the storage gives no answer at all. A file is
-    answered for only when the storage holds it with the size and the date the inventory saw:
-    a twin that lags behind the folder, or runs ahead of it, says nothing of the file. The
-    storage is believed beyond that: a twin that held other bytes under the same size and the
-    same date would not be noticed."""
+    answered for only when the storage holds it with the size and the instant the inventory
+    saw, before the checksum is asked and after it was given: a twin that lags behind the
+    folder, runs ahead of it, or changes meanwhile says nothing of the file. The storage is
+    believed beyond that: a twin that held other bytes under the same size and the same second
+    would not be noticed."""
     wanted = {row["rel"]: row for row in rows if "\n" not in row["rel"] and "\r" not in row["rel"]}
     if not wanted:
         return {}
     with tempfile.TemporaryDirectory(prefix="shelffind-") as work:
         listing = Path(work) / "files"
         listing.write_text("".join(rel + "\n" for rel in wanted), encoding="utf-8")
-        told = storage(["lsjson", "-R", "--files-only", "--no-mimetype"], listing, remote, 900)
-        try:
-            entries = json.loads(told) if told is not None else None
-        except ValueError:
-            entries = None
-        if not isinstance(entries, list):
+        before = listed(remote, listing, wanted)
+        if before is None:
             return None
-        agreeing = []
-        for entry in entries:
-            row = wanted.get(entry.get("Path")) if isinstance(entry, dict) else None
-            if row is None or entry.get("Size") != row["size"]:
-                continue
-            try:                                # an instant with its offset, whatever the time zone it is written in
-                moment = datetime.datetime.fromisoformat(str(entry.get("ModTime")))
-            except ValueError:
-                continue
-            if moment.tzinfo is not None and math.floor(moment.timestamp()) == row["mtime"] // 1_000_000_000:
-                agreeing.append(entry["Path"])
-        if not agreeing:
+        if not before:
             return {}
-        listing.write_text("".join(rel + "\n" for rel in agreeing), encoding="utf-8")
+        listing.write_text("".join(rel + "\n" for rel in before), encoding="utf-8")
         told = storage(["hashsum", "md5"], listing, remote, 1800)
-    if told is None:
+        after = listed(remote, listing, wanted) if told is not None else None
+    if told is None or after is None:
         return None
     found = {}
     for line in told.splitlines():
         word, _, rel = line.partition("  ")
         word = word.strip().lower()
-        if rel in wanted and len(word) == 32 and all(char in "0123456789abcdef" for char in word):
+        if rel in before and after.get(rel) == before[rel] and len(word) == 32 \
+                and all(char in "0123456789abcdef" for char in word):
             found[rel] = f"md5:{word}"
     return found
 
 
-def joined(db, file, keys):
-    """Keep the checksums `keys` of the whole of a file, taken from its bytes or given by its
-    storage, and let the file join the document that carries one of them.
+def joined(db, file, measured, local=True):
+    """Keep the checksums `measured` of the whole of a file, computed by a full reading
+    (`local`) or given by its storage, and let the file join the document that carries one of
+    them. Returns True when something was learnt. The caller holds the transaction.
 
-    A document speaks for the file it was read from, or, when it was never read, for its files
-    alike. The checksums of such a file become those of the document; should the document carry
-    another checksum of the same kind, on the word of a source, that word is withdrawn when the
-    document was read from this very file, and otherwise the file leaves the document. A file
-    that joined a document read from another file keeps its checksums to itself: they confirm
-    that document once it is known by its own, and until then only show whether the file is
-    some other document. The caller holds the transaction."""
+    A reading outranks the storage, which never replaces what a reading found. What a source
+    said of this very file, and that the measure contradicts, was said of other bytes: it is
+    dropped, and the sources are asked about the file again. A document speaks for the file it
+    was read from, or, when it was never read, for its only file: such a file keeps its
+    document, and every statement to the contrary leaves it. Any other file whose measure
+    contradicts its document leaves the document. And a file that sits, on the word of a
+    source, in a document read from another file which was not measured yet keeps its measure
+    to itself, unless another document is known by it."""
     row = db.execute("SELECT doc,sum,read FROM files WHERE id=?", (file,)).fetchone()
     if row is None:
-        return
-    db.execute("UPDATE files SET sum=? WHERE id=?", (" ".join(sorted({*(row["sum"] or "").split(), *keys})), file))
+        return False
+    known, new = store.sums(row["sum"]), store.sums(" ".join(measured))
+    kept = {**known, **new} if local else {**new, **known}
+    if kept == known:
+        return False
+    mine = [kept[kind] for kind in sorted(kept)]
+    db.execute("UPDATE files SET sum=? WHERE id=?", (" ".join(mine), file))
     doc = row["doc"]
-    if store.against(keys, store.keys_of(db, doc)):
-        if row["read"]:
-            store.disown(db, doc, file, measured=True)
+    refuted = [record["id"] for record in db.execute("SELECT id,keys FROM records WHERE file=?", (file,))
+               if store.against(record["keys"].split(), mine)]
+    if refuted:
+        db.executemany("DELETE FROM records WHERE id=?", [(number,) for number in refuted])
+        db.execute("UPDATE files SET asked='' WHERE id=?", (file,))
+        store.unback(db, doc)
+        store.retitle(db, doc)
+    read = store.has_pages(db, doc)
+    alone = db.execute("SELECT count(*) FROM files WHERE doc=?", (doc,)).fetchone()[0] == 1
+    measured_there = {found["key"].split("@")[0] for found in
+                      db.execute("SELECT key FROM doc_keys WHERE doc=? AND basis='content'", (doc,))}
+    if store.against(mine, store.keys_of(db, doc)):
+        if row["read"] or (alone and not read):
+            store.part(db, doc, file, mine)
         else:
             doc = store.set_apart(db, file)
-    elif not row["read"] and db.execute("SELECT 1 FROM pages WHERE doc=? LIMIT 1", (doc,)).fetchone():
-        marks = ",".join("?" * (2 * len(keys)))
+    elif read and not row["read"] and not measured_there & set(mine):
         fmt = db.execute("SELECT format FROM docs WHERE id=?", (doc,)).fetchone()["format"]
-        elsewhere = db.execute(f"SELECT 1 FROM doc_keys WHERE key IN ({marks}) AND doc!=? LIMIT 1",
-                               (*keys, *(f"{key}@{fmt}" for key in keys), doc)).fetchone()
+        elsewhere = db.execute(f"SELECT 1 FROM doc_keys WHERE key IN ({','.join('?' * len(mine))}) AND doc!=? LIMIT 1",
+                               (*(f"{key}@{fmt}" for key in mine), doc)).fetchone()
         if not elsewhere:
-            return
+            return True
         doc = store.set_apart(db, file)
-    for key in keys:
+    for key in mine:
         doc = store.claim(db, doc, key, "content")
-    # The document is now known by these checksums: a file of it that was measured otherwise
-    # is not that document.
-    for other in db.execute("SELECT id,sum FROM files WHERE doc=? AND id!=? AND sum IS NOT NULL", (doc, file)).fetchall():
-        if store.against(other["sum"].split(), store.keys_of(db, doc)):
-            apart = store.set_apart(db, other["id"])
-            for key in other["sum"].split():
-                apart = store.claim(db, apart, key, "content")
+    store.part_strangers(db, doc)
+    return True
 
 
-def bearers(db, found):
-    """The documents that carry the fingerprint `found`: one as a rule, several when files that
-    agree on every sample of a fingerprint were shown to differ by their checksums."""
-    return [row["doc"] for row in db.execute("SELECT doc FROM doc_keys WHERE key=? OR (key>? AND key<?) ORDER BY key",
-                                             (found, found + "#", found + "$"))]
-
-
-def keep_print(db, doc, found):
-    """Let a document be known by the fingerprint of the file it was read from."""
-    carrying = bearers(db, found)
-    if doc not in carrying:
-        db.execute("INSERT INTO doc_keys(key,doc,basis) VALUES(?,?,'content')",
-                   (f"{found}#{doc}" if carrying else found, doc))
-
-
-def join_known(db, file, found, whole):
-    """Let a file join the document that its fingerprint `found` shows it to be; True when it
-    joined one. When several documents carry that fingerprint, only the checksums of the whole
-    file tell which of them it is: `whole()` reads them, and without it the file waits. The
-    caller holds the transaction."""
-    own = db.execute("SELECT doc FROM files WHERE id=?", (file,)).fetchone()
-    if own is None:
-        return False
-    carrying = bearers(db, found)
-    others = [doc for doc in carrying if doc != own["doc"]]
-    if not others or own["doc"] in carrying:
-        return False
-    if len(others) == 1:
-        return store.merge(db, others[0], own["doc"]) is not None
-    if whole is None:
-        return False
-    joined(db, file, whole())
-    now = db.execute("SELECT doc FROM files WHERE id=?", (file,)).fetchone()
-    return now is not None and now["doc"] in bearers(db, found)
-
-
-COMPARABLE = {
-    "fp": "f.print IS NULL AND k.key LIKE 'fp:%'",
-    "md5": "instr(coalesce(f.sum,''),'md5:')=0 AND k.key LIKE 'md5:%'",
-    "sha256": "instr(coalesce(f.sum,''),'sha256:')=0 AND k.key LIKE 'sha256:%'",
-}
-FILE = "f.id,f.rel,f.size,f.mtime,f.format"
-
-
-def unsettled(db, root, kinds, only=None):
-    """The files of a folder that may be a known document of their size and format, by a
-    comparison of one of `kinds` that has not been made of them yet."""
-    tests = " OR ".join(f"({COMPARABLE[kind]})" for kind in kinds)
+def uncompared(db, root, only=None, storage_only=False):
+    """The files of a folder that may be a known document of their size and format: a document
+    that carries checksums of which the file has none of the same kind, so that the two were
+    never compared. With `storage_only`, those among them that an MD5 would settle."""
+    has = lambda kind: f"EXISTS (SELECT 1 FROM doc_keys k WHERE k.doc=d.id AND k.key LIKE '{kind}:%')"
+    lacks = lambda kind: f"instr(coalesce(f.sum,''),'{kind}:')=0"
+    known = has("md5") if storage_only else "EXISTS (SELECT 1 FROM doc_keys k WHERE k.doc=d.id)"
     rows = db.execute(
-        f"SELECT {FILE} FROM files f WHERE f.root=? AND EXISTS (SELECT 1 FROM docs d JOIN doc_keys k ON k.doc=d.id "
-        f"WHERE d.size=f.size AND d.format=f.format AND d.id!=f.doc AND ({tests})) ORDER BY f.id", (root["id"],)).fetchall()
+        f"SELECT {FILE} FROM files f WHERE f.root=? AND {lacks('md5') if storage_only else '1'} AND EXISTS ("
+        f"SELECT 1 FROM docs d WHERE d.size=f.size AND d.format=f.format AND d.id!=f.doc AND {known} "
+        f"AND ({lacks('md5')} OR NOT {has('md5')}) AND ({lacks('sha256')} OR NOT {has('sha256')})) "
+        "ORDER BY f.id", (root["id"],)).fetchall()
+    return [row for row in rows if only is None or row["rel"] in only]
+
+
+def unmeasured(db, root, only=None, kind="md5"):
+    """The files a document was read from, of which no checksum of `kind` is known yet: the
+    document is recognised by it when the file is moved, and its copies when they come."""
+    rows = db.execute(f"SELECT {FILE} FROM files f WHERE f.root=? AND f.read=1 AND instr(coalesce(f.sum,''),?)=0 "
+                      "ORDER BY f.id", (root["id"], kind + ":")).fetchall()
     return [row for row in rows if only is None or row["rel"] in only]
 
 
 def ask_storage(db, root, rows, progress):
     """Keep what the storage of a folder says of the files `rows`, and let each join the
-    document that carries its checksum. No file is read. Returns False when the storage gave
-    no answer."""
+    document that carries its checksum. No file is read. Returns the number of files of which
+    something was learnt, or None when the storage gave no answer."""
+    learnt = 0
     for start in range(0, len(rows), ASKED):
         batch = rows[start:start + ASKED]
         if len(rows) > ASKED:
@@ -240,7 +207,7 @@ def ask_storage(db, root, rows, progress):
         if told is None:
             progress(f"The storage of {root['name']} gives no answer ({root['remote']}): "
                      "its files will be compared when it does")
-            return False
+            return None
         for row in batch:
             given = told.get(row["rel"])
             if not given:
@@ -250,145 +217,132 @@ def ask_storage(db, root, rows, progress):
             except (OSError, ValueError):
                 continue
             with db:
-                joined(db, row["id"], [given])
-    return True
+                learnt += joined(db, row["id"], [given], local=False)
+    return learnt
 
 
-def prints(db, root, progress, only=None, failed=None):
-    """Take the fingerprint of every file a document was read from and that has none yet, as
-    happens to the documents an earlier version read: the file, unchanged since, is the one
-    proof of what the pages hold. Returns the number of files that could not be read."""
-    failures = 0
-    failed = set() if failed is None else failed
-    bare = db.execute(f"SELECT {FILE} FROM files f WHERE f.root=? AND f.read=1 AND f.print IS NULL AND EXISTS "
-                      "(SELECT 1 FROM pages p WHERE p.doc=f.doc) ORDER BY f.id", (root["id"],)).fetchall()
-    for row in bare:
-        if (only is not None and row["rel"] not in only) or row["id"] in failed:
-            continue
-        path = Path(root["path"]) / row["rel"]
-        try:
-            found = proven(path, row)
-        except ValueError:
-            continue                            # changed since the inventory: the next one will see it
-        except OSError as fault:
-            progress(f"Could not fingerprint {row['rel']}: {fault}")
-            failed.add(row["id"])
-            failures += 1
-            continue
-        with db:
-            now = db.execute("SELECT doc FROM files WHERE id=? AND read=1 AND print IS NULL", (row["id"],)).fetchone()
-            if now is None:
-                continue
-            db.execute("UPDATE files SET print=? WHERE id=?", (found, row["id"]))
-            carried = {key.split("#")[0] for key in store.keys_of(db, now["doc"]) if key.startswith("fp:")}
-            if carried and found not in carried:
-                store.set_apart(db, row["id"])      # the document was read from another file than this one
-            elif not join_known(db, row["id"], found, lambda: whole_checksums(path, row)):
-                keep_print(db, db.execute("SELECT doc FROM files WHERE id=?", (row["id"],)).fetchone()["doc"], found)
-    return failures
-
-
-def settle(db, root, progress, reads=True, only=None, failed=None):
-    """Compare the files of one folder with the documents already known, as far as it has not
-    been done: by the checksum its storage gives, when the folder has an rclone twin, which
-    costs no reading; then, when `reads` allows, by their fingerprint; and, in a folder without
-    a twin, by a full reading for the checksums of the whole file, when a source described a
-    document of that size by them. A file joins the document that has the same content.
-    `only` limits the work to some addresses. Returns the number of files that could not be
-    compared; `failed` collects them, so that one run says a failure once."""
-    failures = 0
-    failed = set() if failed is None else failed
-    # A fingerprint taken earlier may be that of a document read since: no reading is needed
-    # to see it.
-    known = db.execute(f"SELECT {FILE},f.print FROM files f JOIN doc_keys k ON k.key=f.print "
-                       "WHERE f.root=? AND k.doc!=f.doc ORDER BY f.id", (root["id"],)).fetchall()
-    for row in known:
-        if only is None or row["rel"] in only:
-            path = Path(root["path"]) / row["rel"]
-            try:
-                with db:
-                    join_known(db, row["id"], row["print"], (lambda: whole_checksums(path, row)) if reads else None)
-            except (OSError, ValueError):
-                pass                            # it could not be read in full now: another run will tell
-    if root.get("remote"):
-        # Also asked: the checksum of every file a document was read from, so that the file is
-        # recognised after a move without being read again; and that of every large file which
-        # joined a document on the samples of its fingerprint, to confirm that the whole agrees.
-        asked = set()
-        for _ in range(2):                      # what the first answers tell may make other files worth asking about
-            more = db.execute(
-                f"SELECT {FILE} FROM files f WHERE f.root=? AND instr(coalesce(f.sum,''),'md5:')=0 AND (f.read=1 OR "
-                "(f.size>? AND f.print IS NOT NULL AND EXISTS (SELECT 1 FROM doc_keys k WHERE k.doc=f.doc AND "
-                "k.key LIKE 'md5:%'))) ORDER BY f.id", (root["id"], store.WHOLE)).fetchall()
-            wanted = {row["id"]: row for row in unsettled(db, root, ["md5"], only)}
-            wanted.update((row["id"], row) for row in more if only is None or row["rel"] in only)
-            rows = [row for number, row in wanted.items() if number not in asked]
-            if not rows or not ask_storage(db, root, rows, progress):
-                break
-            asked.update(wanted)
-    if not reads:
-        return failures
-
-    def compare(row, measure, keep):
-        nonlocal failures
+def read_in_full(db, root, rows, progress, failed):
+    """Measure the files `rows` by a full reading, and let each join the document that carries
+    its checksums. Returns (files of which something was learnt, files that could not be read)."""
+    learnt = failures = 0
+    for row in rows:
         if row["id"] in failed:
-            return
+            continue
         try:
-            found = measure(Path(root["path"]) / row["rel"], row)
+            measured = whole_checksums(Path(root["path"]) / row["rel"], row)
         except ValueError:
             progress(f"Changed while it was compared: {row['rel']}; run index again")
         except OSError as fault:
             progress(f"Could not compare {row['rel']}: {fault}")
         else:
             with db:
-                keep(row, found)
-            return
+                learnt += joined(db, row["id"], measured)
+            continue
         failed.add(row["id"])
         failures += 1
+    return learnt, failures
 
-    def by_print(row, found):
-        if db.execute("UPDATE files SET print=? WHERE id=? AND print IS NULL", (found, row["id"])).rowcount:
-            path = Path(root["path"]) / row["rel"]
-            join_known(db, row["id"], found, lambda: whole_checksums(path, row))
 
-    for row in unsettled(db, root, ["fp"], only):
-        compare(row, proven, by_print)
-    if not root.get("remote"):
-        # No storage tells the checksums here: the file is read once in full to know them.
-        for row in unsettled(db, root, ["md5", "sha256"], only):
-            compare(row, whole_checksums, lambda row, found: joined(db, row["id"], found))
+def reconsider(db, root, only=None):
+    """A file that sits in a document read from another file keeps its measure to itself (see
+    `joined`). When another document comes to be known by that very measure, the file is that
+    document: it goes there. No reading is needed. Returns the number of files that moved."""
+    moved = 0
+    rows = db.execute(
+        "SELECT f.id,f.rel,f.doc,f.sum,f.format FROM files f WHERE f.root=? AND f.sum IS NOT NULL AND f.read=0 "
+        "AND EXISTS (SELECT 1 FROM pages p WHERE p.doc=f.doc) ORDER BY f.id", (root["id"],)).fetchall()
+    for row in rows:
+        if only is not None and row["rel"] not in only:
+            continue
+        mine = row["sum"].split()
+        names = [f"{key}@{row['format']}" for key in mine]
+        marks = ",".join("?" * len(names))
+        if db.execute(f"SELECT 1 FROM doc_keys WHERE key IN ({marks}) AND doc=? LIMIT 1", (*names, row["doc"])).fetchone():
+            continue                            # its document is known by the same measure
+        if db.execute(f"SELECT 1 FROM doc_keys WHERE key IN ({marks}) AND doc!=? LIMIT 1", (*names, row["doc"])).fetchone():
+            with db:
+                doc = store.set_apart(db, row["id"])
+                for key in mine:
+                    doc = store.claim(db, doc, key, "content")
+                store.part_strangers(db, doc)
+            moved += 1
+    return moved
+
+
+def settle(db, roots, chosen, progress, reads=True, failed=None):
+    """Compare the files of the folders with the documents already known, as far as it has not
+    been done. Where a folder has an rclone twin, its storage is asked first, which costs no
+    reading. Then, when `reads` allows, the files that the storage could not settle, and those
+    of the folders without twin, are read in full, as are, in a folder without twin, the files
+    that documents were read from before checksums were kept. What one folder teaches may
+    settle a file of another: the folders are gone through again while something is learnt.
+    `chosen` limits the work, per folder, to some addresses. Returns the number of files that
+    could not be read; `failed` collects them, so that one run says a failure once."""
+    failures = 0
+    failed = set() if failed is None else failed
+    silent, asked = set(), set()
+    for _ in range(3):
+        learnt = 0
+        for root in roots:
+            only = chosen[root["id"]]
+            learnt += reconsider(db, root, only)
+            if root.get("remote") and root["id"] not in silent:
+                wanted = {row["id"]: row for row in uncompared(db, root, only, storage_only=True) + unmeasured(db, root, only)}
+                rows = [row for number, row in wanted.items() if number not in asked]
+                asked.update(row["id"] for row in rows)
+                told = ask_storage(db, root, rows, progress) if rows else 0
+                if told is None:
+                    silent.add(root["id"])
+                learnt += told or 0
+            if reads:
+                rows = uncompared(db, root, only)
+                if not root.get("remote"):
+                    rows = list({row["id"]: row for row in rows + unmeasured(db, root, only, "sha256")}.values())
+                found, missed = read_in_full(db, root, rows, progress, failed)
+                learnt += found
+                failures += missed
+        if not learnt:
+            break
     return failures
+
+
+def forget(db, file):
+    """A file was replaced while it was read: what was measured of it and said of it was of
+    the file that is gone. It starts again as a document of its own."""
+    db.execute("UPDATE records SET file=NULL WHERE file=?", (file,))
+    store.set_apart(db, file)
+    db.execute("UPDATE files SET sum=NULL,asked='',read=0 WHERE id=?", (file,))
 
 
 def update_text(db, root, row, ocr, languages):
     """Read one document through one of its files. Returns False when the file turned out to be
-    a document already read, in which case nothing was extracted."""
+    a document that needs no reading, in which case nothing was extracted."""
     path = Path(root["path"]) / row["rel"]
     doc = row["doc"]
-    file = db.execute("SELECT id,read FROM files WHERE root=? AND rel=? AND doc=?", (root["id"], row["rel"], doc)).fetchone()
+    file = db.execute("SELECT id,read,sum FROM files WHERE root=? AND rel=? AND doc=?", (root["id"], row["rel"], doc)).fetchone()
     if file is None:
         raise AnotherDocument(row["rel"])
     same = check_stamp(path, row)
-    key = proven(path, row, same)
-    with db:
-        db.execute("UPDATE files SET print=? WHERE id=?", (key, file["id"]))
-    carried = {name.split("#")[0] for name in store.keys_of(db, doc) if name.startswith("fp:")}
-    if carried and key not in carried:
-        # The document is known by the fingerprint of the file it was read from, and this file
-        # has another: whatever put the two together, this file is not that document.
+    if not root.get("remote") and "sha256:" not in (file["sum"] or ""):
+        # No storage tells what this file holds: it is measured by a full reading, once, and
+        # may then turn out to be a document already known.
+        measured = whole_checksums(path, row, same)
         with db:
-            store.set_apart(db, file["id"])
-        raise AnotherDocument(row["rel"])
-    if ocr:
-        if not carried and not file["read"]:
-            raise ValueError("The file its pages were read from is not at hand, and no other is proved to be the same")
-    else:
-        with db:
-            merged = join_known(db, file["id"], key, lambda: whole_checksums(path, row))
-        if merged:
-            doc = db.execute("SELECT doc FROM files WHERE id=?", (file["id"],)).fetchone()["doc"]
-            if db.execute("SELECT 1 FROM pages WHERE doc=? LIMIT 1", (doc,)).fetchone():
+            joined(db, file["id"], measured)
+        now = db.execute("SELECT f.read,f.sum,f.doc,d.state FROM files f JOIN docs d ON d.id=f.doc WHERE f.id=?",
+                         (file["id"],)).fetchone()
+        if now["doc"] != doc:
+            if ocr or store.has_pages(db, now["doc"]) or now["state"] not in ("pending", "error"):
                 return False
+            doc = now["doc"]
+        file = {"id": file["id"], "read": now["read"], "sum": now["sum"]}
+    if ocr and not file["read"]:
+        # Pages are recognised only through a file that holds what the document was read from:
+        # the file it was read from, or one that a measure shows to be the same.
+        content = {found["key"].split("@")[0] for found in
+                   db.execute("SELECT key FROM doc_keys WHERE doc=? AND basis='content'", (doc,))}
+        if not content & set((file["sum"] or "").split()):
+            raise ValueError("The file its pages were read from is not at hand, and no measure shows this one to be the same")
     with extract.document(path, row["format"]) as (source, fmt, work):
         if ocr:
             blanks = db.execute("SELECT id,page FROM pages WHERE doc=? AND needs_ocr=1 "
@@ -401,8 +355,6 @@ def update_text(db, root, row, ocr, languages):
                     fuzzy.remember_more(db, (text,))
             with db:
                 db.execute("UPDATE docs SET state='indexed',error=NULL WHERE id=?", (doc,))
-                keep_print(db, doc, key)
-                db.execute("UPDATE files SET read=1 WHERE id=?", (file["id"],))
             return True
         pages = list(extract.passages(source, fmt, work))
         if not pages:
@@ -415,8 +367,7 @@ def update_text(db, root, row, ocr, languages):
             db.executemany("INSERT INTO pages(doc,page,section,ztext,needs_ocr) VALUES(?,?,?,?,?)",
                            [(doc, p.page, p.section, store.deflate(p.text), p.needs_ocr) for p in pages])
             db.execute("UPDATE docs SET state=?,error=NULL WHERE id=?", (state, doc))
-            # The fingerprint is kept once the reading has succeeded, and not before.
-            keep_print(db, doc, key)
+            db.execute("UPDATE files SET read=0 WHERE doc=?", (doc,))
             db.execute("UPDATE files SET read=1 WHERE id=?", (file["id"],))
     return True
 
@@ -429,8 +380,9 @@ def build(db, directory, selected, *, names_only=False, ocr=False, languages="en
     `progress(text)` receives the messages; `on_document(seen, total, name)` is called before
     each waiting document is taken up; `relink` asks the sources about every file again. With
     `names_only` no file is opened: the files are compared only as far as the storage of a
-    folder tells their checksums. Returns the number of documents read, a file found to be a
-    document already read not being one, and the number of problems."""
+    folder tells their checksums. Returns the number of documents on which a reading was tried,
+    which `limit` caps, a file found to need no reading not being one, and the number of
+    problems."""
     done = failures = 0
     ready = []
     with store.index_lock(directory):
@@ -453,15 +405,11 @@ def build(db, directory, selected, *, names_only=False, ocr=False, languages="en
         chosen = {root["id"]: {str(p.relative_to(root["path"])) for p in paths if p.is_relative_to(root["path"])}
                   if paths else None for root in ready}
         failed = set()
-        if not names_only:
-            # First of all, so that the comparisons that follow know the documents by them.
-            for root in ready:
-                failures += prints(db, root, progress, chosen[root["id"]], failed)
-        for root in ready:
-            failures += settle(db, root, progress, not names_only, chosen[root["id"]], failed)
+        failures += settle(db, ready, chosen, progress, not names_only, failed)
         if link.link(db, directory, ready, progress, everything=relink):
-            for root in ready:                  # what the sources said may show more files to be known documents
-                failures += settle(db, root, progress, not names_only, chosen[root["id"]], failed)
+            # What the sources said may show more files to be known documents.
+            failures += settle(db, ready, chosen, progress, not names_only, failed)
+        link.cover(db, directory)
         if names_only:
             return done, failures
         # A pass takes a snapshot of its queue so failures cannot retry in a tight loop.
@@ -513,6 +461,9 @@ def build(db, directory, selected, *, names_only=False, ocr=False, languages="en
                         offline.add(root["id"])
                         failures += 1
                         continue
+                    if str(exc) == CHANGED:     # another file stands in its place: nothing known of it holds
+                        with db:
+                            forget(db, row["id"])
                     fault, tried = fault or (row["rel"], exc), True
             if fault:
                 with db:
@@ -527,7 +478,6 @@ def build(db, directory, selected, *, names_only=False, ocr=False, languages="en
         if done:
             # What was just read may be what other files hold, and its checksum is asked where
             # a storage tells it: neither needs a reading.
-            for root in ready:
-                if root["id"] not in offline:
-                    settle(db, root, progress, False, chosen[root["id"]], failed)
+            settle(db, [root for root in ready if root["id"] not in offline], chosen, progress, False, failed)
+            link.cover(db, directory)
     return done, failures

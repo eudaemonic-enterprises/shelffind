@@ -84,7 +84,7 @@ def resolve(request):
 def act(request):
     return {{"result": "copy", "text": request["id"].lower() + "-key"}}
 
-serve(name="Library", search=search, identify=identify, pages=pages, resolve=resolve, act=act, text=True,
+serve(name="Library", search=search, identify=identify, pages=pages, resolve=resolve, act=act, text=STATE.get("text", True),
       network=STATE.get("network", False),
       actions=[{{"name": "cite", "label": "Copy the citation key", "result": "copy"}}])
 """
@@ -151,7 +151,7 @@ class Linked(Shelf):
         self.assertEqual([(hit["name"], hit["title"], hit["byline"], hit["year"]) for hit in found],
                          [("scan-0042.txt", "Linear and Nonlinear Waves", "G. B. Whitham", "1974")])
         keys = {row[0] for row in self.db.execute("SELECT key FROM doc_keys WHERE basis='source'")}
-        self.assertEqual(keys, {self.checksum})
+        self.assertEqual(keys, {self.checksum + "@txt"})    # kept under the format of the document
         self.assertEqual(self.build(), (0, 0))              # nothing more to ask, nothing to read
         code, out, _ = self.run_cli("status", "--json")
         self.assertEqual(json.loads(out)[0]["states"], {"covered": 1, "indexed": 1})
@@ -250,8 +250,7 @@ class Linked(Shelf):
         questions = self.twin()
         self.build()
         target = self.moved()
-        with patch("shelffind.indexer.fingerprint", side_effect=AssertionError("the file was opened")), \
-                patch("shelffind.indexer.whole_checksums", side_effect=AssertionError("the file was opened")):
+        with patch("shelffind.indexer.whole_checksums", side_effect=AssertionError("the file was opened")):
             self.assertEqual(self.build(names_only=True), (0, 0))       # an inventory alone is enough
         self.assertEqual(self.states()[target.name], "covered")
         self.assertEqual(search(self.db, "whitham")[0]["path"], str(target))
@@ -265,21 +264,63 @@ class Linked(Shelf):
         self.catalogue()
         self.build()
         self.assertEqual(self.states()["scan-0042.txt"], "indexed")
-        with self.db:                                       # as an earlier version left it: pages, no fingerprint
-            self.db.execute("DELETE FROM doc_keys WHERE key LIKE 'fp:%'")
-            self.db.execute("UPDATE files SET print=NULL")
+        with self.db:                                       # as an earlier version left it: pages, nothing measured
+            self.db.execute("DELETE FROM doc_keys")
+            self.db.execute("UPDATE files SET sum=NULL")
         copy = self.root / "Mechanics" / "elsewhere.txt"    # the same bytes under a name the library knows
         copy.parent.mkdir()
         copy.write_text(BOOK)
         os.utime(copy, (1_800_000_000, 1_800_000_000))
         self.read.clear()
-        self.assertEqual(self.build(), (0, 0))              # one run: the fingerprint, the comparison, the record
+        self.assertEqual(self.build(), (0, 0))              # one run: the measures, the comparison, the record
         self.assertEqual(self.read, [])
         self.book.unlink()
         self.assertEqual(self.build(), (0, 0))
         found = search(self.db, "chapter eleven")           # the text read long ago is still that of the copy
         self.assertEqual([(hit["path"], hit["title"]) for hit in found], [(str(copy), "Linear and Nonlinear Waves")])
         self.assertEqual(self.read, [])
+
+    def test_a_file_the_library_did_not_know_is_asked_about_again_though_its_copy_was_known(self):
+        copy = self.root / "Desk" / "tome.txt"              # the same bytes under a name the library does not know
+        copy.parent.mkdir()
+        copy.write_text(BOOK)
+        self.assertEqual(self.build(), (1, 0))
+        self.assertEqual(self.states()["tome.txt"], "covered")          # measured, it is the book of the library
+        said = lambda: sorted(row[0] for row in self.db.execute(
+            "SELECT f.name FROM records r JOIN files f ON f.id=r.file WHERE r.source='library'"))
+        self.assertEqual(said(), ["scan-0042.txt"])
+        self.assertEqual(self.build(), (0, 0))
+        self.assertEqual(said(), ["scan-0042.txt"])         # not asked twice within the day
+        with self.db:
+            self.db.execute("UPDATE meta SET value='0' WHERE key='asked:library'")
+        self.assertEqual(self.build(), (0, 0))              # asked again, with its own checksums this time
+        self.assertEqual(said(), ["scan-0042.txt", "tome.txt"])
+        self.assertEqual(self.asked()["tome.txt"][-1], self.checksum)
+
+    def test_a_card_without_text_about_a_copy_does_not_cost_the_document_its_text(self):
+        copy = self.root / "Desk" / "tome.txt"
+        copy.parent.mkdir()
+        copy.write_text(BOOK)
+        self.works.append({"id": "W3", "title": "A Card In A Catalogue", "byline": "Nobody", "year": 1999,
+                           "file": "tome.txt", "size": len(BOOK)})      # no pages: the source holds no text for it
+        self.catalogue()
+        self.assertEqual(self.build(), (1, 0))              # only the notes are read
+        self.assertEqual(self.read, ["notes.txt"])
+        self.assertEqual((self.states()["scan-0042.txt"], self.states()["tome.txt"]), ("covered", "covered"))
+        self.assertEqual(self.db.execute("SELECT count(DISTINCT doc) FROM files WHERE name!='notes.txt'").fetchone()[0], 1)
+        rows, _ = self.find("dispersion relation")
+        self.assertEqual([hit["title"] for hit in rows], ["Linear and Nonlinear Waves"])
+        with patch("shelffind.extract.recognize", side_effect=AssertionError("recognised for nothing")):
+            self.assertEqual(self.build(ocr=True), (0, 0))
+
+    def test_a_source_that_says_it_holds_no_text_any_more_gives_the_reading_back(self):
+        self.build()
+        self.assertEqual(self.states()["scan-0042.txt"], "covered")
+        self.catalogue(text=False)
+        os.utime(self.folder / "library.py", (1_900_000_000, 1_900_000_000))    # it is asked again what it can do
+        self.read.clear()
+        self.assertEqual(self.build(), (1, 0))
+        self.assertEqual((self.read, self.states()["scan-0042.txt"]), (["scan-0042.txt"], "indexed"))
 
     def test_a_document_partly_read_that_the_library_holds_waits_for_no_recognition(self):
         self.works[0].update(file="elsewhere.txt")

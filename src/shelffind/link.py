@@ -2,14 +2,14 @@
 """Which files of the folders the sources know.
 
 After an inventory, every source that answers `identify` is asked about the files it has not
-been asked about yet. What it says is kept as a record of the document: the true title and
-authors, which then find the file, its checksums, by which two files are known to be the same
-document, and whether the source holds its text, in which case ShelfFind does not read it.
+been asked about yet. What it says of a file is kept as a record, with that very file: the
+true title and authors, which then find the file, the checksums of the work, by which two files
+are known to be the same document, and whether the source holds its text, in which case
+ShelfFind does not read it.
 
-A source is asked about each file, also about one that joined a document it knows already: its
-answer may show that the file is another work. What a source says is its word, and is taken as
-such: it joins files into one document, but never against what ShelfFind itself measured of a
-file (see `store`).
+What a source says is its word, and is taken as such (see `store`): it joins a file that was
+never read to a document, never two documents that were both read, and never against what was
+measured of a file.
 """
 import json
 import re
@@ -29,92 +29,135 @@ SUM = re.compile(r"(?:md5:[0-9a-f]{32}|sha256:[0-9a-f]{64})\Z")
 ASKED = "instr(' '||asked||' ',?)"      # with ' NAME ' for parameter: whether the source NAME was asked about a file
 
 
-def retitle(db, doc):
-    """Give a document the title and the authors of what the sources say of it now."""
-    told = db.execute("SELECT title,byline,year FROM records WHERE doc=? AND coalesce(title,'')!='' "
-                      "ORDER BY source LIMIT 1", (doc,)).fetchone()
-    db.execute("UPDATE docs SET title=?,byline=?,year=? WHERE id=?",
-               (told["title"] if told else None, told["byline"] if told else None, told["year"] if told else None, doc))
-    store.describe(db, doc)
+def checksums(record):
+    """The checksums a record gives, when they are well formed and one of each kind at most:
+    two checksums of one kind in one record describe no file."""
+    given = [key for key in record.get("keys") or () if isinstance(key, str) and SUM.match(key)]
+    return given if len({key.split(":", 1)[0] for key in given}) == len(given) else []
+
+
+def withdraw(db, file, name):
+    """Drop what the source `name` said of the file `file`, with the checksums that only its
+    word had given to the document."""
+    said = db.execute("SELECT doc FROM records WHERE file=? AND source=?", (file, name)).fetchone()
+    if said is not None:
+        db.execute("DELETE FROM records WHERE file=? AND source=?", (file, name))
+        store.unback(db, said["doc"])
+        store.retitle(db, said["doc"])
 
 
 def attach(db, file, name, record, known):
     """Keep what the source `name` says of the file `file`: that it is the work `record`.
-    Returns False when ShelfFind's own measure of the file says otherwise, and nothing is kept.
+    Returns False when the record is not kept.
 
-    The checksums of the record speak of the bytes of this file. A document that carries them
-    already is the same document, and the file joins it. A file whose own checksum, taken from
-    its bytes or given by its storage, differs from the record's is not that work, whatever its
-    address suggests. And a document that carries another checksum of the same kind, on the
-    strength of its other files, does not describe this file, which then gets a document of its
-    own; unless the document was read from this very file, in which case it stays the file's
-    and the earlier word is withdrawn. Nor is the word about a file taken for a word about a
-    document read from another file, unless the two are known to be the same byte for byte."""
+    The checksums of the record speak of the bytes of this file. A file whose own checksum,
+    measured by a reading or given by its storage, differs from the record's is not that work,
+    whatever its address suggests, and neither is a file of which another source says
+    otherwise: a measure will tell which of the two is right. A document that carries another
+    checksum of the same kind, on the strength of its other files, does not describe this file,
+    which then gets a document of its own; unless the document was read from this very file, in
+    which case it stays the file's, and what was said of the others leaves with them. The file
+    then joins the document that the checksums of the record name, if there is one."""
     row = db.execute("SELECT doc,sum,read FROM files WHERE id=?", (file,)).fetchone()
     if row is None:
         return False
-    keys = [key for key in record.get("keys") or () if isinstance(key, str) and SUM.match(key)]
+    keys = checksums(record)
     if store.against(keys, (row["sum"] or "").split()):
         return False
+    for other in db.execute("SELECT keys FROM records WHERE file=? AND source!=?", (file, name)):
+        if store.against(keys, other["keys"].split()):
+            return False
+    withdraw(db, file, name)                    # what the same source said of the file before is replaced
     doc = row["doc"]
-    theirs = store.keys_of(db, doc)
-    if store.against(keys, theirs):
-        if row["read"]:                         # the document is this file's: what was said of it before goes
-            store.disown(db, doc, file)
+    if store.against(keys, store.keys_of(db, doc)):
+        if row["read"]:
+            store.part(db, doc, file, keys)
         else:
             doc = store.set_apart(db, file)
-    elif any(key not in theirs for key in keys) and not store.same_whole(db, file, doc) \
-            and db.execute("SELECT 1 FROM pages WHERE doc=? LIMIT 1", (doc,)).fetchone():
-        # The document was read from another file, with which this one is only known to share
-        # the samples of a fingerprint: what is said of this file is not said of that one. The
-        # two are one again as soon as the same is said, or measured, of the other.
-        doc = store.set_apart(db, file)
     for key in keys:
-        doc = store.claim(db, doc, key, "source")           # the same content at two addresses is one document
+        doc = store.claim(db, doc, key, "source")
+    doc = db.execute("SELECT doc FROM files WHERE id=?", (file,)).fetchone()["doc"]
     title, byline = record.get("title") or "", record.get("byline") or ""
     year = "" if record.get("year") is None else str(record["year"])
-    db.execute("INSERT OR REPLACE INTO records(doc,source,ref,title,byline,year,flags,basis,text,local) "
-               "VALUES(?,?,?,?,?,?,?,?,?,?)",
-               (doc, name, record["id"], title, byline, year, json.dumps(record.get("flags") or []),
+    db.execute("INSERT INTO records(doc,file,source,ref,keys,title,byline,year,flags,basis,text,local) "
+               "VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",
+               (doc, file, name, record["id"], " ".join(keys), title, byline, year, json.dumps(record.get("flags") or []),
                 record.get("basis") or "", int(record.get("text") is True), record.get("path")))
-    retitle(db, doc)
+    store.retitle(db, doc)
+    store.part_strangers(db, doc)
     if title:
         fuzzy.remember_names(db, (title, byline), known)
     return True
 
 
-def link(db, directory, selected, progress=lambda text: None, everything=False):
-    """Ask the sources about the files of the folders `selected` that they have not been asked
-    about, or about all of them with `everything`. Returns the number of files they recognised."""
-    try:
-        programs = sources.registered(directory)
-    except (OSError, ValueError) as fault:
-        progress(f"Source configuration: {fault}")
-        return 0
-    usable = {}
+def usable(directory, progress=lambda text: None):
+    """The sources of the settings; those that tell which files they know, as name -> whether
+    the text they hold is relied upon; and the trusted ones that say, at this moment, that they
+    hold no text."""
+    programs = sources.registered(directory)
+    found, without = {}, set()
     for name, argv in programs.items():
+        wanted = sources.policy(name)
         try:
             caps = sources.abilities(directory, name, argv)
         except (OSError, ValueError) as fault:
             progress(f"{name}: {fault}")
             continue
-        wanted = sources.policy(name)
+        if not caps["text"] and wanted["text"] == "trust":
+            without.add(name)
         if "identify" in caps["ops"] and not caps["network"] and wanted["identify"]:
-            usable[name] = caps["text"] and wanted["text"] == "trust"
+            found[name] = caps["text"] and wanted["text"] == "trust"
+    return programs, found, without
+
+
+def cover(db, directory):
+    """Leave to the sources the text they hold, and take back what they no longer answer for.
+    The text of a document is left to a source that holds it and is relied upon. It is the
+    reader's again once that source is no longer registered or relied upon, or says itself
+    that it holds no text. A source that merely fails to answer at this moment keeps its
+    documents: a passing fault must not start a reading of thousands."""
+    try:
+        programs, found, without = usable(directory)
+    except (OSError, ValueError):
+        return
+    relied_upon = [name for name in programs if sources.policy(name)["text"] == "trust" and name not in without]
+    holding = [name for name, relied in found.items() if relied]
+    with db:
+        db.execute(f"UPDATE docs SET state={RESTORED} WHERE state='covered' AND NOT EXISTS (SELECT 1 FROM records r "
+                   f"WHERE r.doc=docs.id AND r.text=1 AND r.source IN ({','.join('?' * len(relied_upon))}))",
+                   relied_upon)
+        db.execute(f"UPDATE docs SET state='covered',error=NULL WHERE state IN ({','.join('?' * len(WAITING))}) "
+                   f"AND EXISTS (SELECT 1 FROM records r WHERE r.doc=docs.id AND r.text=1 AND r.source IN "
+                   f"({','.join('?' * len(holding))}))", (*WAITING, *holding))
+
+
+def link(db, directory, selected, progress=lambda text: None, everything=False):
+    """Ask the sources about the files of the folders `selected` that they have not been asked
+    about, or about all the files of these folders with `everything`. A file that a source no
+    longer recognises loses what that source said of it. Returns the number of files
+    recognised."""
+    try:
+        _, found, _ = usable(directory, progress)
+    except (OSError, ValueError) as fault:
+        progress(f"Source configuration: {fault}")
+        return 0
     recognised = 0
     known = set()
-    for name in usable:
+    places = [root["id"] for root in selected]
+    among = f"root IN ({','.join('?' * len(places))})"
+    for name in found:
         mark = f" {name} "
+        clear = f"UPDATE files SET asked=trim(replace(' '||asked||' ',?,' ')) WHERE {ASKED}>0 AND {among}"
         last = db.execute("SELECT value FROM meta WHERE key=?", (f"asked:{name}",)).fetchone()
-        if everything or last is None or time.time() - float(last["value"]) > AGAIN:
-            # The files it did not know are asked about again, since it may have learnt them;
-            # with `everything`, all the files are.
-            with db:
-                db.execute(f"UPDATE files SET asked=trim(replace(' '||asked||' ',?,' ')) WHERE {ASKED}>0"
-                           + ("" if everything else " AND NOT EXISTS (SELECT 1 FROM records r WHERE r.doc=files.doc "
-                                                    "AND r.source=?)"), (mark, mark) if everything else (mark, mark, name))
+        with db:
+            if everything:
+                db.execute(clear, (mark, mark, *places))
+            elif last is None or time.time() - float(last["value"]) > AGAIN:
+                # The files it did not know are asked about again, since it may have learnt them.
+                db.execute(clear + " AND NOT EXISTS (SELECT 1 FROM records r WHERE r.file=files.id AND r.source=?)",
+                           (mark, mark, *places, name))
                 db.execute("INSERT OR REPLACE INTO meta(key,value) VALUES(?,?)", (f"asked:{name}", str(time.time())))
-        spoken, answering = [], True
+        spoken, answering = 0, True
         for root in selected:
             if not answering:
                 break
@@ -122,8 +165,8 @@ def link(db, directory, selected, progress=lambda text: None, everything=False):
                                  (root["id"], mark)).fetchall()
             for start in range(0, len(waiting), BATCH):
                 batch = waiting[start:start + BATCH]
-                # With each file goes what ShelfFind measured of that very file, and nothing of
-                # the other files of its document.
+                # With each file goes what was measured of that very file, and nothing of the
+                # other files of its document.
                 files = [{"n": number, "path": str(Path(root["path"]) / row["rel"]), "size": row["size"],
                           "mtime": row["mtime"] // 1_000_000_000, "keys": (row["sum"] or "").split()}
                          for number, row in enumerate(batch)]
@@ -138,37 +181,14 @@ def link(db, directory, selected, progress=lambda text: None, everything=False):
                     for record in answer["records"]:
                         if 0 <= record["n"] < len(batch) and record["n"] not in seen:
                             seen.add(record["n"])
-                            if attach(db, batch[record["n"]]["id"], name, record, known):
-                                spoken.append(batch[record["n"]]["id"])
+                            spoken += attach(db, batch[record["n"]]["id"], name, record, known)
+                    for number, row in enumerate(batch):
+                        if number not in seen:      # what it said of the file before, it says no more
+                            withdraw(db, row["id"], name)
                     db.executemany(f"UPDATE files SET asked=trim(asked||' '||?) WHERE id=? AND {ASKED}=0",
                                    [(name, row["id"], mark) for row in batch])
-        if everything and answering:
-            # Asked about every file again, the source no longer knows some works it knew: what
-            # it said of a document is withdrawn when it was asked about every file of the
-            # document and recognised none.
-            with db:
-                held = {row["doc"] for file in spoken for row in db.execute("SELECT doc FROM files WHERE id=?", (file,))}
-                stale = [row["doc"] for row in db.execute(
-                    f"SELECT r.doc FROM records r WHERE r.source=? AND EXISTS (SELECT 1 FROM files f WHERE f.doc=r.doc) "
-                    f"AND NOT EXISTS (SELECT 1 FROM files f WHERE f.doc=r.doc AND {ASKED}=0)", (name, mark))]
-                for doc in stale:
-                    if doc not in held:
-                        db.execute("DELETE FROM records WHERE doc=? AND source=?", (doc, name))
-                        retitle(db, doc)
         if spoken:
-            progress(f"{name}: {len(spoken):,} files recognised")
-        recognised += len(spoken)
-    # The text of a document is left to a source that holds it and is relied upon; and it is the
-    # reader's again once that source is no longer registered or no longer relied upon. A source
-    # that merely fails to answer at this moment keeps its documents: a passing fault must not
-    # start a reading of thousands.
-    relied_upon = [name for name in programs if sources.policy(name)["text"] == "trust"]
-    holding = [name for name, relied in usable.items() if relied]
-    with db:
-        db.execute(f"UPDATE docs SET state={RESTORED} WHERE state='covered' AND NOT EXISTS (SELECT 1 FROM records r "
-                   f"WHERE r.doc=docs.id AND r.text=1 AND r.source IN ({','.join('?' * len(relied_upon))}))",
-                   relied_upon)
-        db.execute(f"UPDATE docs SET state='covered',error=NULL WHERE state IN ({','.join('?' * len(WAITING))}) "
-                   f"AND EXISTS (SELECT 1 FROM records r WHERE r.doc=docs.id AND r.text=1 AND r.source IN "
-                   f"({','.join('?' * len(holding))}))", (*WAITING, *holding))
+            progress(f"{name}: {spoken:,} files recognised")
+        recognised += spoken
+    cover(db, directory)
     return recognised

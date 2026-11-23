@@ -141,14 +141,14 @@ class Conversion(Earlier):
         self.assertEqual([(hit["path"], hit["page"], len(hit["copies"])) for hit in found],
                          [(str(self.root / "Desk/TideTables.txt"), 2, 0)])
         self.assertEqual(db.execute("SELECT count(*),sum(needs_ocr) FROM pages").fetchone()[:], (5, 1))
-        # The first reading run takes the fingerprints of the files that were read: the two
-        # copies, which hold the same bytes, become one document with the pages read in full.
+        # The first reading run measures the files that were read: the two copies, which hold
+        # the same bytes, become one document with the pages read in full.
         with patch("shelffind.extract.passages", side_effect=AssertionError("read again")):
             indexer.build(db, self.data, store.roots(db), limit=0, progress=lambda _: None)
         found = search(db, "spring tide")
         self.assertEqual([(hit["name"], hit["page"], len(hit["copies"])) for hit in found], [("TideTables.txt", 2, 1)])
         self.assertEqual(db.execute("SELECT count(*),sum(needs_ocr) FROM pages").fetchone()[:], (3, 0))
-        self.assertEqual(db.execute("SELECT count(*) FROM files WHERE read=1 AND print IS NULL").fetchone()[0], 0)
+        self.assertEqual(db.execute("SELECT count(*) FROM files WHERE read=1 AND sum IS NULL").fetchone()[0], 0)
         self.assertEqual(search(db, "wind", where="text")[0]["name"], "notes.txt")
         self.assertEqual([hit["name"] for hit in search(db, "windroses")], ["WindRoses.txt"])
         self.assertEqual(search(db, "harbuors")[0]["name"], "TideTables.txt")       # the spellings follow
@@ -258,6 +258,52 @@ class Conversion(Earlier):
         self.assertTrue((self.data / store.EARLIER).exists())
         panel.close()
         self.assertGreater(migrate.discard_old(self.data), 0)
+
+    def test_an_old_index_kept_in_another_mode_is_neither_converted_nor_deleted(self):
+        # Version 0.2 keeps its index in the write-ahead mode, the one in which a program that
+        # still has the index open cannot go unseen.
+        old = self.earlier()
+        self.assertEqual(old.execute("PRAGMA journal_mode=DELETE").fetchone()[0], "delete")
+        old.close()
+        with self.assertRaises(ValueError) as refused:
+            migrate.upgrade(self.data)
+        self.assertIn("journal mode", str(refused.exception))
+        self.assertEqual(sorted(p.name for p in self.data.glob("index2*")), [])
+        self.assertEqual(self.old_state()[0], 1)
+        old = self.earlier()
+        old.execute("PRAGMA journal_mode=WAL")
+        old.close()
+        self.converted()
+        old = self.earlier()
+        old.execute("PRAGMA journal_mode=DELETE")
+        old.close()
+        with self.assertRaises(ValueError) as kept:
+            migrate.discard_old(self.data)
+        self.assertIn("journal mode", str(kept.exception))
+        self.assertTrue((self.data / store.EARLIER).exists())
+
+    def test_a_file_under_the_old_name_that_is_no_index_of_ours_is_not_hidden_by_a_new_one(self):
+        for version in (0, 37):
+            other = self.home / f"elsewhere{version}"
+            other.mkdir()
+            stranger = sqlite3.connect(other / store.EARLIER)
+            stranger.execute("CREATE TABLE pages(text)")
+            stranger.execute("INSERT INTO pages VALUES('the only copy of a passage')")
+            stranger.execute(f"PRAGMA user_version={version}")
+            stranger.commit()
+            stranger.close()
+            with self.assertRaises(ValueError):
+                store.connect(other)
+            code, out, err = run_main(other, "status", "--json")
+            self.assertEqual((code, out), (1, ""), version)
+            self.assertIn("is not an index that this version can convert", err)
+            self.assertFalse((other / store.INDEX).exists())
+            self.assertEqual(run_main(other, "upgrade")[0], 1)
+        empty = self.home / "empty"
+        empty.mkdir()
+        (empty / store.EARLIER).write_bytes(b"")            # a file with nothing in it is in nobody's way
+        store.connect(empty).close()
+        self.assertTrue((empty / store.INDEX).exists())
 
     def test_a_file_under_the_old_name_that_was_never_converted_is_not_deleted(self):
         stranger = sqlite3.connect(self.home / "stranger.sqlite3")      # format number 0, as SQLite makes it
@@ -378,9 +424,9 @@ class Conversion(Earlier):
         self.assertEqual((len(found), len(found[0]["copies"])), (1, 0))
         with patch("shelffind.extract.passages", side_effect=AssertionError("read again")):
             indexer.build(db, self.data, store.roots(db), progress=lambda _: None)
-        # Their fingerprints say which files hold the same: the two scans, with the page that
-        # one of them had recognised; and the unread almanac with the southern one, not the
-        # northern, without being read.
+        # Their checksums say which files hold the same: the two scans, with the page that one
+        # of them had recognised; and the unread almanac with the southern one, not the northern,
+        # without its text being read again.
         found = search(db, "recognised first page")
         self.assertEqual((len(found), len(found[0]["copies"])), (1, 1))
         self.assertEqual(db.execute("SELECT count(*) FROM pages p JOIN files f ON f.doc=p.doc "

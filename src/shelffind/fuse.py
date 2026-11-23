@@ -19,12 +19,18 @@ WEIGHT = 20
 
 def document(db, name, row):
     """The document of the folders that a result of the source `name` stands for, or None."""
-    known = db.execute("SELECT doc FROM records WHERE source=? AND ref=?", (name, row["id"])).fetchone()
+    # The same work, or the same bytes, may be kept under several formats, each a document of
+    # its own: the one of the format of the result comes first, then one that has a file.
+    fmt = str(row.get("format") or "")
+    order = "ORDER BY (d.format=?) DESC,EXISTS (SELECT 1 FROM files f WHERE f.doc=d.id) DESC,d.id LIMIT 1"
+    known = db.execute("SELECT r.doc FROM records r JOIN docs d ON d.id=r.doc WHERE r.source=? AND r.ref=? " + order,
+                       (name, row["id"], fmt)).fetchone()
     if known:
         return known[0]
     for key in row.get("keys") or ():
-        # The same bytes may be kept under several formats: the checksum then bears the format.
-        for known in db.execute("SELECT doc FROM doc_keys WHERE key=? OR (key>? AND key<?)", (key, key + "@", key + "A")):
+        known = db.execute("SELECT k.doc FROM doc_keys k JOIN docs d ON d.id=k.doc WHERE k.key>? AND k.key<? " + order,
+                           (str(key) + "@", str(key) + "A", fmt)).fetchone()
+        if known:
             return known[0]
     return None
 

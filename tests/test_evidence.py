@@ -21,12 +21,12 @@ def names(db, query):
 
 
 class Evidence(Reading):
-    def unprinted(self):
-        """As in an index converted from the earlier one: the text is there, and no fingerprint
-        was ever taken."""
+    def unmeasured(self):
+        """As in an index converted from the earlier one: the text is there, and nothing was
+        ever measured of the files."""
         with self.db:
-            self.db.execute("DELETE FROM doc_keys WHERE key LIKE 'fp:%'")
-            self.db.execute("UPDATE files SET print=NULL")
+            self.db.execute("DELETE FROM doc_keys")
+            self.db.execute("UPDATE files SET sum=NULL")
 
     def ids(self):
         return dict(self.db.execute("SELECT rel,id FROM files"))
@@ -34,8 +34,9 @@ class Evidence(Reading):
     def docs(self):
         return dict(self.db.execute("SELECT rel,doc FROM files"))
 
-    def prints(self):
-        return self.db.execute("SELECT count(*) FROM doc_keys WHERE key LIKE 'fp:%'").fetchone()[0]
+    def measured(self):
+        """The checksums by which documents are known from a measure."""
+        return self.db.execute("SELECT count(*) FROM doc_keys WHERE basis='content'").fetchone()[0]
 
 
 class Likeness(Evidence):
@@ -84,10 +85,10 @@ class Likeness(Evidence):
         self.assertEqual((len(found), len(found[0]["copies"])), (1, 1))
         self.assertEqual(self.build(), (0, 0))
 
-    def test_a_document_read_before_fingerprints_existed_is_never_guessed_from_its_size(self):
+    def test_a_document_read_before_checksums_were_kept_is_never_guessed_from_its_size(self):
         old = self.write("old.txt")
         self.build()
-        self.unprinted()
+        self.unmeasured()
         old.unlink()
         self.write("new.txt", OTHER, when=1_800_000_000)
         self.read.clear()
@@ -96,13 +97,13 @@ class Likeness(Evidence):
         self.assertEqual(names(self.db, "southern capes"), ["Reading Room/new.txt"])
         self.assertEqual(search(self.db, "northern harbours"), [])
 
-    def test_such_a_document_gets_its_fingerprint_at_the_next_reading_of_its_folder(self):
+    def test_such_a_document_gets_its_checksums_at_the_next_reading_of_its_folder(self):
         path = self.write("old.txt")
         self.build()
-        self.unprinted()
-        self.build()
-        self.assertEqual(self.prints(), 1)
-        self.assertEqual(self.db.execute("SELECT count(*) FROM files WHERE print IS NULL").fetchone()[0], 0)
+        self.unmeasured()
+        self.assertEqual(self.build(), (0, 0))
+        self.assertEqual(self.measured(), 2)                # its MD5 and its SHA-256
+        self.assertEqual(self.db.execute("SELECT count(*) FROM files WHERE sum IS NULL").fetchone()[0], 0)
         os.utime(path, (1_800_000_000, 1_800_000_000))      # so that a mere new date reads nothing again
         self.read.clear()
         self.assertEqual(self.build(), (0, 0))
@@ -113,17 +114,19 @@ class Likeness(Evidence):
         self.write("a/book.txt")
         self.build()
         other = self.write("b/other.txt", OTHER, when=1_800_000_000)
-        real = indexer.fingerprint
+        real, looks = indexer.check_stamp, []
 
-        def racing(path, fmt):
-            if path == other:               # rewritten, between the look at its date and its reading,
-                other.write_text(LARGE)     # into the very content of a document already known
-            return real(path, fmt)
+        def racing(path, row, same=None):
+            if path == other:
+                looks.append(path)
+                if len(looks) == 2:         # rewritten, between the look at its date and the end of its reading,
+                    other.write_text(LARGE)     # into the very content of a document already known
+            return real(path, row, same)
 
-        with patch("shelffind.indexer.fingerprint", side_effect=racing):
+        with patch("shelffind.indexer.check_stamp", side_effect=racing):
             self.assertEqual(self.build(), (0, 1))          # nothing is concluded from such a reading, and it is said
         self.assertEqual(names(self.db, "northern harbours"), ["a/book.txt"])
-        self.assertEqual(self.prints(), 1)
+        self.assertEqual(self.measured(), 2)
         self.assertEqual(self.build(), (0, 0))              # the next inventory sees the file as it is now,
         found = search(self.db, "northern harbours")        # a second copy of the first document
         self.assertEqual((len(found), found[0]["copies"]), (1, [str(other)]))
@@ -134,18 +137,18 @@ class Likeness(Evidence):
         self.assertEqual(self.build(), (2, 0))
         self.assertEqual(sorted(self.read), ["notes.md", "notes.txt"])
         self.assertEqual(self.documents(), 2)
-        path = self.root / "notes.txt"
-        self.assertNotEqual(indexer.fingerprint(path, "txt"), indexer.fingerprint(path, "md"))
-        self.assertEqual(indexer.fingerprint(path, "txt"), indexer.fingerprint(self.root / "notes.md", "txt"))
+        known = sorted(row["key"].rsplit("@", 1) for row in self.db.execute("SELECT key FROM doc_keys WHERE key LIKE 'md5:%'"))
+        self.assertEqual((known[0][0], [fmt for _, fmt in known]), (known[1][0], ["md", "txt"]))     # one checksum, two readers
 
-    def test_a_failed_reading_leaves_no_fingerprint_behind(self):
+    def test_a_failed_reading_does_not_keep_a_copy_from_being_read(self):
         self.write("first.txt")
         with patch("shelffind.extract.passages", side_effect=RuntimeError("the reader stumbled")):
             self.assertEqual(self.build(), (1, 1))
-        self.assertEqual(self.prints(), 0)
-        self.write("second.txt", when=1_800_000_000)        # a healthy copy under another date
-        self.assertEqual(self.build(), (1, 0))
-        # Once the second is read, the first is seen to hold the same, without another attempt.
+        self.assertEqual(self.db.execute("SELECT state FROM docs").fetchone()[0], "error")
+        self.write("second.txt", when=1_800_000_000)        # a copy under another date
+        self.read.clear()
+        self.assertEqual(self.build(), (1, 0))              # the two are one document, which waits no longer
+        self.assertEqual(len(self.read), 1)
         found = search(self.db, "northern harbours")
         self.assertEqual((len(found), len(found[0]["copies"]), self.documents()), (1, 1, 1))
 
@@ -207,7 +210,7 @@ class Ambiguity(Evidence):
     def test_a_file_that_replaces_another_of_its_size_and_second_is_read(self):
         old = self.write("old.txt")
         self.build()
-        self.unprinted()                                    # read before fingerprints existed
+        self.unmeasured()                                    # read before fingerprints existed
         old.unlink()
         new = self.write("new.txt", OTHER)
         os.utime(new, ns=(1_700_000_000 * 10**9 + 77, 1_700_000_000 * 10**9 + 77))    # the same second
@@ -216,9 +219,9 @@ class Ambiguity(Evidence):
         self.assertEqual(self.read, ["new.txt"])
         self.assertEqual((search(self.db, "northern harbours"), names(self.db, "southern capes")),
                          ([], ["Reading Room/new.txt"]))
-        # No fingerprint was lent to the pages of the file that left.
+        # No checksum was lent to the pages of the file that left.
         self.assertEqual(self.db.execute("SELECT count(*) FROM doc_keys k JOIN docs d ON d.id=k.doc "
-                                         "WHERE k.key LIKE 'fp:%' AND d.gone IS NOT NULL").fetchone()[0], 0)
+                                         "WHERE d.gone IS NOT NULL").fetchone()[0], 0)
 
     def test_a_file_moved_to_a_folder_listed_earlier_keeps_its_text(self):
         annex = self.base / "Zannex"
@@ -275,7 +278,7 @@ class Ambiguity(Evidence):
                                 (doc, store.deflate("Tide tables of the northern harbours.")))
             self.db.execute("UPDATE docs SET state='indexed'")
             self.db.execute("UPDATE files SET read=1")
-        self.assertEqual(self.build(), (0, 0))              # their fingerprints show one document
+        self.assertEqual(self.build(), (0, 0))              # their checksums show one document
         self.assertEqual(self.documents(), 1)
         self.assertEqual(self.db.execute("SELECT count(*) FROM files WHERE read=1").fetchone()[0], 1)
         self.assertEqual(self.db.execute("SELECT count(*) FROM pages").fetchone()[0], 1)
@@ -293,152 +296,222 @@ class Ambiguity(Evidence):
         self.assertEqual(self.db.execute("SELECT count(*) FROM pages WHERE doc=? AND needs_ocr=0", (kept,)).fetchone()[0], 1)
 
     @unittest.skipIf(os.geteuid() == 0, "The administrator reads every file")
-    def test_a_fingerprint_that_cannot_be_taken_is_reported(self):
+    def test_a_file_that_was_read_and_cannot_be_measured_is_reported(self):
         path = self.write("old.txt")
         self.build()
-        self.unprinted()
+        self.unmeasured()
         path.chmod(0)
         self.addCleanup(path.chmod, 0o600)
         said = []
         done = indexer.build(self.db, self.data, store.roots(self.db), progress=said.append)
         self.assertEqual(done, (0, 1))
-        self.assertTrue(any("Could not fingerprint old.txt" in line for line in said))
+        self.assertTrue(any("Could not compare old.txt" in line for line in said))
 
 
-class Samples(Evidence):
-    """Beyond a certain size a fingerprint is made of samples: two files may agree on every one
-    of them and differ between two. Checksums of the whole file then have the last word."""
+class Words(Evidence):
+    """A measure and the word of a source: what each may join, and which outranks the other."""
 
-    def setUp(self):
-        super().setUp()
-        for module, name, value in ((store, "WHOLE", 4096), (indexer, "BLOCK", 64)):
-            small = patch.object(module, name, value)
-            small.start()
-            self.addCleanup(small.stop)
-        body = "Tide tables of the northern harbours. " * 300
-        self.alpha = body[:300] + " ALPHA " + body[307:]    # the two differ by one word that no sample holds
-        self.bravo = body[:300] + " BRAVO " + body[307:]
-        self.sums = {}
-
-    def twins(self):
-        one, two = self.write("a/book.txt", self.alpha), self.write("b/book.txt", self.bravo)
-        self.assertEqual(indexer.fingerprint(one, "txt"), indexer.fingerprint(two, "txt"))
-        return one, two
-
-    def record(self, path, number):
+    def sha(self, path):
         row = {"size": path.stat().st_size, "mtime": path.stat().st_mtime_ns}
-        return {"id": f"W{number}", "keys": [indexer.whole_checksums(path, row)[1]], "title": f"Work {number}", "text": False}
+        return indexer.whole_checksums(path, row)[1]
 
-    def told(self, *files):
-        """A source says of each file which work it is, with the checksum of that work."""
-        ids = self.ids()
+    def say(self, rel, work, key=None, **more):
+        """A source says that the file at `rel` is the work `work`, with the checksum `key`."""
+        record = {"id": work, "keys": [key] if key else [], "title": f"Work {work}", **more}
         with self.db:
-            for number, path in enumerate(files, 1):
-                self.assertTrue(link.attach(self.db, ids[str(path.relative_to(self.root))], "library",
-                                            self.record(path, number), set()))
+            return link.attach(self.db, self.ids()[rel], "library", record, set())
 
-    def each_has_its_own(self):
-        self.assertEqual((names(self.db, "ALPHA"), names(self.db, "BRAVO")), (["a/book.txt"], ["b/book.txt"]))
-
-    def test_without_other_evidence_the_samples_stand(self):
-        self.twins()
-        self.assertEqual(self.build(), (1, 0))              # the stated limit of a fingerprint
-        self.assertEqual(self.documents(), 1)
-
-    def test_checksums_known_before_the_reading_keep_the_two_apart(self):
-        one, two = self.twins()
+    def test_two_files_that_differ_by_one_word_are_two_documents_whatever_their_size(self):
+        body = "Tide tables of the northern harbours. " * 300_000        # some eleven megabytes
+        one = self.write("a/book.txt", body)
+        two = self.write("b/book.txt", body[:6_000_000] + " BRAVO " + body[6_000_007:])
+        self.assertEqual(one.stat().st_size, two.stat().st_size)
         self.build(names_only=True)
-        self.told(one, two)
-        self.assertEqual(self.build(), (2, 0))
-        self.each_has_its_own()
-        self.assertEqual(self.build(), (0, 0))
+        with self.db:
+            for rel, path in (("a/book.txt", one), ("b/book.txt", two)):
+                row = self.db.execute("SELECT size,mtime FROM files WHERE rel=?", (rel,)).fetchone()
+                indexer.joined(self.db, self.ids()[rel], indexer.whole_checksums(path, row))
         self.assertEqual(self.documents(), 2)
+        third = self.write("c/book.txt", two.read_text(), when=1_800_000_000)
+        self.assertEqual(self.build(limit=0), (0, 0))       # the third is measured, and is the second
+        docs = self.docs()
+        self.assertEqual((docs["c/book.txt"], docs["a/book.txt"] != docs["b/book.txt"]), (docs["b/book.txt"], True))
+        self.assertTrue(third.exists())
 
-    def test_a_checksum_learnt_after_the_two_were_joined_parts_them(self):
-        one, two = self.twins()
-        self.assertEqual(self.build(), (1, 0))
-        self.assertEqual(self.documents(), 1)
-        self.told(one, two)                                 # asked about each file, the source tells them apart
-        self.assertEqual(self.documents(), 2)
-        self.assertEqual(self.build(), (1, 0))
-        self.each_has_its_own()
-        self.assertEqual(self.build(), (0, 0))
-
-    def test_a_third_file_with_these_samples_is_told_by_its_whole(self):
-        one, two = self.twins()
-        self.build(names_only=True)
-        self.told(one, two)
-        self.build()
-        three = self.write("c/book.txt", self.bravo, when=1_800_000_000)
-        self.read.clear()
-        self.assertEqual(self.build(), (0, 0))
-        self.assertEqual(self.read, [])
-        found = search(self.db, "BRAVO")
-        self.assertEqual({found[0]["path"], *found[0]["copies"]}, {str(two), str(three)})
-        self.assertEqual(names(self.db, "ALPHA"), ["a/book.txt"])
-
-    def test_a_third_file_is_told_by_its_whole_also_while_the_storage_gives_no_answer(self):
-        self.twin()
-        one, two = self.twins()
-        self.build(names_only=True)
-        self.told(one, two)
-        self.assertEqual(self.build(), (2, 0))
-        three = self.write("c/book.txt", self.bravo, when=1_800_000_000)
-        four = self.write("d/book.txt", self.alpha, when=1_800_000_000)
-        self.read.clear()
-        with patch.dict(os.environ, {"SHELFFIND_TEST_TWIN_SILENT": "1"}):
-            self.assertEqual(self.build(), (0, 0))          # two documents bear their samples: each is read in full
-        self.assertEqual(self.read, [])
-        for word, pair in (("BRAVO", {str(two), str(three)}), ("ALPHA", {str(one), str(four)})):
-            found = search(self.db, word)
-            self.assertEqual({found[0]["path"], *found[0]["copies"]}, pair)
-
-    def test_a_full_reading_parts_two_files_joined_on_their_samples_whichever_is_measured_first(self):
-        two = self.write("b/book.txt", self.bravo)          # the one listed first is not the one read
-        self.build(names_only=True)
-        one = self.write("a/book.txt", self.alpha)
-        self.assertEqual(self.build(paths=[one]), (1, 0))
-        self.assertEqual(self.build(), (0, 0))              # the other joins it on its samples
-        self.assertEqual(self.documents(), 1)
-        other = self.write("c/other.txt", "x" * len(self.alpha))
-        self.build(names_only=True)
-        self.told(other)                                    # a work of that size is known by its checksum:
-        self.assertEqual(self.build(), (2, 0))              # files of that size are read in full, and the two part
-        self.each_has_its_own()
-        self.assertEqual(self.build(), (0, 0))
-        self.assertEqual((one.read_text()[300:307], two.read_text()[300:307]), (" ALPHA ", " BRAVO "))
-
-    def test_the_storage_of_the_folder_tells_them_apart_before_they_are_joined(self):
-        self.twin()
-        one = self.write("a/book.txt", self.alpha)
-        self.assertEqual(self.build(), (1, 0))              # read, and its checksum asked of the storage
-        two = self.write("b/book.txt", self.bravo)
-        self.assertEqual(indexer.fingerprint(one, "txt"), indexer.fingerprint(two, "txt"))
-        self.assertEqual(self.build(), (1, 0))
-        self.each_has_its_own()
-        self.assertEqual(self.build(), (0, 0))
-
-    def test_the_storage_parts_two_files_that_were_joined_while_it_gave_no_answer(self):
-        self.twin()
-        with patch.dict(os.environ, {"SHELFFIND_TEST_TWIN_SILENT": "1"}):
-            self.twins()
-            self.assertEqual(self.build(), (1, 0))
-            self.assertEqual(self.documents(), 1)           # joined on their samples, for want of anything else
-        self.assertEqual(self.build(), (1, 0))              # the storage answers: the whole of the two differs
-        self.each_has_its_own()
-        self.assertEqual(self.build(), (0, 0))
-
-    def test_what_was_read_of_a_file_outranks_what_a_source_says_of_it(self):
-        one, two = self.twins()
-        self.build(names_only=True)
-        ids = self.ids()
-        with self.db:                                       # the whole of the first file was measured
-            row = self.db.execute("SELECT size,mtime FROM files WHERE id=?", (ids["a/book.txt"],)).fetchone()
-            indexer.joined(self.db, ids["a/book.txt"], indexer.whole_checksums(one, row))
-            wrong = self.record(two, 2)                     # and a source takes it for the second work
-            self.assertFalse(link.attach(self.db, ids["a/book.txt"], "library", wrong, set()))
+    def test_what_was_measured_of_a_file_outranks_what_a_source_says_of_it(self):
+        one, two = self.write("a/book.txt"), self.write("b/book.txt", OTHER)
+        self.assertEqual(self.build(), (2, 0))              # each was measured when it was read
+        self.assertFalse(self.say("a/book.txt", "W2", self.sha(two)))
         self.assertEqual(self.db.execute("SELECT count(*) FROM records").fetchone()[0], 0)
-        self.assertEqual([row["title"] for row in self.db.execute("SELECT title FROM docs")], [None, None])
+        self.assertTrue(self.say("a/book.txt", "W1", self.sha(one)))
+        self.assertEqual(names(self.db, "work w1"), ["a/book.txt"])
+
+    def test_two_documents_that_were_both_read_are_not_joined_on_a_word(self):
+        self.write("a/book.txt")
+        self.write("b/book.txt", OTHER)
+        self.build()
+        self.unmeasured()                                   # read by an earlier version: nothing measured yet
+        key = "sha256:" + "aa" * 32
+        self.assertTrue(self.say("a/book.txt", "W1", key))
+        self.assertTrue(self.say("b/book.txt", "W1", key))  # the source takes the two for one work
+        self.assertEqual(self.documents(), 2)
+        self.assertEqual((names(self.db, "northern harbours"), names(self.db, "southern capes")),
+                         (["a/book.txt"], ["b/book.txt"]))
+        self.assertEqual(self.build(), (0, 0))              # measured in their turn, they stay what they are,
+        self.assertEqual(self.documents(), 2)               # and the word that was wrong of both is gone
+        self.assertEqual(self.db.execute("SELECT count(*) FROM records").fetchone()[0], 0)
+        self.assertEqual(self.db.execute("SELECT count(*) FROM doc_keys WHERE basis='source'").fetchone()[0], 0)
+
+    def test_a_word_joins_a_file_that_was_never_read(self):
+        one = self.write("a/book.txt")
+        self.write("b/book.txt")                            # a true copy, of which nothing is measured
+        self.build(names_only=True)
+        key = self.sha(one)
+        self.assertTrue(self.say("a/book.txt", "W1", key))
+        self.assertTrue(self.say("b/book.txt", "W1", key))
+        self.assertEqual(self.documents(), 1)
+        self.read.clear()
+        self.assertEqual(self.build(), (1, 0))              # read once for the two, and measured
+        self.assertEqual((len(self.read), self.documents()), (1, 1))
+        self.assertEqual(len(search(self.db, "northern harbours")[0]["copies"]), 1)
+
+    def test_a_measure_joins_what_a_word_alone_could_not(self):
+        one = self.write("a/book.txt")
+        self.build()
+        self.unmeasured()                                   # read, and known only by the word of a source
+        self.assertTrue(self.say("a/book.txt", "W1", self.sha(one)))
+        self.write("b/book.txt", when=1_800_000_000)        # a true copy arrives
+        self.read.clear()
+        self.assertEqual(self.build(), (0, 0))              # both are measured: one document, nothing read again
+        self.assertEqual((self.read, self.documents()), ([], 1))
+        found = search(self.db, "northern harbours")
+        self.assertEqual((len(found[0]["copies"]), found[0]["title"]), (1, "Work W1"))
+        self.assertEqual(self.db.execute("SELECT count(*) FROM doc_keys WHERE basis='source'").fetchone()[0], 0)
+
+    def test_a_wrong_word_about_a_file_that_was_read_costs_it_nothing(self):
+        self.write("a/book.txt")
+        other = self.write("b/other.txt", OTHER)
+        self.build()
+        self.unmeasured()
+        self.assertTrue(self.say("a/book.txt", "W9", self.sha(other)))      # the checksum of another file
+        self.assertEqual(names(self.db, "work w9"), ["a/book.txt"])
+        self.read.clear()
+        self.assertEqual(self.build(), (0, 0))
+        self.assertEqual(self.read, [])                     # its text is kept, the wrong record is gone,
+        self.assertEqual(names(self.db, "northern harbours"), ["a/book.txt"])
+        self.assertEqual([row["ref"] for row in self.db.execute("SELECT ref FROM records")], [])
+        self.assertEqual(search(self.db, "work w9"), [])    # and the sources will be asked about it again
+        self.assertEqual(self.db.execute("SELECT asked FROM files WHERE rel='a/book.txt'").fetchone()[0], "")
+
+    def test_what_is_said_of_one_file_follows_that_file_and_no_other(self):
+        self.write("a/book.txt")
+        self.write("b/book.txt", OTHER)
+        self.build(names_only=True)
+        key = "sha256:" + "aa" * 32
+        self.assertTrue(self.say("a/book.txt", "W1", key, title="AlphaAtlas"))
+        self.assertTrue(self.say("b/book.txt", "W1", key, title="AlphaAtlas"))
+        self.assertTrue(self.say("b/book.txt", "W2", None, title="BravoAtlas", byline="Someone Else"))   # of the second only
+        self.assertEqual(self.documents(), 1)
+        self.assertEqual(self.build(), (1, 0))              # read through the first; then both are measured
+        self.assertEqual(self.build(), (1, 0))              # and the second, which is another document, is read
+        self.assertEqual((names(self.db, "northern harbours"), names(self.db, "southern capes")),
+                         (["a/book.txt"], ["b/book.txt"]))
+        self.assertEqual(self.db.execute("SELECT count(*) FROM records WHERE ref='W1'").fetchone()[0], 0)
+
+    def test_a_checksum_given_on_a_word_goes_when_the_word_is_withdrawn(self):
+        self.write("a/alpha.txt")
+        bravo = self.base / "bravo.txt"
+        bravo.write_text(OTHER)
+        self.build(names_only=True)
+        key = self.sha(bravo)
+        self.assertTrue(self.say("a/alpha.txt", "W2", key))     # the source takes alpha for bravo
+        with self.db:
+            link.withdraw(self.db, self.ids()["a/alpha.txt"], "library")    # and then says so no more
+        self.assertEqual(self.db.execute("SELECT count(*) FROM doc_keys").fetchone()[0], 0)
+        self.write("b/bravo.txt", OTHER)                    # the true bravo arrives
+        self.assertEqual(self.build(), (2, 0))
+        self.assertEqual((names(self.db, "northern harbours"), names(self.db, "southern capes")),
+                         (["a/alpha.txt"], ["b/bravo.txt"]))
+
+    def test_a_reading_outranks_the_storage_which_never_overrides_it(self):
+        one = self.write("a/book.txt")
+        self.build(names_only=True)
+        file = self.ids()["a/book.txt"]
+        row = self.db.execute("SELECT size,mtime FROM files").fetchone()
+        true, stale = indexer.whole_checksums(one, row), ["md5:" + "ee" * 16]
+        with self.db:
+            self.assertTrue(indexer.joined(self.db, file, stale, local=False))      # a twin that held other bytes
+            self.assertTrue(indexer.joined(self.db, file, true))                    # then the file is read in full
+            self.assertFalse(indexer.joined(self.db, file, stale, local=False))
+        self.assertEqual(self.db.execute("SELECT sum FROM files").fetchone()[0], " ".join(true))
+        self.assertEqual(sorted(row["key"] for row in self.db.execute("SELECT key FROM doc_keys")),
+                         sorted(key + "@txt" for key in true))
+
+    def test_a_file_goes_to_the_document_that_comes_to_be_known_by_its_measure(self):
+        self.write("a/book.txt")
+        self.build()
+        self.unmeasured()                                   # read by an earlier version, never measured
+        two = self.write("b/book.txt", OTHER)
+        self.build(names_only=True)
+        key = "sha256:" + "aa" * 32
+        self.assertTrue(self.say("a/book.txt", "W1", key))
+        self.assertTrue(self.say("b/book.txt", "W1", key))  # a source takes the second for the first
+        self.assertEqual(self.documents(), 1)
+        row = {"size": two.stat().st_size, "mtime": two.stat().st_mtime_ns}
+        md5 = indexer.whole_checksums(two, row)[0]
+        with self.db:                                       # its storage tells the MD5 of the second file,
+            indexer.joined(self.db, self.ids()["b/book.txt"], [md5], local=False)
+        self.assertEqual(self.documents(), 1)               # which contradicts nothing known, and is kept with the file
+        self.write("c/other.txt", OTHER, when=1_800_000_000)
+        self.build(names_only=True)
+        self.assertTrue(self.say("c/other.txt", "W2", md5))     # a document comes to be known by that very MD5
+        self.assertEqual(self.build(names_only=True), (0, 0))
+        docs = self.docs()
+        self.assertEqual((docs["b/book.txt"], docs["a/book.txt"] != docs["b/book.txt"]), (docs["c/other.txt"], True))
+        self.assertEqual(names(self.db, "northern harbours"), ["a/book.txt"])
+
+    def test_what_one_folder_teaches_settles_a_file_of_another_in_the_same_run(self):
+        annex = self.base / "Annex"
+        annex.mkdir()
+        self.run_cli("roots", "add", str(annex))
+        (annex / "book.txt").write_text(LARGE)
+        self.build()
+        self.unmeasured()                                   # read in the folder that is gone through last
+        self.write("copy.txt", when=1_800_000_000)          # a copy in the folder that is gone through first
+        self.read.clear()
+        self.assertEqual(self.build(), (0, 0))
+        self.assertEqual((self.read, self.documents()), ([], 1))
+        self.assertEqual(len(search(self.db, "northern harbours")[0]["copies"]), 1)
+
+    def test_a_result_of_a_source_stands_for_the_file_of_its_format(self):
+        from shelffind import fuse
+        one, two = self.write("notes.txt"), self.write("notes.md")      # the same bytes, two readers
+        self.assertEqual(self.build(), (2, 0))
+        row = {"size": one.stat().st_size, "mtime": one.stat().st_mtime_ns}
+        key = indexer.whole_checksums(one, row)[1]
+        docs = self.docs()
+        for fmt, rel in (("md", "notes.md"), ("txt", "notes.txt")):
+            self.assertEqual(fuse.document(self.db, "library", {"id": "X", "keys": [key], "format": fmt}), docs[rel])
+        self.assertIn(fuse.document(self.db, "library", {"id": "X", "keys": [key]}), docs.values())
+        self.assertTrue(two.exists())
+
+    def test_two_checksums_of_one_kind_in_one_record_are_no_checksum(self):
+        self.write("a/book.txt")
+        self.build(names_only=True)
+        record = {"id": "W1", "keys": ["md5:" + "aa" * 16, "md5:" + "bb" * 16], "title": "Twice Told"}
+        with self.db:
+            self.assertTrue(link.attach(self.db, self.ids()["a/book.txt"], "library", record, set()))
+        self.assertEqual(self.db.execute("SELECT count(*) FROM doc_keys").fetchone()[0], 0)
+        self.assertEqual(names(self.db, "twice told"), ["a/book.txt"])     # the title is taken, the checksums are not
+
+    def test_a_second_source_that_says_otherwise_is_not_believed_before_a_measure(self):
+        one = self.write("a/book.txt")
+        self.build(names_only=True)
+        self.assertTrue(self.say("a/book.txt", "W1", self.sha(one)))
+        other = {"id": "Z9", "keys": ["sha256:" + "bb" * 32], "title": "Another Work"}
+        with self.db:
+            self.assertFalse(link.attach(self.db, self.ids()["a/book.txt"], "catalogue", other, set()))
+        self.assertEqual([row["source"] for row in self.db.execute("SELECT source FROM records")], ["library"])
 
 
 class Reading2(Evidence):
@@ -459,7 +532,11 @@ class Reading2(Evidence):
         with patch("shelffind.extract.passages", side_effect=swapping):
             self.assertEqual(self.build(), (1, 1))
         self.assertEqual(self.db.execute("SELECT count(*) FROM pages").fetchone()[0], 0)
-        self.assertEqual(self.prints(), 0)
+        # What was measured was the file that is gone: the one in its place starts afresh.
+        self.assertEqual(tuple(self.db.execute("SELECT sum,asked,read FROM files").fetchone()), (None, "", 0))
+        self.assertEqual(self.build(), (1, 0))
+        self.assertEqual(names(self.db, "southern capes"), ["Reading Room/book.txt"])
+        self.assertEqual(search(self.db, "northern harbours"), [])
 
     def test_a_document_is_never_completed_through_a_file_that_is_not_its_copy(self):
         one = self.write("one/book.txt")
@@ -470,6 +547,7 @@ class Reading2(Evidence):
         two = self.write("two/book.txt", OTHER)             # the same name, size and date, another text
         self.build(names_only=True)
         self.assertEqual(self.documents(), 2)
+        self.unmeasured()                                   # read by an earlier version: nothing measured yet
         ids = self.ids()
         record = {"id": "W1", "keys": ["sha256:" + "aa" * 32], "text": False}
         with self.db:                                       # a source takes the two for one work
@@ -495,15 +573,17 @@ class Reading2(Evidence):
         with self.db:
             self.db.execute("UPDATE pages SET needs_ocr=1")
             self.db.execute("UPDATE docs SET state='needs-ocr'")
-        self.unprinted()                                    # read by an earlier version: no fingerprint yet
-        self.write("two/book.txt", OTHER)
+        self.unmeasured()                                    # read by an earlier version: no fingerprint yet
+        two = self.write("two/book.txt", OTHER)
         self.build(names_only=True)
         ids = self.ids()
+        row = {"size": two.stat().st_size, "mtime": two.stat().st_mtime_ns}
+        key = indexer.whole_checksums(two, row)[1]          # the checksum that the second file really has
         with self.db:                                       # a source takes the two for one work
             for rel in ("one/book.txt", "two/book.txt"):
-                link.attach(self.db, ids[rel], "library", {"id": "W1", "keys": ["sha256:" + "aa" * 32]}, set())
+                link.attach(self.db, ids[rel], "library", {"id": "W1", "keys": [key]}, set())
         self.assertEqual(self.documents(), 1)
-        one.unlink()                                        # the file that was read is gone before any fingerprint
+        one.unlink()                                        # the file that was read is gone, never measured
         recognise = lambda source, fmt, work, page, lang: source.read_text()[:60]
         with patch("shelffind.extract.recognize", side_effect=recognise):
             self.assertEqual(self.build(ocr=True), (1, 1))
@@ -513,10 +593,9 @@ class Reading2(Evidence):
     def test_an_inventory_opens_no_file(self):
         self.write("old.txt")
         self.build()
-        self.unprinted()
+        self.unmeasured()
         self.write("moved.txt", when=1_800_000_000)
-        with patch("shelffind.indexer.fingerprint", side_effect=AssertionError("a file was opened")), \
-                patch("shelffind.indexer.whole_checksums", side_effect=AssertionError("a file was opened")):
+        with patch("shelffind.indexer.whole_checksums", side_effect=AssertionError("a file was opened")):
             self.assertEqual(self.build(names_only=True), (0, 0))
         self.assertEqual(self.documents(), 2)
         self.read.clear()
@@ -672,6 +751,19 @@ class Storage(Evidence):
             with self.rclone(f'[{{"Path":"a/book.txt","Size":{size},"ModTime":"{written}"}}]', f"{md5}  a/book.txt"):
                 self.assertEqual(indexer.stored_checksums("twin:", [row]), {}, (size, written))
 
+    def test_a_file_that_changes_in_the_storage_while_it_is_asked_is_not_answered_for(self):
+        row = {"rel": "a/book.txt", "size": 9, "mtime": 1_700_000_000 * 10**9}
+        count = self.base / "listings"
+        script = ('case "$1" in\n'
+                  f'lsjson) echo x >> "{count}"\n'
+                  f'if [ "$(wc -l < "{count}")" = 1 ]; then when=20; else when=21; fi\n'
+                  'echo "[{\\"Path\\":\\"a/book.txt\\",\\"Size\\":9,\\"ModTime\\":\\"2023-11-14T22:13:${when}Z\\"}]"\n;;\n'
+                  'hashsum) echo "0123456789abcdef0123456789abcdef  a/book.txt"\n;;\nesac\n')
+        folder = self.fake_tool("rclone", script)
+        with patch.dict(os.environ, {"PATH": f"{folder}{os.pathsep}{os.environ['PATH']}"}):
+            self.assertEqual(indexer.stored_checksums("twin:", [row]), {})      # the checksum is of the later file
+        self.assertEqual(len(count.read_text().split()), 2)
+
     def test_a_storage_that_gives_no_answer_is_not_taken_for_one_that_knows_nothing(self):
         row = {"rel": "a/book.txt", "size": 9, "mtime": 1_700_000_000 * 10**9}
         folder = self.fake_tool("rclone", "exit 3\n")
@@ -694,8 +786,7 @@ class Twin(Evidence):
         return target
 
     def unread(self):
-        return (patch("shelffind.indexer.fingerprint", side_effect=AssertionError("a file was opened")),
-                patch("shelffind.indexer.whole_checksums", side_effect=AssertionError("a file was opened")))
+        return patch("shelffind.indexer.whole_checksums", side_effect=AssertionError("a file was opened"))
 
     def test_a_file_read_here_is_known_again_after_a_move_by_an_inventory_alone(self):
         questions = self.twin()
@@ -704,8 +795,7 @@ class Twin(Evidence):
         self.assertEqual(self.db.execute("SELECT count(*) FROM doc_keys WHERE key LIKE 'md5:%' AND basis='content'")
                          .fetchone()[0], 1)                 # asked of the storage once the file was read
         self.refile(path, "Harbours/TideTables.txt")
-        first, second = self.unread()
-        with first, second:
+        with self.unread():
             self.assertEqual(self.build(names_only=True), (0, 0))
         self.assertEqual(names(self.db, "northern harbours"), ["Harbours/TideTables.txt"])
         self.assertEqual(self.documents(), 1)
@@ -732,14 +822,14 @@ class Twin(Evidence):
         self.twin()
         path = self.write("book.txt")
         self.build()
-        measured = lambda: self.db.execute("SELECT sum,asked,print FROM files").fetchone()
+        measured = lambda: self.db.execute("SELECT sum,asked FROM files").fetchone()
         self.assertEqual(measured()["sum"], "md5:" + hashlib.md5(LARGE.encode()).hexdigest())
         with self.db:
             self.db.execute("UPDATE files SET asked='library'")
         path.write_text(OTHER)                              # other bytes at the same address
         os.utime(path, (1_800_000_000, 1_800_000_000))
         self.assertEqual(self.build(names_only=True), (0, 0))
-        self.assertEqual(tuple(measured()), ("md5:" + hashlib.md5(OTHER.encode()).hexdigest(), "", None))
+        self.assertEqual(tuple(measured()), ("md5:" + hashlib.md5(OTHER.encode()).hexdigest(), ""))
         self.assertEqual(search(self.db, "northern harbours"), [])
 
     def test_a_twin_that_lags_behind_the_folder_says_nothing_of_a_file(self):
@@ -814,7 +904,7 @@ class Lost(Evidence):
         self.assertEqual(self.read, ["again.txt"])          # read for itself: what was forgotten stays forgotten
         self.assertEqual(self.db.execute("SELECT count(*) FROM docs WHERE gone IS NOT NULL").fetchone()[0], 0)
 
-    def test_of_two_records_of_one_source_the_one_with_the_text_survives_a_merge(self):
+    def test_what_was_said_of_two_documents_is_said_of_the_one_they_become(self):
         with self.db:
             one, two, other = (store.new_document(self.db, size, "txt") for size in (1, 1, 2))
             self.db.execute("INSERT INTO records(doc,source,ref,title,text) VALUES(?,'library','W0','',0)", (one,))
@@ -822,7 +912,8 @@ class Lost(Evidence):
             self.db.execute("UPDATE docs SET title='Tides' WHERE id=?", (two,))
             kept = store.merge(self.db, one, two)
             self.assertIsNone(store.merge(self.db, kept, other))            # another size: another document
-        self.assertEqual(self.db.execute("SELECT ref FROM records WHERE doc=?", (kept,)).fetchall()[0][0], "W1")
+        self.assertEqual(sorted(row["ref"] for row in self.db.execute("SELECT ref FROM records WHERE doc=?", (kept,))),
+                         ["W0", "W1"])                      # both are kept, and the one with a title names the document
         self.assertEqual(self.db.execute("SELECT title FROM docs WHERE id=?", (kept,)).fetchone()[0], "Tides")
         self.assertEqual(self.documents(), 2)
 

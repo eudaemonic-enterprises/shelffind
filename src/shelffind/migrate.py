@@ -74,9 +74,19 @@ def exclusively(old):
     try:
         old.execute("PRAGMA locking_mode=EXCLUSIVE")
         old.execute("BEGIN IMMEDIATE")
-    except sqlite3.OperationalError:
+    except sqlite3.OperationalError as fault:
+        if "locked" not in str(fault) and "busy" not in str(fault):
+            raise ValueError(f"The earlier index cannot be taken for this ({fault}): "
+                             "it is left as it is") from None
         raise ValueError("The earlier index is open in another program: close the other ShelfFind "
                          "windows, or let them finish, then run this again") from None
+    # Version 0.2 keeps its index in the write-ahead mode, in which a program that has the
+    # index open holds it visibly. In any other mode a program could go on writing unseen, into
+    # a file that this command is about to retire or to delete.
+    mode = old.execute("PRAGMA journal_mode").fetchone()[0]
+    if str(mode).lower() != "wal":
+        raise ValueError(f"The earlier index is not kept as version 0.2 keeps it (journal mode {mode}): it is left "
+                         "as it is. Give it back its mode with `PRAGMA journal_mode=WAL`, then run this again")
 
 
 def searches(old):
@@ -89,7 +99,7 @@ def copy(old, new, progress):
     """Fill the new index from the old one, inside one transaction of the new index. Every file
     of the old index becomes a document of its own with the pages the earlier version read from
     it, exactly as that version held them. Files that hold the same content become one
-    document later, when their fingerprints or their checksums show it."""
+    document later, when their checksums show it."""
     folders = {}
     for row in old.execute("SELECT * FROM roots ORDER BY id").fetchall():
         name = store.free_name(new, Path(row["path"]).name or "root")
@@ -125,7 +135,7 @@ def copy(old, new, progress):
             if count % 20000 == 0:
                 progress(f"Converting the index: {count:,} pages of text")
     fuzzy.remember_text(new, texts)
-    # The file a document's pages were read from, for the fingerprint it will be given.
+    # The file a document's pages were read from: its checksum will be that of the document.
     new.execute("UPDATE files SET read=1 WHERE EXISTS (SELECT 1 FROM pages p WHERE p.doc=files.doc)")
     new.execute("INSERT INTO meta(key,value) VALUES(?,?)", (ORIGIN, print_of(old)))
 
@@ -157,8 +167,9 @@ def upgrade(directory, progress=lambda text: None, wait=20.0):
             return target
         earlier = store.earlier_format(directory)
         if earlier not in (1, RETIRED):
-            if earlier:
-                raise ValueError(f"Unsupported index schema {earlier}")
+            if earlier or store.holds_something(directory):
+                raise ValueError(f"{directory / store.EARLIER} holds data and is not an index that this version "
+                                 f"can convert (format {earlier}): move it away, and nothing of it is touched")
             return None
         refuse_development(directory)
         for stale in directory.glob(store.INDEX + ".partial.*"):
