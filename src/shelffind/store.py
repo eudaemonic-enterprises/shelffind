@@ -5,18 +5,23 @@ Text belongs to a document, and a document is recognised by its content, not by 
 files of the folders point at documents, so a file that is moved, renamed or copied keeps its
 text. Addresses are stored from the home folder (`~/...`) and expanded when used.
 
-A file is given the text of a document only on evidence. The inventory alone tells one thing
-without reading anything: a file with the name, the size, the date and the format of a file
-that is there is a copy of it. Everything else is settled by content, proved by a fingerprint
-or a checksum: a file that resembles a known document (a stamp whose file is gone, a stamp that
-several documents share, the size of a document that was read) gets a document of its own and
-the mark `files.maybe`, and joins the document that has its fingerprint when it is compared.
-`files.read` marks the file a document's pages were read from, and `files.print` keeps the
-fingerprint taken of a file as it is.
+A file is given the text of a document on the evidence of its content alone. Names, sizes and
+dates prove nothing and never join a file to a document: a file that is new at its address, or
+changed there, gets a document of its own. It joins a known document of its size and format
+when a comparison shows the two to be the same:
+
+- the same checksum of the whole file, computed by a full reading or given by the storage of
+  the folder (`files.sum` keeps what is known of each file in this way);
+- the same fingerprint (`files.print`), which is the whole file up to 4 MiB and samples of it
+  beyond, unless checksums of the whole file show two documents;
+- the word of a source, which says that the file is a work whose checksum a document carries.
+
+What was read of a file outranks what a source says of it, and two different checksums of one
+kind keep two documents apart whatever else agrees. `files.read` marks the file a document's
+pages were read from, and `files.asked` names the sources that were asked about the file as it is.
 """
 import contextlib
 import fcntl
-import hashlib
 import os
 import re
 import sqlite3
@@ -32,8 +37,9 @@ from .extract import SUPPORTED, file_format
 INDEX, EARLIER = "index2.sqlite3", "index.sqlite3"
 FORMAT = 2
 RETIRED = 101           # the format number of an earlier index once it has been converted
-SMALL = 64 * 1024       # below this size a file is identified together with its address
 KEEP = 30 * 86400       # seconds a document keeps its text after its last file has gone
+WHOLE = 4 << 20         # up to this size the whole file is its fingerprint; beyond, samples of it
+SUMS = ("md5:", "sha256:")      # the checksums of a whole file that documents are known by
 
 SCHEMA = """
 CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
@@ -42,7 +48,7 @@ CREATE TABLE roots (
     mount TEXT NOT NULL, scanned TEXT, problem TEXT
 );
 CREATE TABLE docs (
-    id INTEGER PRIMARY KEY, size INTEGER NOT NULL, format TEXT NOT NULL, state TEXT NOT NULL,
+    id INTEGER PRIMARY KEY AUTOINCREMENT, size INTEGER NOT NULL, format TEXT NOT NULL, state TEXT NOT NULL,
     error TEXT, title TEXT, byline TEXT, year TEXT, gone INTEGER, gone_from INTEGER
 );
 CREATE INDEX docs_state ON docs(state, id);
@@ -56,10 +62,9 @@ CREATE TABLE files (
     id INTEGER PRIMARY KEY, root INTEGER NOT NULL REFERENCES roots ON DELETE CASCADE,
     rel TEXT NOT NULL, name TEXT NOT NULL, folded TEXT NOT NULL, format TEXT NOT NULL, size INTEGER NOT NULL,
     mtime INTEGER NOT NULL, doc INTEGER NOT NULL REFERENCES docs,
-    maybe INTEGER, read INTEGER NOT NULL DEFAULT 0, print TEXT, UNIQUE(root, rel)
+    read INTEGER NOT NULL DEFAULT 0, print TEXT, sum TEXT, asked TEXT NOT NULL DEFAULT '', UNIQUE(root, rel)
 );
 CREATE INDEX files_doc ON files(doc);
-CREATE INDEX files_maybe ON files(root) WHERE maybe IS NOT NULL;
 CREATE VIRTUAL TABLE names USING fts5(name, folder, title, byline, tokenize='unicode61 remove_diacritics 2');
 CREATE TRIGGER files_ad AFTER DELETE ON files BEGIN
     DELETE FROM names WHERE rowid=old.id;
@@ -313,8 +318,11 @@ def remove_root(db, selector):
     except ValueError:
         root = roots(db, str(Path(selector).expanduser().absolute()))[0]
     with db:
+        # With the folder go the documents it lost earlier, and those without file whose folder
+        # is not known: what was forgotten must not come back under another name.
         db.execute("CREATE TEMP TABLE leaving AS SELECT DISTINCT doc FROM files WHERE root=? "
-                   "UNION SELECT id FROM docs WHERE gone_from=?", (root["id"], root["id"]))
+                   "UNION SELECT id FROM docs WHERE gone IS NOT NULL AND (gone_from=? OR gone_from IS NULL)",
+                   (root["id"], root["id"]))
         db.execute("DELETE FROM files WHERE root=?", (root["id"],))
         db.execute("DELETE FROM roots WHERE id=?", (root["id"],))
         db.execute("DELETE FROM pages WHERE doc IN (SELECT doc FROM leaving) AND NOT EXISTS "
@@ -368,62 +376,77 @@ def inventory(root, exclude):
     return entries
 
 
-def digest(text):
-    return hashlib.sha256(text.encode("utf-8", "surrogateescape")).hexdigest()[:16]
-
-
-def stamp_key(size, mtime, fmt, place, rel):
-    """What the inventory alone tells of a file's content: its size, its date to the second and
-    its format. A small file is identified with its folder and address as well, since many
-    small files are written in the same second."""
-    key = f"stamp:{size}:{mtime // 1_000_000_000}:{fmt}"
-    if size < SMALL:
-        key += ":" + digest(f"{place}/{rel}")
-    return key
-
-
-def new_document(db, key, size, fmt, basis="stamp"):
+def new_document(db, size, fmt):
+    """A document of its own for a file whose content no known document is proved to share."""
     state = "pending" if fmt in SUPPORTED else "name-only"
-    doc = db.execute("INSERT INTO docs(size,format,state) VALUES(?,?,?)", (size, fmt, state)).lastrowid
-    db.execute("INSERT INTO doc_keys(key,doc,basis) VALUES(?,?,?)", (key, doc, basis))
-    return doc
+    return db.execute("INSERT INTO docs(size,format,state) VALUES(?,?,?)", (size, fmt, state)).lastrowid
 
 
-def hopeful(db, doc, size, fmt):
-    """True when some other document of this size and format has a fingerprint or a checksum:
-    the file may be that document, and a comparison will tell."""
-    return db.execute(
-        "SELECT 1 FROM docs d WHERE d.size=? AND d.format=? AND d.id!=? AND EXISTS (SELECT 1 FROM doc_keys k "
-        "WHERE k.doc=d.id AND (k.key LIKE 'fp:%' OR k.key LIKE 'sha256:%' OR k.key LIKE 'md5:%')) LIMIT 1",
-        (size, fmt, doc)).fetchone() is not None
+def set_apart(db, file):
+    """Give a file a document of its own, when the document it was in turned out not to describe
+    it. What is known of the file itself stays with it; the document it leaves keeps its text,
+    its keys and its records. Returns the new document, or None when the file is not there."""
+    row = db.execute("SELECT root,size,format FROM files WHERE id=?", (file,)).fetchone()
+    if row is None:
+        return None
+    apart = new_document(db, row["size"], row["format"])
+    db.execute("UPDATE files SET doc=?,read=0 WHERE id=?", (apart, file))
+    describe(db, apart)                         # the title of the document it left is not its own
+    tend_orphans(db, row["root"], drop=False)
+    return apart
 
 
-def document_for(db, place, rel, name, size, mtime, fmt, edited=False):
-    """The document of a file that is new at this address, or changed there, from the inventory
-    alone. Returns the document and whether the file is still to be compared with the documents
-    it resembles.
+def disown(db, doc, file):
+    """The document `doc` was read from the file `file`, and what the sources said of it turned
+    out not to describe that file. The document stays the file's, with its text; the word of the
+    sources is withdrawn from it, and the other files that nothing but that word had joined to
+    it get documents of their own, about which the sources will be asked again."""
+    db.execute("DELETE FROM doc_keys WHERE doc=? AND basis='source'", (doc,))
+    db.execute("DELETE FROM records WHERE doc=?", (doc,))
+    db.execute("UPDATE docs SET title=NULL,byline=NULL,year=NULL WHERE id=?", (doc,))
+    prints = {key.split("#")[0] for key in keys_of(db, doc) if key.startswith("fp:")}
+    for row in db.execute("SELECT id,print FROM files WHERE doc=? AND id!=?", (doc, file)).fetchall():
+        if row["print"] is None or row["print"] not in prints:
+            set_apart(db, row["id"])
+        db.execute("UPDATE files SET asked='' WHERE id=?", (row["id"],))
+    describe(db, doc)
 
-    One case is settled without reading: the stamp of the file (size, date and format) belongs
-    to one document only, and a file of that document that is there bears the same name. The
-    file is then a copy. In every other case the file gets a document of its own: a stamp whose
-    file is gone (moved, renamed, or another file altogether), a stamp under another name, a
-    stamp that several documents share, an address `edited` without a change of size or of
-    second, a stamp never seen. Its text, if a known document has it, comes back by proof.
-    """
-    base = stamp_key(size, mtime, fmt, place, rel)
-    owners = [row["doc"] for row in db.execute(
-        "SELECT DISTINCT doc FROM doc_keys WHERE key=? OR (key>? AND key<?)", (base, base + ":", base + ";"))]
-    if not edited and len(owners) == 1 and db.execute(
-            "SELECT 1 FROM doc_keys WHERE key=? AND doc=?", (base, owners[0])).fetchone():
-        names = [row["name"] for row in db.execute("SELECT name FROM files WHERE doc=?", (owners[0],))]
-        if name in names:
-            return owners[0], False
-    state = "pending" if fmt in SUPPORTED else "name-only"
-    doc = db.execute("INSERT INTO docs(size,format,state) VALUES(?,?,?)", (size, fmt, state)).lastrowid
-    # The first document of a stamp carries the stamp itself; the others a key of their own.
-    key, basis = (base, "stamp") if not owners else (f"{base}:{digest(name)}:{doc}", "stamp shared")
-    db.execute("INSERT INTO doc_keys(key,doc,basis) VALUES(?,?,?)", (key, doc, basis))
-    return doc, bool(owners) or hopeful(db, doc, size, fmt)
+
+def same_whole(db, file, doc):
+    """True when the file is known to hold, byte for byte, what the document `doc` was read
+    from: it is that file, or it has its fingerprint and is small enough for the fingerprint
+    to be the whole file, or it shares a checksum that was measured."""
+    row = db.execute("SELECT read,size,print,sum FROM files WHERE id=? AND doc=?", (file, doc)).fetchone()
+    if row is None:
+        return False
+    if row["read"]:
+        return True
+    carried = db.execute("SELECT key,basis FROM doc_keys WHERE doc=?", (doc,)).fetchall()
+    if row["size"] <= WHOLE and row["print"] in {key["key"].split("#")[0] for key in carried}:
+        return True
+    measured = {key["key"].split("@")[0] for key in carried if key["basis"] == "content"}
+    return bool(measured & set((row["sum"] or "").split()))
+
+
+def kinds(keys):
+    """The checksums of whole files among `keys`, by kind, without the format some of them bear."""
+    found = {}
+    for key in keys:
+        key = key.split("@")[0]
+        if key.startswith(SUMS):
+            found.setdefault(key.split(":", 1)[0], set()).add(key)
+    return found
+
+
+def against(one, other):
+    """True when two sets of keys hold different checksums of one kind: they then describe
+    different bytes."""
+    one, other = kinds(one), kinds(other)
+    return any(kind in other and not one[kind] & other[kind] for kind in one)
+
+
+def keys_of(db, doc):
+    return [row["key"] for row in db.execute("SELECT key FROM doc_keys WHERE doc=?", (doc,))]
 
 
 def describe(db, doc):
@@ -456,6 +479,9 @@ def merge(db, one, other):
         return one if one in told else other if other in told else None
     if (told[one]["format"], told[one]["size"]) != (told[other]["format"], told[other]["size"]):
         return None
+    # Two different checksums of the whole file prove two documents, whatever else agrees.
+    if against(keys_of(db, one), keys_of(db, other)):
+        return None
     keep, drop = sorted((one, other), key=lambda doc: (rank.get(told[doc]["state"], 9), blanks(db, doc)[0], doc))
     # A page that only the other document has recognised is not lost with it.
     theirs = {row["page"]: row["ztext"] for row in db.execute(
@@ -466,11 +492,18 @@ def merge(db, one, other):
                 db.execute("UPDATE pages SET ztext=?,needs_ocr=0 WHERE id=?", (theirs[row["page"]], row["id"]))
         if told[keep]["state"] in ("needs-ocr", "ocr-error") and blanks(db, keep)[0] == 0:
             db.execute("UPDATE docs SET state='indexed',error=NULL WHERE id=?", (keep,))
+    if told[keep]["state"] == "ocr-error" and told[drop]["state"] == "needs-ocr":
+        # The other copy was waiting for an ordinary recognition: the document still is.
+        db.execute("UPDATE docs SET state='needs-ocr',error=NULL WHERE id=? AND state='ocr-error'", (keep,))
+    # The pages kept are those read from the files of the document kept: a file of the other
+    # is, from now on, a copy by the evidence that joined the two.
+    if blanks(db, keep)[1]:
+        db.execute("UPDATE files SET read=0 WHERE doc=?", (drop,))
     db.execute("UPDATE files SET doc=? WHERE doc=?", (keep, drop))
     db.execute("UPDATE OR IGNORE doc_keys SET doc=? WHERE doc=?", (keep, drop))
-    # What a source said of the document is kept in preference to its not knowing it.
-    db.execute("DELETE FROM records WHERE doc=? AND ref='' AND EXISTS (SELECT 1 FROM records r "
-               "WHERE r.doc=? AND r.source=records.source AND r.ref!='')", (keep, drop))
+    # Of two records of one source, the one that says the source holds the text is kept.
+    db.execute("DELETE FROM records WHERE doc=? AND (text IS NULL OR text!=1) AND EXISTS (SELECT 1 FROM records r "
+               "WHERE r.doc=? AND r.source=records.source AND r.text=1)", (keep, drop))
     db.execute("UPDATE OR IGNORE records SET doc=? WHERE doc=?", (keep, drop))
     if not told[keep]["title"] and told[drop]["title"]:
         db.execute("UPDATE docs SET title=?,byline=?,year=? WHERE id=?",
@@ -486,21 +519,23 @@ def merge(db, one, other):
 def claim(db, doc, key, basis):
     """Give the document `doc` the checksum `key` of its bytes, and return the document that
     carries it afterwards. A document of the same format that carries the key already is the
-    same document: the two are merged. The same bytes under another format are another
+    same document: the two are merged, unless other checksums keep them apart, in which case
+    `doc` is returned without the key. The same bytes under another format are another
     document, read by another reader: the key is then kept under that format."""
     told = db.execute("SELECT format FROM docs WHERE id=?", (doc,)).fetchone()
     if told is None:
         return doc
     for name in (key, f"{key}@{told['format']}"):
-        owner = db.execute("SELECT doc FROM doc_keys WHERE key=?", (name,)).fetchone()
+        owner = db.execute("SELECT k.doc,d.format FROM doc_keys k JOIN docs d ON d.id=k.doc WHERE k.key=?",
+                           (name,)).fetchone()
         if owner is None:
             db.execute("INSERT INTO doc_keys(key,doc,basis) VALUES(?,?,?)", (name, doc, basis))
             return doc
         if owner["doc"] == doc:
             return doc
-        kept = merge(db, owner["doc"], doc)
-        if kept is not None:
-            return kept
+        if owner["format"] == told["format"]:
+            kept = merge(db, owner["doc"], doc)
+            return doc if kept is None else kept
     return doc
 
 
@@ -541,7 +576,7 @@ def tend_orphans(db, root=None, now=None, drop=True):
         # Worth keeping for a while: the text that was read, what a source said of the document,
         # and the fingerprint or the checksums by which its file can be recognised again.
         bare = ("NOT EXISTS (SELECT 1 FROM pages p WHERE p.doc=docs.id) "
-                "AND NOT EXISTS (SELECT 1 FROM records r WHERE r.doc=docs.id AND r.ref!='') "
+                "AND NOT EXISTS (SELECT 1 FROM records r WHERE r.doc=docs.id) "
                 "AND NOT EXISTS (SELECT 1 FROM doc_keys k WHERE k.doc=docs.id AND "
                 "(k.key LIKE 'fp:%' OR k.key LIKE 'sha256:%' OR k.key LIKE 'md5:%'))")
         db.execute(f"DELETE FROM docs WHERE gone IS NOT NULL AND (({bare}) OR gone<?)", (now - KEEP,))
@@ -563,29 +598,22 @@ def scan(db, root, directory):
         db.executemany("DELETE FROM files WHERE id=?", [(r["id"],) for r in existing.values()])
         tend_orphans(db, root["id"], drop=False)
         for rel, size, mtime, old in fresh:
+            # New at its address, or changed there: a document of its own, whatever its name,
+            # its size and its date resemble. What it holds is compared afterwards.
             path = Path(rel)
             fmt = file_format(path)
-            # A change that keeps the size and the second leaves the stamp as it was: only a
-            # reading can tell what the file holds now.
-            edited = bool(old) and (size, mtime // 10**9, fmt) == (old["size"], old["mtime"] // 10**9, old["format"])
-            doc, unsure = document_for(db, root["name"], rel, path.name, size, mtime, fmt, edited)
-            maybe = 1 if unsure else None
+            doc = new_document(db, size, fmt)
             if old:
-                db.execute("UPDATE files SET size=?,mtime=?,format=?,doc=?,maybe=?,read=0,print=NULL WHERE id=?",
-                           (size, mtime, fmt, doc, maybe, old["id"]))
-                told = db.execute("SELECT title,byline FROM docs WHERE id=?", (doc,)).fetchone()
-                db.execute("UPDATE names SET title=?,byline=? WHERE rowid=?",
-                           (told["title"] or "", told["byline"] or "", old["id"]))
+                db.execute("UPDATE files SET size=?,mtime=?,format=?,doc=?,read=0,print=NULL,sum=NULL,asked='' "
+                           "WHERE id=?", (size, mtime, fmt, doc, old["id"]))
+                db.execute("UPDATE names SET title='',byline='' WHERE rowid=?", (old["id"],))
                 continue
-            cur = db.execute("INSERT INTO files(root,rel,name,folded,format,size,mtime,doc,maybe) "
-                             "VALUES(?,?,?,?,?,?,?,?,?)",
-                             (root["id"], rel, path.name, fuzzy.fold(path.name), fmt, size, mtime, doc, maybe))
+            cur = db.execute("INSERT INTO files(root,rel,name,folded,format,size,mtime,doc) VALUES(?,?,?,?,?,?,?,?)",
+                             (root["id"], rel, path.name, fuzzy.fold(path.name), fmt, size, mtime, doc))
             folder = str(Path(Path(root["path"]).name) / path.parent)
-            described = db.execute("SELECT title,byline FROM docs WHERE id=?", (doc,)).fetchone()
             fuzzy.remember_names(db, (terms_for_name(path.name), terms_for_name(folder)), known)
-            db.execute("INSERT INTO names(rowid,name,folder,title,byline) VALUES(?,?,?,?,?)",
-                       (cur.lastrowid, terms_for_name(path.name), terms_for_name(folder),
-                        described["title"] or "", described["byline"] or ""))
+            db.execute("INSERT INTO names(rowid,name,folder,title,byline) VALUES(?,?,?,'','')",
+                       (cur.lastrowid, terms_for_name(path.name), terms_for_name(folder)))
         tend_orphans(db, root["id"])
         if not available(root):
             raise OSError(f"Root disconnected: {root['path']}")

@@ -36,7 +36,7 @@ def unlinked(db, root=None, source=None):
     found = []
     for row in db.execute(
             "SELECT f.root,f.rel,f.size,f.format,d.state FROM files f JOIN docs d ON d.id=f.doc WHERE NOT EXISTS "
-            f"(SELECT 1 FROM records r WHERE r.doc=f.doc AND r.ref!=''{only}) ORDER BY f.root,f.rel",
+            f"(SELECT 1 FROM records r WHERE r.doc=f.doc{only}) ORDER BY f.root,f.rel",
             (source,) if source else ()):
         if row["root"] in wanted and row["format"] in SUPPORTED:
             found.append({"path": str(Path(wanted[row["root"]]) / row["rel"]), "size": row["size"], "state": row["state"]})

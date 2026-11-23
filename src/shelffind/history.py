@@ -100,7 +100,8 @@ def absorb(directory, asked):
             for line in kept:
                 try:
                     event = json.loads(line)
-                    held.add((event.get("t"), event.get("q")))
+                    if event.get("act") == "search":        # an opening is not the search that led to it
+                        held.add((event.get("t"), event.get("q")))
                 except (ValueError, AttributeError, TypeError):     # a line that is not an event
                     continue
             added = [json.dumps({"t": int(when), "act": "search", "q": query}, ensure_ascii=False) + "\n"

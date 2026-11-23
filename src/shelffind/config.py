@@ -33,6 +33,7 @@ KEYS = {
     "folder": "f4",
     "format": "f5",
     "source": "f6",
+    "exact": "f7",
     "help": "f1",
 }
 
@@ -47,6 +48,8 @@ SETTINGS = {
     "panel.after_open": (("close", "stay"), "close", "What the panel does once a document is opened."),
     "search.limit": (int, 50, "Results listed in the panel."),
     "search.scope": (("all", "name", "text"), "all", "What the panel searches when it opens."),
+    "search.exact": (bool, False, "Whether the panel opens on exact search: the words as typed, with no "
+                                  "completion, no spelling help and no letters in order."),
     "index.refresh": (int, 60, "Minutes after which opening the panel refreshes the list of files; 0 never."),
     "history.record": (bool, True, "Remember the searches made and the documents opened."),
     "share.history": (bool, False, "Share that journal between your machines; off unless asked for."),
@@ -163,13 +166,19 @@ class Settings:
         return max(3, min(wanted, rows - 1))
 
     def keymap(self):
-        """Key name -> action. A key given to two actions is reported once."""
-        found = {}
+        """Key name -> action. A key that the settings give to an action is taken from the action
+        that had it only by default, so that a key chosen long ago keeps its meaning when a later
+        version gives the same key to something new. A key given twice otherwise is reported."""
+        found, chosen = {}, {}
         for action in KEYS:
+            own = self.origins.get(f"keys.{action}", "default") != "default"
             for key in self.values[f"keys.{action}"].split():
                 if key in found and found[key] != action:
-                    self.warnings.append(f"The key {key} is given to {found[key]} and to {action}")
-                found[key] = action
+                    if chosen[key] and not own:
+                        continue
+                    if chosen[key] == own:
+                        self.warnings.append(f"The key {key} is given to {found[key]} and to {action}")
+                found[key], chosen[key] = action, own
         return found
 
     def apply(self, data, origin):

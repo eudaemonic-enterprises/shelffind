@@ -232,6 +232,9 @@ def update(model, event, keymap):
     if action == "scope":
         model.options["where"] = cycle(SCOPES, model.options.get("where", "all"))
         return [("search",)]
+    if action == "exact":
+        model.options["exact"] = not model.options.get("exact", False)
+        return [("search",)]
     if action in ("folder", "format", "source"):
         name, values = {"folder": ("root", model.roots), "format": ("fmt", model.formats),
                         "source": ("source", model.channels)}[action]

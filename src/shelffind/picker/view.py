@@ -31,6 +31,7 @@ HELP = [
     ("reveal", "show in the file manager"),
     ("copy", "copy the address"),
     ("folder", "one folder or all"), ("format", "one format or all"), ("source", "one source or all"),
+    ("exact", "the words exactly as typed, or approximately"),
     ("quit", "leave"),
 ]
 
@@ -353,7 +354,8 @@ def prompt(model, look, width):
         return sides(left, [(f"line {min(lines, model.scroll + 1)} of {lines}", "count")], width,
                      look.sign("dots")), None
     left = [(f"[ {SCOPE_LABELS[model.options.get('where', 'all')]} ] ", "scope")]
-    facets = [Path(model.options["root"]).name if model.options.get("root") else None,
+    facets = ["exact" if model.options.get("exact") else None,
+              Path(model.options["root"]).name if model.options.get("root") else None,
               model.options.get("fmt"), model.options.get("source")]
     for facet in facets:
         if facet:

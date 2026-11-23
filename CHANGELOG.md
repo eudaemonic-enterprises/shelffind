@@ -11,11 +11,14 @@ are covered by tests.
 The folders and the sources in one list, with the text attached to documents.
 
 The text that ShelfFind reads now belongs to a document, not to an address. A renamed or moved
-file keeps its text, a document kept in several places is read once and shown on one row that
-names its copies, and a file written anew elsewhere is recognised by a fingerprint of its
-content. The inventory alone settles one case, a file with the name, the size and the date of a
-file that is there; everything else is settled by content, never by a likeness of size and date.
-A document whose last file has gone keeps its text for a month.
+file keeps its text, and a document kept in several places is read once and shown on one row
+that names its copies. A file joins a document only on the evidence of its content, never on a
+likeness of name, size and date: by a checksum of the whole file, which the storage of a folder
+gives without any reading when the folder has an rclone twin; by a fingerprint taken when the
+file is read or compared; or on the word of a source that knows the work by its checksum. Two
+different checksums keep two documents apart, and what was measured of a file outranks what a
+source says of it. An inventory alone opens no file. A document whose last file has gone keeps
+its text for a month.
 
 Sources speak a second, richer version of their exchange, described in `docs/sources.md`, with
 a helper of one file for writing one and `shelffind sources check NAME` for trying one. A
@@ -35,6 +38,9 @@ and through pages taken at regular intervals beyond, the excerpt is cut around t
 most words of the query meet, and the matches by name are shown before the passages are
 searched. In the text only the last word of a query is completed, from four letters. Spelling
 suggestions give the usual word first. Documents opened often rise among matches of their kind.
+In the panel, F7 turns the fuzzy matching off and on, and `search.exact` makes exact search what
+the panel opens on. A key that the settings give to an action is no longer disputed by the
+default key of another action.
 
 Several machines can share the journal of searches and of opened documents, through a folder
 kept in step or a remote of rclone (`[share]`, `shelffind sync`, `shelffind machine`); nothing is
@@ -44,9 +50,12 @@ beside the panel when it is old. `shelffind report copies`, `unlinked` and `name
 for keeping the folders in order.
 
 The index has a new form, kept in a new file. An index of version 0.2 is converted by copy the
-first time the panel or `shelffind index` runs, and by `shelffind upgrade`; the earlier index is
-locked while it is copied, marked as converted before the new one takes its name, and deleted
-only by `shelffind upgrade --discard-old`, as long as it is exactly what the new index was made
+first time the panel or `shelffind index` runs, and by `shelffind upgrade`: every file comes
+over as a document of its own with the pages read from it, and the first `shelffind index`
+that follows takes the fingerprints by which copies are joined. The earlier index is taken
+exclusively while it is copied, which is refused for as long as another program has it open,
+marked as converted before the new one takes its name, and deleted only by
+`shelffind upgrade --discard-old`, as long as it is exactly what the new index was made
 from. `status` reports from an earlier index without converting it, and a script that meets a
 large earlier index receives exit code 75. The JSON of `search` gains `copies`, `title`,
 `byline`, `year` and, for a file a source knows, `record`, `flags`, `notes` and `fast`; the keys

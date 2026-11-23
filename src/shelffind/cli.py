@@ -190,8 +190,8 @@ def find(args, db, directory, settings):
     picking = args.command == "pick"
     wanted = picking or not (args.json or args.list)
     if wanted and (picking or (sys.stdin.isatty() and sys.stdout.isatty())):
-        opts = {"root": args.root, "fmt": args.fmt, "exact": args.exact, "source": args.source,
-                "limit": args.limit or settings["search.limit"],
+        opts = {"root": args.root, "fmt": args.fmt, "exact": args.exact or settings["search.exact"],
+                "source": args.source, "limit": args.limit or settings["search.limit"],
                 "where": args.where or settings["search.scope"]}
         refresh_later(args, db, settings)
         if picking:
@@ -294,16 +294,21 @@ def execute(args, db, directory, settings):
         else:
             sources.configure(directory, args.name, args.program if args.action == "add" else None)
     elif args.command == "index":
-        store.adopt_declared(db, directory, say)        # the folders the settings name
-        roots = store.roots(db, args.root)
-        if not roots:
-            raise ValueError("Register a document folder with shelffind roots add FOLDER")
         if args.limit is not None and args.limit < 0:
             raise ValueError("Choose a nonnegative limit")
         files = [p.expanduser().resolve(strict=True) for p in args.file]
-        for path in files:
-            if not path.is_file() or not any(path.is_relative_to(r["path"]) for r in roots):
-                raise ValueError(f"File outside the selected roots: {path}")
+
+        def roots():
+            """The folders to index, chosen once the build holds its lock: no other command can
+            then change them under this one."""
+            store.adopt_declared(db, directory, say)    # the folders the settings name
+            chosen = store.roots(db, args.root)
+            if not chosen:
+                raise ValueError("Register a document folder with shelffind roots add FOLDER")
+            for path in files:
+                if not path.is_file() or not any(path.is_relative_to(r["path"]) for r in chosen):
+                    raise ValueError(f"File outside the selected roots: {path}")
+            return chosen
         live = None
         if sys.stderr.isatty():         # at a terminal: one line follows the documents being read
             def write(text):
@@ -482,7 +487,13 @@ def main(argv=None):
                     db = opened(args, directory)
                 except store.NeedsUpgrade as waiting:
                     if args.command == "status":        # a report never converts: it reads the old index
-                        return status(args, coverage_earlier(directory, args.errors), directory, settings)
+                        try:
+                            rows = coverage_earlier(directory, args.errors)
+                        except sqlite3.Error:
+                            # The old index went at this very moment: its successor answers.
+                            with closing(opened(args, directory)) as db:
+                                return execute(args, db, directory, settings)
+                        return status(args, rows, directory, settings)
                     print(f"shelffind: {waiting}", file=sys.stderr)
                     return 75
                 with closing(db):

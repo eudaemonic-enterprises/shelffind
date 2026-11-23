@@ -5,7 +5,8 @@ The new index is written beside the old one, in a file that takes its final name
 very end. The order of the steps leaves no moment at which both indexes could be used:
 
 1. no reading of documents by an earlier version is under way (its lock is held), and the old
-   index is locked against writing;
+   index is taken exclusively: this is refused for as long as any other program has it open,
+   and no program can open it until the conversion has ended;
 2. the new index is written in full under another name;
 3. the searches the old index remembers join the journal;
 4. the old index is marked as converted, which an earlier version of the program refuses, and
@@ -14,10 +15,13 @@ very end. The order of the steps leaves no moment at which both indexes could be
 
 Cut before step 4, nothing has changed and the conversion is done again. Cut between steps 4
 and 5, the old index is frozen and without a successor: it is converted again, which gives the
-same result. Of the old index only that mark ever changes; it is deleted on request alone, and
-only while it is still exactly what the new index was made from.
+same result. Of the old index only that mark ever changes; it is deleted on request alone, taken
+exclusively in the same way, only while it is still exactly what the new index was made from,
+and after its searches have been put in the journal once more.
 """
+import contextlib
 import fcntl
+import gc
 import hashlib
 import os
 import sqlite3
@@ -28,8 +32,6 @@ from . import __version__, fuzzy, history, store
 
 RETIRED = store.RETIRED         # the format number an old index receives once it has been converted
 ORIGIN = "converted_from"       # in the new index: the print of the old index it was made from
-# The better state wins when two copies of one document were read apart by the earlier version.
-BETTER = {"indexed": 0, "needs-ocr": 1, "ocr-error": 1, "error": 3, "pending": 4, "name-only": 5}
 
 
 def refuse_development(directory):
@@ -38,119 +40,93 @@ def refuse_development(directory):
                          "name another folder with --data-dir")
 
 
+@contextlib.contextmanager
+def rows(old, question):
+    """The rows of a question to the old index. The question is closed with the block, also when
+    the reading is cut short: left open, it would keep the old index held after its connection
+    is closed."""
+    cursor = old.execute(question)
+    try:
+        yield cursor
+    finally:
+        cursor.close()
+
+
 def print_of(old):
-    """A print of everything an old index holds: its folders, its files, the text of its pages
-    and the searches it remembers. It is the same as long as nothing is added to the old index,
-    taken from it or changed in it."""
+    """A print of everything an old index holds: its folders, its files, every page with its
+    place and its text, and the searches it remembers. It is the same as long as nothing is
+    added to the old index, taken from it or changed in it."""
     told = hashlib.sha256()
-    for question in ("SELECT id,path FROM roots ORDER BY id",
-                     "SELECT id,root,rel,size,mtime,state,error FROM files ORDER BY id",
-                     "SELECT id,file,page,needs_ocr,text FROM pages ORDER BY id",
-                     "SELECT query,used FROM history ORDER BY query"):
-        for row in old.execute(question):
-            told.update(repr(tuple(row)).encode("utf-8", "surrogatepass"))
+    for question in ("SELECT * FROM roots ORDER BY id", "SELECT * FROM files ORDER BY id",
+                     "SELECT * FROM pages ORDER BY id", "SELECT * FROM history ORDER BY query,used"):
+        told.update(question.encode())
+        with rows(old, question) as found:
+            for row in found:
+                told.update(repr(tuple(row)).encode("utf-8", "surrogatepass"))
     return told.hexdigest()
 
 
-def different(old, one, other):
-    """True when the earlier version read two files and found different text in them: on a page
-    that both have read, the words differ, or the files have not the same number of pages."""
-    pages = [old.execute("SELECT text,needs_ocr FROM pages WHERE file=? ORDER BY id", (file,)).fetchall()
-             for file in (one, other)]
-    if len(pages[0]) != len(pages[1]):
-        return True
-    return any(not a["needs_ocr"] and not b["needs_ocr"] and a["text"] != b["text"] for a, b in zip(*pages))
+def exclusively(old):
+    """Take an old index for this program alone, until its connection is closed. An index that
+    another program has open, were it only a search panel left in a terminal, cannot be taken:
+    what that program wrote afterwards would be lost."""
+    gc.collect()        # a connection this very process dropped without closing it would hold the index too
+    try:
+        old.execute("PRAGMA locking_mode=EXCLUSIVE")
+        old.execute("BEGIN IMMEDIATE")
+    except sqlite3.OperationalError:
+        raise ValueError("The earlier index is open in another program: close the other ShelfFind "
+                         "windows, or let them finish, then run this again") from None
+
+
+def searches(old):
+    """The searches an old index remembers, as (time in seconds, query), the earliest first."""
+    return [(row["used"] // 1_000_000_000, row["query"])
+            for row in old.execute("SELECT query,used FROM history ORDER BY used").fetchall()]
 
 
 def copy(old, new, progress):
-    """Fill the new index from the old one, inside one transaction of the new index."""
+    """Fill the new index from the old one, inside one transaction of the new index. Every file
+    of the old index becomes a document of its own with the pages the earlier version read from
+    it, exactly as that version held them. Files that hold the same content become one
+    document later, when their fingerprints or their checksums show it."""
     folders = {}
-    for row in old.execute("SELECT * FROM roots ORDER BY id"):
+    for row in old.execute("SELECT * FROM roots ORDER BY id").fetchall():
         name = store.free_name(new, Path(row["path"]).name or "root")
         new.execute("INSERT INTO roots(id,name,path,mount,scanned,problem) VALUES(?,?,?,?,?,?)",
                     (row["id"], name, store.from_home(row["path"]), store.from_home(row["mount"]),
                      row["scanned"], row["problem"]))
-        folders[row["id"]] = (name, Path(row["path"]).name)
-
-    # What the earlier version read of each file: how many pages, how many still to recognise,
-    # and how much text.
-    read = {row["file"]: (row["pages"], row["blank"], row["letters"]) for row in old.execute(
-        "SELECT file,count(*) AS pages,sum(needs_ocr) AS blank,sum(length(text)) AS letters FROM pages GROUP BY file")}
-
-    def worth(row):
-        """The smaller, the further the reading of this file went."""
-        pages, blank, letters = read.get(row["id"], (0, 0, 0))
-        return (BETTER.get(row["state"], 9), blank if pages else 1 << 30, -letters, row["id"])
-
-    # The files: each joins the document that its name, size, date and format designate, as the
-    # inventory would decide, unless the earlier version read it and one of the files of that
-    # document, and found different text in them.
+        folders[row["id"]] = Path(row["path"]).name
     total = old.execute("SELECT count(*) FROM files").fetchone()[0]
-    documents, members, document_of, donor = {}, {}, {}, {}
     known = set()
-    for count, row in enumerate(old.execute("SELECT * FROM files ORDER BY id"), 1):
-        place = folders[row["root"]][0]
-        base = store.stamp_key(row["size"], row["mtime"], row["format"], place, row["rel"])
-        doc = documents.get((base, row["name"]))
-        if doc is not None and row["id"] in read and any(
-                different(old, other, row["id"]) for other in members[doc] if other in read):
-            doc = None
-        if doc is None:
-            doc = new.execute("INSERT INTO docs(size,format,state,error) VALUES(?,?,?,?)",
-                              (row["size"], row["format"], row["state"], row["error"])).lastrowid
-            shared = new.execute("SELECT 1 FROM doc_keys WHERE key=?", (base,)).fetchone()
-            key, basis = (f"{base}:{store.digest(row['name'])}:{doc}", "stamp shared") if shared else (base, "stamp")
-            new.execute("INSERT INTO doc_keys(key,doc,basis) VALUES(?,?,?)", (key, doc, basis))
-            documents.setdefault((base, row["name"]), doc)
-            members[doc] = []
-            donor[doc] = (worth(row), row["id"])
-        elif worth(row) < donor[doc][0]:
-            new.execute("UPDATE docs SET state=?,error=? WHERE id=?", (row["state"], row["error"], doc))
-            donor[doc] = (worth(row), row["id"])
-        members[doc].append(row["id"])
-        document_of[row["id"]] = doc
-        new.execute("INSERT INTO files(id,root,rel,name,folded,format,size,mtime,doc) VALUES(?,?,?,?,?,?,?,?,?)",
-                    (row["id"], row["root"], row["rel"], row["name"], row["folded"], row["format"],
-                     row["size"], row["mtime"], doc))
-        folder = str(Path(folders[row["root"]][1]) / Path(row["rel"]).parent)
-        terms = (store.terms_for_name(row["name"]), store.terms_for_name(folder))
-        fuzzy.remember_names(new, terms, known)
-        new.execute("INSERT INTO names(rowid,name,folder,title,byline) VALUES(?,?,?,'','')", (row["id"], *terms))
-        if count % 5000 == 0:
-            progress(f"Converting the index: {count:,} of {total:,} files")
-
-    # The text: a document read through several copies keeps the pages of the copy whose
-    # reading went furthest, and takes from the other copies the pages only they recognised.
-    several = {doc for doc, files in members.items() if sum(file in read for file in files) > 1}
-    spare, texts, current, count = {}, [], None, 0
-    for row in old.execute("SELECT file,page,section,text,needs_ocr FROM pages ORDER BY file,id"):
-        doc = document_of.get(row["file"])
-        if doc is None:
-            continue
-        if donor[doc][1] != row["file"]:
-            if doc in several and not row["needs_ocr"] and row["page"] is not None:
-                spare.setdefault((doc, row["page"]), row["text"])
-            continue
-        if row["file"] != current:
-            fuzzy.remember_text(new, texts)
-            current, texts = row["file"], []
-        new.execute("INSERT INTO pages(doc,page,section,ztext,needs_ocr) VALUES(?,?,?,?,?)",
-                    (doc, row["page"], row["section"], store.deflate(row["text"]), row["needs_ocr"]))
-        texts.append(row["text"])
-        count += 1
-        if count % 20000 == 0:
-            progress(f"Converting the index: {count:,} pages of text")
+    with rows(old, "SELECT * FROM files ORDER BY id") as files:
+        for count, row in enumerate(files, 1):
+            new.execute("INSERT INTO docs(id,size,format,state,error) VALUES(?,?,?,?,?)",
+                        (row["id"], row["size"], row["format"], row["state"], row["error"]))
+            new.execute("INSERT INTO files(id,root,rel,name,folded,format,size,mtime,doc) VALUES(?,?,?,?,?,?,?,?,?)",
+                        (row["id"], row["root"], row["rel"], row["name"], row["folded"], row["format"],
+                         row["size"], row["mtime"], row["id"]))
+            folder = str(Path(folders[row["root"]]) / Path(row["rel"]).parent)
+            terms = (store.terms_for_name(row["name"]), store.terms_for_name(folder))
+            fuzzy.remember_names(new, terms, known)
+            new.execute("INSERT INTO names(rowid,name,folder,title,byline) VALUES(?,?,?,'','')", (row["id"], *terms))
+            if count % 5000 == 0:
+                progress(f"Converting the index: {count:,} of {total:,} files")
+    texts, current, count = [], None, 0
+    with rows(old, "SELECT file,page,section,text,needs_ocr FROM pages ORDER BY file,id") as pages:
+        for row in pages:
+            if row["file"] != current:
+                fuzzy.remember_text(new, texts)
+                current, texts = row["file"], []
+            new.execute("INSERT INTO pages(doc,page,section,ztext,needs_ocr) VALUES(?,?,?,?,?)",
+                        (row["file"], row["page"], row["section"], store.deflate(row["text"]), row["needs_ocr"]))
+            texts.append(row["text"])
+            count += 1
+            if count % 20000 == 0:
+                progress(f"Converting the index: {count:,} pages of text")
     fuzzy.remember_text(new, texts)
-    for (doc, page), text in spare.items():
-        blank = new.execute("SELECT id FROM pages WHERE doc=? AND page=? AND needs_ocr=1", (doc, page)).fetchone()
-        if blank:
-            new.execute("UPDATE pages SET ztext=?,needs_ocr=0 WHERE id=?", (store.deflate(text), blank["id"]))
-            fuzzy.remember_more(new, (text,))
-    new.execute("UPDATE docs SET state='indexed',error=NULL WHERE state IN ('needs-ocr','ocr-error') AND EXISTS "
-                "(SELECT 1 FROM pages p WHERE p.doc=docs.id) AND NOT EXISTS "
-                "(SELECT 1 FROM pages p WHERE p.doc=docs.id AND p.needs_ocr=1)")
     # The file a document's pages were read from, for the fingerprint it will be given.
-    new.executemany("UPDATE files SET read=1 WHERE id=?", [(file,) for _, file in donor.values() if file in read])
+    new.execute("UPDATE files SET read=1 WHERE EXISTS (SELECT 1 FROM pages p WHERE p.doc=files.doc)")
     new.execute("INSERT INTO meta(key,value) VALUES(?,?)", (ORIGIN, print_of(old)))
 
 
@@ -209,11 +185,7 @@ def upgrade(directory, progress=lambda text: None, wait=20.0):
             old.row_factory = sqlite3.Row
             new = None
             try:
-                try:
-                    old.execute("BEGIN IMMEDIATE")
-                except sqlite3.OperationalError:
-                    raise ValueError("The earlier index is in use by another program: "
-                                     "run the conversion again when it has finished") from None
+                exclusively(old)
                 # Step 2. The partial file is thrown away after any failure, so it needs no
                 # journal of its own; it is written to the disk in full.
                 os.close(os.open(partial, os.O_RDWR | os.O_CREAT | os.O_EXCL, 0o600))
@@ -229,9 +201,7 @@ def upgrade(directory, progress=lambda text: None, wait=20.0):
                 with open(partial, "rb") as written:
                     os.fsync(written.fileno())
                 # Step 3.
-                asked = [(row["used"] // 1_000_000_000, row["query"])
-                         for row in old.execute("SELECT query,used FROM history ORDER BY used")]
-                if not history.absorb(directory, asked):
+                if not history.absorb(directory, searches(old)):
                     raise ValueError("The searches of the earlier index could not be saved: nothing was converted")
                 # Step 4.
                 old.execute(f"PRAGMA user_version={RETIRED}")
@@ -255,9 +225,9 @@ def upgrade(directory, progress=lambda text: None, wait=20.0):
         return target
 
 
-def discard_old(directory):
-    """Delete the earlier index, provided it is still exactly what the new index was made from.
-    Returns the bytes freed."""
+def discard_old(directory, wait=5.0):
+    """Delete the earlier index, provided it is still exactly what the new index was made from
+    and no other program has it open. Returns the bytes freed."""
     directory = Path(directory).absolute()
     if not directory.is_dir():
         raise ValueError("The new index does not exist yet: nothing is deleted")
@@ -266,24 +236,39 @@ def discard_old(directory):
         target = directory / store.INDEX
         if not target.exists() or target.stat().st_size == 0:
             raise ValueError("The new index does not exist yet: nothing is deleted")
-        if store.earlier_format(directory):
-            made_from = origin(directory)
+        if not (directory / store.EARLIER).is_file():
+            return 0
+        made_from = origin(directory)
+        # The old index is this program's alone from its comparison to its deletion: nothing can
+        # be added to it between the two, and no program that has it open is left writing into
+        # a file that no longer has a name.
+        try:
+            old = sqlite3.connect((directory / store.EARLIER).as_uri() + "?mode=rw", uri=True, timeout=wait)
+        except sqlite3.Error as fault:
+            raise ValueError(f"The earlier index cannot be read ({fault}): it is kept") from None
+        old.row_factory = sqlite3.Row
+        try:
+            exclusively(old)
             try:
-                old = sqlite3.connect((directory / store.EARLIER).as_uri() + "?mode=ro", uri=True, timeout=30)
-                try:
-                    retired = old.execute("PRAGMA user_version").fetchone()[0] == RETIRED
-                    same = made_from is not None and print_of(old) == made_from
-                finally:
-                    old.close()
+                retired = old.execute("PRAGMA user_version").fetchone()[0] == RETIRED
+                same = retired and made_from is not None and print_of(old) == made_from
+                asked = searches(old) if same else []
             except sqlite3.Error as fault:
                 raise ValueError(f"The earlier index cannot be read ({fault}): it is kept") from None
-            if not (retired and same):
+            if not same:
                 raise ValueError("The earlier index holds something the new one was not made from: it is kept. "
                                  "Move the file away yourself once you are sure it is no longer wanted")
-        freed = 0
-        for name in (store.EARLIER, store.EARLIER + "-wal", store.EARLIER + "-shm"):
-            path = directory / name
-            if path.exists():
-                freed += path.stat().st_size
-                path.unlink()
-        return freed
+            # The journal may have been lost since the conversion, with a folder restored in
+            # part: the searches go into it once more, which changes nothing when they are there.
+            if not history.absorb(directory, asked):
+                raise ValueError("The searches of the earlier index could not be saved: it is kept")
+            freed = 0
+            for name in (store.EARLIER, store.EARLIER + "-wal", store.EARLIER + "-shm"):
+                path = directory / name
+                if path.exists():
+                    freed += path.stat().st_size
+                    path.unlink()
+            return freed
+        finally:
+            old.rollback()
+            old.close()

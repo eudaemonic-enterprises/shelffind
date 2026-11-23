@@ -95,6 +95,14 @@ class Keys(unittest.TestCase):
         press(model, "f5", "f5")
         self.assertEqual(model.options["fmt"], "pdf")
 
+    def test_one_key_turns_the_approximate_search_off_and_on(self):
+        model = Model(query="whitham", caret=7)
+        self.assertFalse(model.options["exact"])
+        self.assertEqual(press(model, "f7"), [("search",)])     # the search is made again, exactly
+        self.assertTrue(model.options["exact"])
+        self.assertEqual(press(model, "f7"), [("search",)])
+        self.assertFalse(model.options["exact"])
+
     def test_earlier_searches_come_back_and_the_draft_is_kept(self):
         model = Model(history=["solitary wave", "bessel"])
         press(model, "t", "i", "d")
@@ -176,6 +184,13 @@ class Frames(unittest.TestCase):
             "│ ~/Books/Waves/Lamb-Hydrodynamics-CUP-1932.pdf",
             "│ 1.2 MB · 2023-11-14 · passage",
         ])
+
+    def test_the_prompt_says_when_the_search_is_exact(self):
+        model = self.model()
+        model.options["exact"] = True
+        self.assertIn("[ ALL ] exact dispersion", plain(frame(model, 80, 10, self.look))[6])
+        model.mode = "help"
+        self.assertTrue(any("f7" in line and "exactly as typed" in line for line in plain(frame(model, 100, 24, self.look))))
 
     def test_prompt_at_the_top(self):
         self.assertEqual(plain(frame(self.model(selected=2, bottom=False), 80, 10, self.look)), [

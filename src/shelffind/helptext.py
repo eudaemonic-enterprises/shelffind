@@ -58,7 +58,7 @@ In the panel
   Enter open at the page  ·  Tab address  ·  Ctrl-R everything, names, passages  ·  F1 keys
   Ctrl-O passages of the document, again to read the page  ·  Ctrl-X actions  ·  Alt-1..9 open
   Ctrl-P earlier search  ·  F2 open with  ·  F3 show in the file manager  ·  Ctrl-Y copy
-  F4 folder  ·  F5 format  ·  F6 source  ·  Esc leave
+  F4 folder  ·  F5 format  ·  F6 source  ·  F7 exact or approximate  ·  Esc leave
 
 Exit codes: 0 done, 1 error or nothing chosen, 75 run `shelffind upgrade` first, 130 interrupted
 Safety: --data-dir DIR works on a separate collection and reads only DIR/config.toml

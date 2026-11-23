@@ -32,7 +32,6 @@ class Reading(Shelf):
         watcher.start()
         self.addCleanup(watcher.stop)
         self.assertEqual(len(LARGE), len(OTHER))
-        self.assertGreater(len(LARGE), store.SMALL)
 
     def write(self, name, text=LARGE, when=1_700_000_000):
         path = self.root / name
@@ -58,12 +57,14 @@ class Copies(Reading):
         only_desk = search(self.db, "tidetables", folder="desk")
         self.assertEqual((only_desk[0]["path"], only_desk[0]["copies"]), (str(second), [str(first)]))
 
-    def test_the_same_stamp_under_another_name_is_compared_before_it_is_shared(self):
+    def test_files_of_one_size_and_date_share_a_text_only_when_their_content_is_the_same(self):
         self.write("TideTables.txt")
         self.write("WindRoses.txt", OTHER)                  # same size, same date, another content
         self.write("TideTables-second.txt")                 # the same content as the first
         self.assertEqual(self.documents(), 0)
-        self.assertEqual(self.build(), (3, 0))
+        self.assertEqual(self.build(names_only=True), (0, 0))
+        self.assertEqual(self.documents(), 3)               # an inventory alone joins nothing
+        self.assertEqual(self.build(), (2, 0))
         self.assertEqual(len(self.read), 2)                 # one of the two equal files, and the other text
         self.assertIn("WindRoses.txt", self.read)
         self.assertEqual(self.documents(), 2)
@@ -76,6 +77,18 @@ class Copies(Reading):
         self.assertEqual(self.build(), (2, 0))
         self.assertEqual(self.documents(), 2)
         self.assertEqual([hit["name"] for hit in search(self.db, '"same length b"')], ["b.txt"])
+
+    def test_the_same_name_size_and_date_in_two_folders_prove_nothing(self):
+        one = self.write("North/book.txt")
+        two = self.write("South/book.txt", OTHER)           # nothing tells them apart but their content
+        self.assertEqual(self.build(), (2, 0))
+        self.assertEqual([hit["path"] for hit in search(self.db, "northern harbours")], [str(one)])
+        self.assertEqual([hit["path"] for hit in search(self.db, "southern capes")], [str(two)])
+        three = self.write("West/book.txt", OTHER)          # a third, which holds what the second holds
+        self.assertEqual(self.build(), (0, 0))
+        found = search(self.db, "southern capes")
+        self.assertEqual({found[0]["path"], *found[0]["copies"]}, {str(two), str(three)})
+        self.assertEqual(search(self.db, "northern harbours")[0]["copies"], [])
 
 
 class Moves(Reading):

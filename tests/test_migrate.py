@@ -84,7 +84,14 @@ class Earlier(unittest.TestCase):
         self.old.execute("INSERT INTO history VALUES('spring tide',?)", (WHEN * 10**9,))
         self.old.execute("INSERT INTO history VALUES('wind roses',?)", ((WHEN + 60) * 10**9,))
         self.old.commit()
+        self.old.close()                # the earlier version is not running
+
+    def earlier(self):
+        """The old index opened again, as a program of the earlier version has it."""
+        self.old = sqlite3.connect(self.data / store.EARLIER, timeout=0.2)
+        self.old.create_function("word_grams", 1, fuzzy.grams, deterministic=True)
         self.addCleanup(self.old.close)
+        return self.old
 
     def file(self, rel, content, state, pages, error=None):
         path = self.root / rel
@@ -99,9 +106,9 @@ class Earlier(unittest.TestCase):
         folder = str(Path(self.root.name) / Path(rel).parent)
         self.old.execute("INSERT INTO names(rowid,name,folder) VALUES(?,?,?)",
                          (number, store.terms_for_name(path.name), store.terms_for_name(folder)))
-        for page, text, blank in pages:
-            self.old.execute("INSERT INTO pages(file,page,section,text,needs_ocr) VALUES(?,?,NULL,?,?)",
-                             (number, page, text, blank))
+        for page, text, blank, *section in pages:
+            self.old.execute("INSERT INTO pages(file,page,section,text,needs_ocr) VALUES(?,?,?,?,?)",
+                             (number, page, section[0] if section else None, text, blank))
 
     def converted(self):
         db = store.connect(self.data)
@@ -109,27 +116,39 @@ class Earlier(unittest.TestCase):
         return db
 
     def old_state(self):
-        with sqlite3.connect((self.data / store.EARLIER).as_uri() + "?mode=ro", uri=True) as old:
+        old = sqlite3.connect((self.data / store.EARLIER).as_uri() + "?mode=ro", uri=True)
+        try:
             return (old.execute("PRAGMA user_version").fetchone()[0],
                     old.execute("SELECT count(*) FROM files").fetchone()[0],
                     old.execute("SELECT count(*) FROM pages").fetchone()[0])
+        finally:
+            old.close()
 
 
 class Conversion(Earlier):
     def test_everything_is_carried_over(self):
         db = self.converted()
         self.assertEqual(db.execute("SELECT count(*) FROM files").fetchone()[0], 6)
-        self.assertEqual(db.execute("SELECT count(*) FROM docs").fetchone()[0], 5)
+        # Every file comes over as a document of its own, with the very pages read from it.
+        self.assertEqual(db.execute("SELECT count(*) FROM docs").fetchone()[0], 6)
         states = dict(db.execute("SELECT f.rel,d.state FROM files f JOIN docs d ON d.id=f.doc"))
-        self.assertEqual(states, {"Harbours/TideTables.txt": "indexed", "Desk/TideTables.txt": "indexed",
+        self.assertEqual(states, {"Harbours/TideTables.txt": "needs-ocr", "Desk/TideTables.txt": "indexed",
                                   "Capes/WindRoses.txt": "pending", "Capes/notes.txt": "indexed",
                                   "Capes/broken.pdf": "error", "Capes/chart.png": "name-only"})
         self.assertEqual(db.execute("SELECT error FROM docs WHERE state='error'").fetchone()[0],
                          "Syntax Error: no trailer")
-        # The two copies are one document, with the pages of the copy that was read in full.
+        found = search(db, "spring tide")
+        self.assertEqual([(hit["path"], hit["page"], len(hit["copies"])) for hit in found],
+                         [(str(self.root / "Desk/TideTables.txt"), 2, 0)])
+        self.assertEqual(db.execute("SELECT count(*),sum(needs_ocr) FROM pages").fetchone()[:], (5, 1))
+        # The first reading run takes the fingerprints of the files that were read: the two
+        # copies, which hold the same bytes, become one document with the pages read in full.
+        with patch("shelffind.extract.passages", side_effect=AssertionError("read again")):
+            indexer.build(db, self.data, store.roots(db), limit=0, progress=lambda _: None)
         found = search(db, "spring tide")
         self.assertEqual([(hit["name"], hit["page"], len(hit["copies"])) for hit in found], [("TideTables.txt", 2, 1)])
         self.assertEqual(db.execute("SELECT count(*),sum(needs_ocr) FROM pages").fetchone()[:], (3, 0))
+        self.assertEqual(db.execute("SELECT count(*) FROM files WHERE read=1 AND print IS NULL").fetchone()[0], 0)
         self.assertEqual(search(db, "wind", where="text")[0]["name"], "notes.txt")
         self.assertEqual([hit["name"] for hit in search(db, "windroses")], ["WindRoses.txt"])
         self.assertEqual(search(db, "harbuors")[0]["name"], "TideTables.txt")       # the spellings follow
@@ -205,19 +224,70 @@ class Conversion(Earlier):
 
     def test_an_old_index_being_written_is_not_converted_until_it_is_free(self):
         before = self.old_state()
-        self.old.execute("BEGIN IMMEDIATE")                 # an earlier version is writing
-        self.old.execute("DELETE FROM roots")               # ... and forgets a folder, not yet for good
+        old = self.earlier()
+        old.execute("BEGIN IMMEDIATE")                      # an earlier version is writing
+        old.execute("DELETE FROM roots")                    # ... and forgets a folder, not yet for good
         with self.assertRaises(ValueError) as refused:
             migrate.upgrade(self.data, wait=0)
-        self.assertIn("in use by another program", str(refused.exception))
+        self.assertIn("open in another program", str(refused.exception))
         self.assertEqual(sorted(p.name for p in self.data.glob("index2*")), [])
-        self.old.rollback()
+        old.rollback()
+        old.close()
         self.assertEqual(self.old_state(), before)
         self.assertEqual(migrate.upgrade(self.data), self.data / store.INDEX)
         self.assertEqual(store.earlier_format(self.data), migrate.RETIRED)
 
+    def test_an_old_index_that_a_panel_left_open_is_neither_converted_nor_deleted(self):
+        panel = self.earlier()                              # a search panel of the earlier version, idle
+        self.assertEqual(panel.execute("PRAGMA user_version").fetchone()[0], 1)
+        with self.assertRaises(ValueError) as refused:
+            migrate.upgrade(self.data, wait=0)
+        self.assertIn("open in another program", str(refused.exception))
+        self.assertEqual(sorted(p.name for p in self.data.glob("index2*")), [])
+        panel.execute("INSERT INTO history VALUES('northern lights',?)", ((WHEN + 120) * 10**9,))
+        panel.commit()                                      # what it writes meanwhile is not lost
+        panel.close()
+        self.converted()
+        self.assertEqual(history.queries(self.data)[0], "northern lights")
+        # A program that had the old index open before it was retired still has it open.
+        panel = self.earlier()
+        panel.execute("SELECT count(*) FROM history").fetchone()
+        with self.assertRaises(ValueError) as kept:
+            migrate.discard_old(self.data, wait=0)
+        self.assertIn("open in another program", str(kept.exception))
+        self.assertTrue((self.data / store.EARLIER).exists())
+        panel.close()
+        self.assertGreater(migrate.discard_old(self.data), 0)
+
+    def test_a_file_under_the_old_name_that_was_never_converted_is_not_deleted(self):
+        stranger = sqlite3.connect(self.home / "stranger.sqlite3")      # format number 0, as SQLite makes it
+        stranger.execute("CREATE TABLE pages(text)")
+        stranger.execute("INSERT INTO pages VALUES('the only copy of a passage')")
+        stranger.commit()
+        stranger.close()
+        other = self.home / "elsewhere"
+        other.mkdir()
+        store.connect(other).close()
+        (other / store.EARLIER).write_bytes((self.home / "stranger.sqlite3").read_bytes())
+        with self.assertRaises(ValueError):
+            migrate.discard_old(other)
+        self.assertTrue((other / store.EARLIER).exists())
+
+    def test_the_searches_are_saved_once_more_before_the_old_index_is_deleted(self):
+        self.converted()
+        (self.data / history.NAME).unlink()                 # a folder restored without its journal
+        self.assertEqual(history.queries(self.data), [])
+        self.assertGreater(migrate.discard_old(self.data), 0)
+        self.assertEqual(history.queries(self.data), ["wind roses", "spring tide"])
+
+    def test_an_opening_does_not_stand_for_the_search_of_the_same_second(self):
+        history.record(self.data, "open", "spring tide", {"path": "~/x.pdf", "name": "x.pdf"}, when=WHEN)
+        self.converted()
+        with (self.data / history.NAME).open() as journal:
+            acts = sorted((json.loads(line)["act"], json.loads(line)["q"]) for line in journal)
+        self.assertEqual(acts, [("open", "spring tide"), ("search", "spring tide"), ("search", "wind roses")])
+
     def test_an_old_index_that_cannot_be_read_is_never_taken_for_none(self):
-        self.old.close()
         (self.data / store.EARLIER).write_bytes(b"this is not an index" * 400)
         for attempt in (lambda: store.connect(self.data), lambda: migrate.upgrade(self.data),
                         lambda: migrate.discard_old(self.data)):
@@ -259,13 +329,17 @@ class Conversion(Earlier):
 
     def test_an_old_index_of_the_same_shape_and_other_words_is_not_discarded(self):
         self.converted()
-        late = sqlite3.connect(self.data / store.EARLIER)   # the same counts and lengths, another text
-        late.execute("UPDATE pages SET text='Short notes on the wing.' WHERE text='Short notes on the wind.'")
-        late.commit()
-        late.close()
-        with self.assertRaises(ValueError):
-            migrate.discard_old(self.data)
-        self.assertTrue((self.data / store.EARLIER).exists())
+        for change in ("UPDATE pages SET text='Short notes on the wing.' WHERE text='Short notes on the wind.'",
+                       "UPDATE pages SET section='other.xhtml' WHERE text='Short notes on the wing.'"):
+            late = sqlite3.connect(self.data / store.EARLIER)   # the same counts and lengths, another content
+            late.execute(change)
+            late.commit()
+            late.close()
+            with self.assertRaises(ValueError):
+                migrate.discard_old(self.data)
+            self.assertTrue((self.data / store.EARLIER).exists())
+            # ... and a new index made from that other content does not vouch for this one either.
+            self.assertNotEqual(migrate.origin(self.data), None)
 
     def test_an_old_index_that_gained_something_since_is_not_discarded(self):
         self.converted()
@@ -282,26 +356,55 @@ class Conversion(Earlier):
         self.assertIn("it is kept", err)
 
     def test_text_that_the_earlier_version_read_apart_stays_apart(self):
+        self.earlier()
         # Two files of one name, size and date in two folders, whose pages differ: two documents.
-        self.file("North/almanac.txt", LARGE, "indexed", [(1, "An almanac of the northern lights", 0)])
-        self.file("South/almanac.txt", LARGE.replace("northern", "southern"), "indexed",
+        north = LARGE.replace("Tide", "Star")
+        self.file("North/almanac.txt", north, "indexed", [(1, "An almanac of the northern lights", 0)])
+        self.file("South/almanac.txt", north.replace("northern", "southern"), "indexed",
                   [(1, "An almanac of the southern cross", 0)])
         # Two copies waiting for their scanned pages, of which the second went further.
         scans = [(1, "", 1), (2, "", 1)]
         self.file("North/scan.txt", LARGE.replace("Tide", "Scan"), "needs-ocr", scans)
         self.file("South/scan.txt", LARGE.replace("Tide", "Scan"), "needs-ocr", [(1, "A recognised first page", 0), (2, "", 1)])
+        # A third file of that name, size and date, which the earlier version never read, and
+        # which holds what the southern almanac holds.
+        self.file("West/almanac.txt", north.replace("northern", "southern"), "pending", [])
         self.old.commit()
+        self.old.close()
         db = self.converted()
         self.assertEqual([hit["path"] for hit in search(db, "northern lights")], [str(self.root / "North/almanac.txt")])
         self.assertEqual([hit["path"] for hit in search(db, "southern cross")], [str(self.root / "South/almanac.txt")])
         found = search(db, "recognised first page")
+        self.assertEqual((len(found), len(found[0]["copies"])), (1, 0))
+        with patch("shelffind.extract.passages", side_effect=AssertionError("read again")):
+            indexer.build(db, self.data, store.roots(db), progress=lambda _: None)
+        # Their fingerprints say which files hold the same: the two scans, with the page that
+        # one of them had recognised; and the unread almanac with the southern one, not the
+        # northern, without being read.
+        found = search(db, "recognised first page")
         self.assertEqual((len(found), len(found[0]["copies"])), (1, 1))
         self.assertEqual(db.execute("SELECT count(*) FROM pages p JOIN files f ON f.doc=p.doc "
                                     "WHERE f.rel='North/scan.txt' AND p.needs_ocr=1").fetchone()[0], 1)
+        self.assertEqual([hit["path"] for hit in search(db, "northern lights")], [str(self.root / "North/almanac.txt")])
+        found = search(db, "southern cross")
+        self.assertEqual([hit["path"] for hit in found] + found[0]["copies"],
+                         [str(self.root / "South/almanac.txt"), str(self.root / "West/almanac.txt")])
+
+    def test_every_file_keeps_the_place_of_its_own_pages(self):
+        self.earlier()
+        # Two books with the same words in chapters that are not named alike.
+        self.file("North/book.epub", "one", "indexed", [(None, "The same chapter in both books", 0, "first.xhtml")])
+        self.file("South/book.epub", "two", "indexed", [(None, "The same chapter in both books", 0, "other.xhtml")])
+        self.old.commit()
+        self.old.close()
+        db = self.converted()
+        places = dict(db.execute("SELECT f.rel,p.section FROM pages p JOIN files f ON f.doc=p.doc WHERE p.section IS NOT NULL"))
+        self.assertEqual(places, {"North/book.epub": "first.xhtml", "South/book.epub": "other.xhtml"})
 
     def test_a_folder_with_a_dollar_sign_in_its_name_is_carried_over(self):
-        self.old.execute("UPDATE roots SET path=?", (str(self.home / "receipts$NOT_A_VARIABLE"),))
+        self.earlier().execute("UPDATE roots SET path=?", (str(self.home / "receipts$NOT_A_VARIABLE"),))
         self.old.commit()
+        self.old.close()
         db = self.converted()
         self.assertEqual(store.roots(db)[0]["path"], str(self.home / "receipts$NOT_A_VARIABLE"))
         self.assertEqual(db.execute("SELECT path FROM roots").fetchone()[0], "~/receipts$NOT_A_VARIABLE")
@@ -351,7 +454,8 @@ class Commands(Earlier):
         self.assertEqual((code, [hit["name"] for hit in json.loads(out)]), (0, ["TideTables.txt"]))
         self.assertIn("Converting the index", err)
         code, out, err = run_main(self.data, "status", "--json")
-        self.assertEqual(json.loads(out)[0]["states"], {"error": 1, "indexed": 3, "name-only": 1, "pending": 1})
+        self.assertEqual(json.loads(out)[0]["states"],
+                         {"error": 1, "indexed": 2, "name-only": 1, "needs-ocr": 1, "pending": 1})
         self.assertEqual(err, "")
         code, out, _ = run_main(self.data, "upgrade")
         self.assertIn("Nothing to convert", out)

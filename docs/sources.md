@@ -120,7 +120,7 @@ The answer is `{"ok": true, "path": "/absolute/path"}` for a file, which the sou
 
 ## identify
 
-ShelfFind asks a source which of the files of the folders it knows, at most 500 in one question. Each file comes with its address, its size, its date in seconds, and the checksums ShelfFind already has for it.
+ShelfFind asks a source which of the files of the folders it knows, at most 500 in one question. Each file comes with its address, its size, its date in seconds, and the checksums that ShelfFind measured of that very file or received from its storage; the list is empty for most files, which were never read in full.
 
 ```json
 {"version": 2, "op": "identify", "files": [
@@ -136,6 +136,8 @@ ShelfFind asks a source which of the files of the folders it knows, at most 500 
 ```
 
 A file the source does not know is left out of the answer. `basis` says how the file was recognised: `sha256` or `md5` when a checksum agreed, or words of the source's own, such as `path and size`, when it relied on something weaker. `text` is true when the source holds the text of that file, in which case ShelfFind does not read the file itself. A source that needs the network is never sent this question.
+
+The `keys` of an answer are the checksums of the bytes of the file asked about, as the source knows them. ShelfFind takes them at the source's word: two files for which a source gives the same checksum become one document, and two files for which it gives different checksums stay two. A source should therefore return `keys` only when it has reason to hold that the file of the folders is byte for byte the file it knows, and leave them out when it recognises the work alone. The word of a source never outranks a measure: when ShelfFind or the storage of the folder has the checksum of a file and the source gives another, the answer is not kept for that file.
 
 ## pages
 

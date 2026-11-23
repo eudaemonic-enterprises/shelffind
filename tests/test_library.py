@@ -55,6 +55,8 @@ def search(request):
     return found[:request["limit"]]
 
 def identify(request):
+    with open(os.path.join(HERE, "asked.jsonl"), "a") as log:
+        log.write(json.dumps(request["files"]) + "\\n")
     records = []
     for file in request["files"]:
         for work in WORKS:
@@ -132,6 +134,14 @@ class Linked(Shelf):
 
     def states(self):
         return dict(self.db.execute("SELECT f.name,d.state FROM files f JOIN docs d ON d.id=f.doc"))
+
+    def asked(self):
+        """What the library was asked about, as one dictionary name of file -> the checksums sent with it."""
+        log = self.folder / "asked.jsonl"
+        told = {}
+        for line in log.read_text().splitlines() if log.exists() else ():
+            told.update({Path(file["path"]).name: file["keys"] for file in json.loads(line)})
+        return told
 
     def test_a_file_the_library_holds_is_not_read_and_is_found_by_its_title(self):
         self.assertEqual(self.build(), (1, 0))
@@ -234,19 +244,58 @@ class Linked(Shelf):
         self.assertEqual(self.db.execute("SELECT count(*) FROM docs WHERE gone IS NOT NULL").fetchone()[0], 0)
 
     def test_the_storage_tells_the_checksum_without_the_file_being_read(self):
-        digest = hashlib.md5(BOOK.encode()).hexdigest()
-        self.works[0]["keys"].append("md5:" + digest)
+        digest = "md5:" + hashlib.md5(BOOK.encode()).hexdigest()
+        self.works[0]["keys"].append(digest)
         self.catalogue()
-        tools = self.fake_tool("rclone", f'[ "$1 $2" = "hashsum md5" ] && echo "{digest}  $(basename "$3")"\n')
-        store.declare({"Reading Room": {"path": str(self.root), "remote": "cloud:Room"}})
-        self.addCleanup(store.declare, {})
+        questions = self.twin()
         self.build()
         target = self.moved()
-        with patch.dict(os.environ, {"PATH": str(tools) + os.pathsep + os.environ["PATH"]}), \
-                patch("shelffind.indexer.proven", side_effect=AssertionError("the file was opened")):
-            self.assertEqual(self.build(), (0, 0))
+        with patch("shelffind.indexer.fingerprint", side_effect=AssertionError("the file was opened")), \
+                patch("shelffind.indexer.whole_checksums", side_effect=AssertionError("the file was opened")):
+            self.assertEqual(self.build(names_only=True), (0, 0))       # an inventory alone is enough
         self.assertEqual(self.states()[target.name], "covered")
         self.assertEqual(search(self.db, "whitham")[0]["path"], str(target))
+        self.assertIn(["hashsum", "twin:Room", ["Mechanics/" + target.name]], questions())
+        # The library was asked about the file with the checksum of that very file, and of no other.
+        self.assertEqual(self.asked()[target.name], [digest])
+        self.assertEqual(self.asked()["notes.txt"], [])
+
+    def test_a_copy_added_beside_a_document_read_by_an_earlier_version_keeps_its_text(self):
+        self.works[0].update(file="elsewhere.txt")          # the library does not know the shelf file by its name
+        self.catalogue()
+        self.build()
+        self.assertEqual(self.states()["scan-0042.txt"], "indexed")
+        with self.db:                                       # as an earlier version left it: pages, no fingerprint
+            self.db.execute("DELETE FROM doc_keys WHERE key LIKE 'fp:%'")
+            self.db.execute("UPDATE files SET print=NULL")
+        copy = self.root / "Mechanics" / "elsewhere.txt"    # the same bytes under a name the library knows
+        copy.parent.mkdir()
+        copy.write_text(BOOK)
+        os.utime(copy, (1_800_000_000, 1_800_000_000))
+        self.read.clear()
+        self.assertEqual(self.build(), (0, 0))              # one run: the fingerprint, the comparison, the record
+        self.assertEqual(self.read, [])
+        self.book.unlink()
+        self.assertEqual(self.build(), (0, 0))
+        found = search(self.db, "chapter eleven")           # the text read long ago is still that of the copy
+        self.assertEqual([(hit["path"], hit["title"]) for hit in found], [(str(copy), "Linear and Nonlinear Waves")])
+        self.assertEqual(self.read, [])
+
+    def test_a_document_partly_read_that_the_library_holds_waits_for_no_recognition(self):
+        self.works[0].update(file="elsewhere.txt")
+        self.catalogue()
+        self.build()
+        with self.db:                                       # as a scan leaves it: one page still to recognise
+            self.db.execute("UPDATE pages SET needs_ocr=1 WHERE doc=(SELECT doc FROM files WHERE name='scan-0042.txt')")
+            self.db.execute("UPDATE docs SET state='needs-ocr' WHERE id=(SELECT doc FROM files WHERE name='scan-0042.txt')")
+        self.works[0].update(file="scan-0042.txt")          # the library has learnt the file since
+        self.catalogue()
+        self.assertEqual(self.build(relink=True), (0, 0))
+        self.assertEqual(self.states()["scan-0042.txt"], "covered")
+        with patch("shelffind.extract.recognize", side_effect=AssertionError("recognised for nothing")):
+            self.assertEqual(self.build(ocr=True), (0, 0))
+        rows, _ = self.find("dispersion relation")
+        self.assertEqual([(hit["path"], hit["record"]["id"]) for hit in rows], [(str(self.book), "W1")])
 
     def test_asking_about_everything_again_withdraws_what_the_library_no_longer_holds(self):
         self.build()

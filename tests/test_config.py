@@ -34,8 +34,16 @@ class Layers(unittest.TestCase):
         self.assertEqual(settings.origins["panel.prompt"], str(self.file))
         self.assertEqual(settings.height(40), 20)
         self.assertEqual(settings.height(8), 4)
-        self.assertEqual(settings.keymap()["f7"], "scope")
+        self.assertEqual(settings.keymap()["f7"], "scope")      # a key chosen by the reader outranks a default
+        self.assertNotIn("exact", settings.keymap().values())
+        self.assertEqual(settings.warnings, [])
         self.assertNotIn("ctrl-r", settings.keymap())
+        self.assertFalse(settings["search.exact"])
+        self.assertEqual(config.defaults().keymap()["f7"], "exact")
+        both = self.load('[keys]\nscope = "f9"\nexact = "f9"\n')
+        both.keymap()
+        self.assertTrue(any("f9" in warning for warning in both.warnings))
+        settings = self.load('[panel]\nheight = "50%"\nprompt = "top"\n[keys]\nscope = "ctrl-s f7"\n')
         settings = self.load(environ={"SHELFFIND_PANEL_HEIGHT": "12", "SHELFFIND_PANEL_HELP": "false"},
                              flags={"panel.prompt": "bottom", "panel.preview": None})
         self.assertEqual((settings["panel.height"], settings["panel.help"]), (12, False))
