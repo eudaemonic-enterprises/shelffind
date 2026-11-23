@@ -11,13 +11,13 @@ import termios
 from contextlib import closing
 from pathlib import Path
 
-from . import __version__, config, desktop, doctor, helptext, indexer, shell, sources, store
+from . import __version__, config, desktop, doctor, helptext, indexer, migrate, shell, sources, store
 from .picker import panel, picker
 from .text import json_text, safe
 from .tui import report, style
 
 COMMANDS = ["search", "pick", "open", "apps", "reveal", "roots", "sources", "index", "status",
-            "config", "doctor", "cheatsheet", "init", "completion"]
+            "config", "doctor", "upgrade", "cheatsheet", "init", "completion"]
 
 
 def search_options(command):
@@ -81,6 +81,8 @@ def parser():
     cf.add_argument("--json", action="store_true")
     dr = cmds.add_parser("doctor", help="Check the installation; nothing is changed")
     dr.add_argument("--json", action="store_true")
+    up = cmds.add_parser("upgrade", help="Convert an index of the earlier format; the old one is kept")
+    up.add_argument("--discard-old", action="store_true", help="Delete the earlier index once converted")
     cmds.add_parser("cheatsheet", help="A one-screen reference")
     it = cmds.add_parser("init", help="Print a key binding for the shell: eval \"$(shelffind init bash)\"")
     it.add_argument("shell", choices=["bash"])
@@ -105,17 +107,60 @@ def listing(hits, terminal):
 
 
 def coverage(db, errors):
+    """One row per folder: its files counted by the state of their documents."""
     result = []
     for root in store.roots(db):
-        counts = dict(db.execute("SELECT state,count(*) FROM files WHERE root=? GROUP BY state",
-                                 (root["id"],)))
-        row = {"path": root["path"], "available": store.available(root), "scanned": root["scanned"],
-                   "problem": root["problem"], "files": sum(counts.values()), "states": counts}
+        counts = dict(db.execute("SELECT d.state,count(*) FROM files f JOIN docs d ON d.id=f.doc "
+                                 "WHERE f.root=? GROUP BY d.state", (root["id"],)))
+        row = {"path": root["path"], "name": root["name"], "available": store.available(root),
+               "scanned": root["scanned"], "problem": root["problem"], "files": sum(counts.values()),
+               "states": counts}
         if errors:
-            row["errors"] = [dict(r) for r in db.execute("SELECT rel,error FROM files WHERE root=? "
-                                                        "AND error IS NOT NULL", (root["id"],))]
+            row["errors"] = [dict(r) for r in db.execute(
+                "SELECT f.rel,d.error FROM files f JOIN docs d ON d.id=f.doc WHERE f.root=? "
+                "AND d.error IS NOT NULL", (root["id"],))]
         result.append(row)
     return result
+
+
+def coverage_earlier(directory, errors):
+    """The same rows read from an index of the earlier format, which `status` never converts."""
+    old = sqlite3.connect((directory / store.EARLIER).as_uri() + "?mode=ro", uri=True, timeout=10)
+    old.row_factory = sqlite3.Row
+    try:
+        result = []
+        for root in old.execute("SELECT * FROM roots ORDER BY id").fetchall():
+            counts = dict(old.execute("SELECT state,count(*) FROM files WHERE root=? GROUP BY state", (root["id"],)))
+            place = {"path": root["path"], "mount": root["mount"]}
+            row = {"path": root["path"], "name": Path(root["path"]).name, "available": store.available(place),
+                   "scanned": root["scanned"], "problem": root["problem"], "files": sum(counts.values()),
+                   "states": counts}
+            if errors:
+                row["errors"] = [dict(r) for r in old.execute(
+                    "SELECT rel,error FROM files WHERE root=? AND error IS NOT NULL", (root["id"],))]
+            result.append(row)
+        return result
+    finally:
+        old.close()
+
+
+def status(args, rows, directory, settings):
+    if args.json:
+        print(json_text(rows))
+    elif sys.stdout.isatty():
+        extra = [name for name in sources.registered(directory)]
+        for line in report.status(rows, look(settings, sys.stdout), __version__, extra,
+                                  unicode_signs(settings, sys.stdout), shutil.get_terminal_size().columns):
+            print(line)
+    else:
+        for row in rows:
+            states = ", ".join(f"{n:,} {k}" for k, n in row["states"].items())
+            print(safe(f"{row['path']}   {row['files']:,} files   {states}"))
+            if not row["available"] or row["problem"]:
+                print("  " + safe(row["problem"] or "Folder unavailable"))
+            for e in row.get("errors", []):
+                print("  " + safe(f"{e['rel']}: {e['error']}"))
+    return 0
 
 
 def find(args, db, directory, settings):
@@ -219,26 +264,32 @@ def execute(args, db, directory, settings):
         print(f"{count:,} documents processed, {failures:,} problems", file=sys.stderr)
         return int(bool(failures))
     elif args.command == "status":
-        rows = coverage(db, args.errors)
-        if args.json:
-            print(json_text(rows))
-            return 0
-        if sys.stdout.isatty():
-            extra = [name for name in sources.registered(directory)]
-            for line in report.status(rows, look(settings, sys.stdout), __version__, extra,
-                                      unicode_signs(settings, sys.stdout), shutil.get_terminal_size().columns):
-                print(line)
-            return 0
-        for row in rows:
-            states = ", ".join(f"{n:,} {k}" for k, n in row["states"].items())
-            print(safe(f"{row['path']}   {row['files']:,} files   {states}"))
-            if not row["available"] or row["problem"]:
-                print("  " + safe(row["problem"] or "Folder unavailable"))
-            for e in row.get("errors", []):
-                print("  " + safe(f"{e['rel']}: {e['error']}"))
+        return status(args, coverage(db, args.errors), directory, settings)
     elif args.command in ("search", "pick"):
         return find(args, db, directory, settings)
     return 0
+
+
+SMALL_INDEX = 64 << 20          # an earlier index below this size is converted without being asked
+
+
+def opened(args, directory):
+    """The index for a command. An index of the earlier format is converted first by the commands
+    that work on it at length (the panel, `index`, `upgrade`) and whenever it is small; a large
+    one is otherwise left alone, and the command says what to do."""
+    def say(text):
+        print(safe(text), file=sys.stderr, flush=True)
+    interactive = args.command == "pick" or (args.command == "search" and not (args.json or args.list)
+                                             and sys.stdin.isatty() and sys.stdout.isatty())
+    try:
+        return store.connect(directory, upgrade=False)
+    except store.NeedsUpgrade:
+        old = directory / store.EARLIER
+        if not (interactive or args.command in ("index", "upgrade") or old.stat().st_size < SMALL_INDEX):
+            raise
+        say("Converting the index to its new form; the earlier one is kept.")
+        migrate.upgrade(directory, say)
+        return store.connect(directory, upgrade=False)
 
 
 def configuration(args, directory, explicit):
@@ -319,8 +370,23 @@ def main(argv=None):
                     print("\n".join(desktop.applications(target["path"])))
                 else:
                     desktop.reveal(target["path"])
+            elif args.command == "upgrade":
+                if args.discard_old:
+                    freed = migrate.discard_old(directory)
+                    print(f"The earlier index is deleted: {freed / 1e6:,.1f} MB freed.")
+                elif store.earlier_format(directory) == 1 and not (directory / store.INDEX).exists():
+                    migrate.upgrade(directory, lambda text: print(safe(text), file=sys.stderr, flush=True))
+                else:
+                    print("Nothing to convert: the index has its present form.")
             else:
-                with closing(store.connect(directory)) as db:
+                try:
+                    db = opened(args, directory)
+                except store.NeedsUpgrade as waiting:
+                    if args.command == "status":        # a report never converts: it reads the old index
+                        return status(args, coverage_earlier(directory, args.errors), directory, settings)
+                    print(f"shelffind: {waiting}", file=sys.stderr)
+                    return 75
+                with closing(db):
                     return execute(args, db, directory, settings)
         return 0
     except KeyboardInterrupt:

@@ -1,5 +1,10 @@
 # Copyright 2026 Eudaemonic Enterprises Inc.
-"""Indexed spelling candidates and bounded Damerau (adjacent transposition) distance."""
+"""Indexed spelling candidates and bounded Damerau (adjacent transposition) distance.
+
+The known words come in two tiers. The words of names and folders are all kept. A word of the
+text is offered as a spelling only once two documents contain it, which leaves out the misprints
+of scans, by far the most numerous words of a large collection.
+"""
 import re
 import unicodedata
 
@@ -22,14 +27,45 @@ def grams(word):
     return " ".join(sorted(keys))
 
 
-def remember_words(db, texts, known):
+SMALL_VOCABULARY = 250_000      # below this many known words, every word may be a spelling
+
+
+def list_words(db):
+    """Enter into the spelling index the words that have just become eligible: the words of
+    names, the words that two documents contain, and every word while the collection is small
+    enough for the misprints of scans not to matter."""
+    if (db.execute("SELECT max(id) FROM words").fetchone()[0] or 0) < SMALL_VOCABULARY:
+        ready = db.execute("SELECT id,term FROM words WHERE listed=0").fetchall()
+    else:
+        ready = db.execute("SELECT id,term FROM words WHERE listed=0 AND (tier=0 OR df>=2)").fetchall()
+    db.executemany("INSERT INTO spelling(rowid,grams) VALUES(?,?)", ((row[0], grams(row[1])) for row in ready))
+    db.executemany("UPDATE words SET listed=1 WHERE id=?", ((row[0],) for row in ready))
+
+
+def remember_names(db, texts, known):
+    """Keep the words of names and folders; `known` spares the words already seen in this run."""
     pending = set()
     for text in texts:
         pending.update(w for w in words(text) if 3 <= len(w) <= 48 and w not in known)
-    db.executemany("INSERT OR IGNORE INTO words(term) VALUES(?)", ((w,) for w in sorted(pending)))
+    db.executemany("INSERT INTO words(term,tier,df) VALUES(?,0,1) ON CONFLICT(term) DO UPDATE SET tier=0",
+                   ((w,) for w in sorted(pending)))
+    if pending:
+        list_words(db)
     if len(known) > 200_000:
         known.clear()
     known.update(pending)
+
+
+def remember_text(db, texts):
+    """Count one more document for each distinct word of a text. Only words made of letters,
+    of 3 to 24 of them, are counted."""
+    seen = set()
+    for text in texts:
+        seen.update(w for w in words(text) if 3 <= len(w) <= 24 and w.isalpha())
+    db.executemany("INSERT INTO words(term,tier,df) VALUES(?,1,1) ON CONFLICT(term) DO UPDATE SET df=df+1",
+                   ((w,) for w in sorted(seen)))
+    if seen:
+        list_words(db)
 
 
 def distance(a, b, bound):
@@ -51,17 +87,19 @@ def distance(a, b, bound):
 
 
 def spellings(db, term):
+    """Up to five known words close to `term`: the closest first, then the words of names, then
+    the words that most documents contain."""
     if not 3 <= len(term) <= 48 or term.isdigit():
         return []
     bound = 1 if len(term) < 7 else 2
     match = " OR ".join(grams(term).split())
-    candidates = db.execute("SELECT w.term FROM spelling JOIN words w ON w.rowid=spelling.rowid "
+    candidates = db.execute("SELECT w.term,w.tier,w.df FROM spelling JOIN words w ON w.id=spelling.rowid "
                             "WHERE spelling MATCH ? ORDER BY rank LIMIT 64", (match,))
     good = []
-    for (word,) in candidates:
+    for word, tier, df in candidates:
         if word == term:
             continue
         cost = distance(term, word, bound)
         if cost <= bound:
-            good.append((cost, word))
-    return [w for _, w in sorted(good)[:5]]
+            good.append((cost, tier, -df, word))
+    return [entry[3] for entry in sorted(good)[:5]]

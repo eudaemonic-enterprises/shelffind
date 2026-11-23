@@ -50,8 +50,7 @@ def prepare(db, directory, query, options, settings):
         model.channels.extend(sources.registered(directory))
     except (OSError, ValueError):
         pass            # the first answer of a search carries the fault of the configuration
-    earlier = [r[0] for r in db.execute("SELECT query FROM history ORDER BY used DESC LIMIT 100")]
-    model.history = history.queries(directory, earlier)
+    model.history = history.queries(directory)
     return model
 
 

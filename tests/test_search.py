@@ -112,7 +112,7 @@ class Collection(Shelf):
         subprocess.run(["gs","-q","-dSAFER","-dBATCH","-dNOPAUSE","-sDEVICE=pdfwrite",
                         f"-sOutputFile={pdf}",str(ps)],check=True)
         self.assertEqual(self.build(),(1,0))
-        self.assertEqual(self.db.execute("SELECT state FROM files").fetchone()[0], "needs-ocr")
+        self.assertEqual(self.db.execute("SELECT state FROM docs").fetchone()[0], "needs-ocr")
         from shelffind.extract import recognize
         def interrupt(path,fmt,work,number,lang):
             if number == 2:

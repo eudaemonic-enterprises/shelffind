@@ -1,5 +1,5 @@
 # Copyright 2026 Eudaemonic Enterprises Inc.
-"""Rank filename, folder, abbreviated name, and full-text matches."""
+"""Rank filename, folder, abbreviated name, and full-text matches. One result per document."""
 import re
 from pathlib import Path
 
@@ -8,6 +8,9 @@ from . import fuzzy, store
 # Marks that surround a matched word inside a snippet while it travels through SQLite; they
 # are removed before the snippet leaves this module, which reports the matched ranges instead.
 OPEN, CLOSE = "\x02", "\x03"
+# Passages are ranked exactly when at most this many pages match. Beyond it the words are too
+# common to rank in good time: a sample of the matching pages is ranked instead.
+SAMPLE = 4000
 
 
 def query_terms(query):
@@ -103,34 +106,44 @@ def spans(text, query, kind=""):
     return merged
 
 
-def file_id(db, hit):
-    """The row of a result in the index, or None when the result is not a local file."""
+def document_id(db, hit):
+    """The document of a result, or None when the result is not a file of the folders."""
+    if hit.get("doc"):
+        return hit["doc"]
     if not hit.get("root") or not hit.get("path"):
         return None
-    found = db.execute("SELECT f.id FROM files f JOIN roots r ON r.id=f.root WHERE r.path=? AND f.rel=?",
-                       (hit["root"], str(Path(hit["path"]).relative_to(hit["root"])))).fetchone()
-    return found["id"] if found else None
+    for root in store.roots(db):
+        if root["path"] == hit["root"]:
+            found = db.execute("SELECT doc FROM files WHERE root=? AND rel=?",
+                               (root["id"], str(Path(hit["path"]).relative_to(hit["root"])))).fetchone()
+            return found["doc"] if found else None
+    return None
 
 
 def passages_of(db, hit, query, exact=False, limit=200):
     """The passages of one document that match `query`, in the order of its pages. Each is a
     dict with part (its rank among the pages, from 1), page, section, snippet and marks. With no
     words in the query, the beginning of every page is listed instead."""
-    file = file_id(db, hit)
-    if file is None:
+    doc = document_id(db, hit)
+    if doc is None:
         return []
-    order = "(SELECT count(*) FROM pages q WHERE q.file=p.file AND q.id<=p.id)"
+    first = db.execute("SELECT min(id),max(id) FROM pages WHERE doc=?", (doc,)).fetchone()
+    if first[0] is None:
+        return []
+    order = "(SELECT count(*) FROM pages q WHERE q.doc=p.doc AND q.id<=p.id)"
     parts = query_terms(query)
     if not parts:
-        rows = db.execute(f"SELECT {order} AS part,p.page,p.section,substr(p.text,1,240) AS snippet "
-                          "FROM pages p WHERE p.file=? ORDER BY p.id LIMIT ?", (file, limit)).fetchall()
+        rows = db.execute(f"SELECT {order} AS part,p.page,p.section,substr(sf_inflate(p.ztext),1,240) AS snippet "
+                          "FROM pages p WHERE p.doc=? ORDER BY p.id LIMIT ?", (doc, limit)).fetchall()
     else:
+        # The pages of a document follow one another in the index: the search is kept to them.
         sql = (f"SELECT {order} AS part,p.page,p.section,"
                f"snippet(passages,0,'{OPEN}','{CLOSE}',' … ',28) AS snippet FROM passages "
-               "JOIN pages p ON p.id=passages.rowid WHERE passages MATCH ? AND p.file=? ORDER BY p.id LIMIT ?")
-        rows = db.execute(sql, (expression(db, parts, False, exact), file, limit)).fetchall()
+               "JOIN pages p ON p.id=passages.rowid WHERE passages MATCH ? AND passages.rowid BETWEEN ? AND ? "
+               "AND p.doc=? ORDER BY p.id LIMIT ?")
+        rows = db.execute(sql, (expression(db, parts, False, exact), first[0], first[1], doc, limit)).fetchall()
         if not rows and not exact:
-            rows = db.execute(sql, (expression(db, parts, True, False), file, limit)).fetchall()
+            rows = db.execute(sql, (expression(db, parts, True, False), first[0], first[1], doc, limit)).fetchall()
     found = []
     for row in rows:
         snippet, marks = unmark(" ".join(row["snippet"].split()))
@@ -142,18 +155,19 @@ def passages_of(db, hit, query, exact=False, limit=200):
 def page_of(db, hit, part):
     """The text of the `part`-th page of a document (from 1), with its page number, its section
     and the number of parts; None when there is no such part."""
-    file = file_id(db, hit)
-    if file is None or part < 1:
+    doc = document_id(db, hit)
+    if doc is None or part < 1:
         return None
-    row = db.execute("SELECT page,section,text FROM pages WHERE file=? ORDER BY id LIMIT 1 OFFSET ?",
-                     (file, part - 1)).fetchone()
+    row = db.execute("SELECT page,section,sf_inflate(ztext) AS text FROM pages WHERE doc=? ORDER BY id "
+                     "LIMIT 1 OFFSET ?", (doc, part - 1)).fetchone()
     if row is None:
         return None
-    total = db.execute("SELECT count(*) FROM pages WHERE file=?", (file,)).fetchone()[0]
+    total = db.execute("SELECT count(*) FROM pages WHERE doc=?", (doc,)).fetchone()[0]
     return {"part": part, "page": row["page"], "section": row["section"], "text": row["text"], "parts": total}
 
 
-COLUMNS = "f.id,f.name,f.format,f.rel,f.size,f.mtime,r.path AS root"
+COLUMNS = "f.id,f.doc,f.root AS place,f.name,f.format,f.rel,f.size,f.mtime,d.title,d.byline,d.year"
+FILES = "files f JOIN docs d ON d.id=f.doc"
 
 
 def containing(text):
@@ -162,10 +176,13 @@ def containing(text):
 
 
 def search(db, query, *, root=None, fmt=None, limit=25, exact=False, where="all", folder=None, without=()):
-    """Rank the files that match `query`. `folder` keeps the files whose path contains it, and
-    `without` drops those whose name or path contains one of its words."""
+    """Rank the documents that match `query`, one result per document: a document with several
+    copies is shown through the copy that matched best, and names the others. `folder` keeps the
+    files whose path contains it, and `without` drops those whose name or path contains one of
+    its words."""
     if not 1 <= limit <= 500:
         raise ValueError("Choose a limit from 1 to 500")
+    places = {row["id"]: row["path"] for row in store.roots(db)}
     filters, bindings = "", []
     if root:
         filters += " AND f.root=?"
@@ -181,37 +198,70 @@ def search(db, query, *, root=None, fmt=None, limit=25, exact=False, where="all"
         bindings += [containing(word.lower()), containing(fuzzy.fold(word))]
     parts = query_terms(query)
     found = {}
+
     def add(row, kind, score):
-        key = row["id"]
-        item = found.get(key)
-        if item is None:
-            item = {'path': str(Path(row["root"]) / row["rel"]), 'root': row["root"],
-                        'name': row["name"], 'format': row["format"], 'match': kind, 'page': None,
-                        'section': None, 'snippet': None, 'marks': [], 'size': row["size"],
-                        'mtime': row["mtime"]}
-            found[key] = (score, item)
-        elif score < item[0]:
-            item = item[1]
+        """Returns the result of the document of `row`, created or improved by this match."""
+        place = places[row["place"]]
+        path = str(Path(place) / row["rel"])
+        entry = found.get(row["doc"])
+        if entry is None:
+            item = {'path': path, 'root': place, 'name': row["name"], 'format': row["format"],
+                    'match': kind, 'page': None, 'section': None, 'snippet': None, 'marks': [],
+                    'size': row["size"], 'mtime': row["mtime"], 'doc': row["doc"], 'copies': [],
+                    'title': row["title"], 'byline': row["byline"], 'year': row["year"]}
+            found[row["doc"]] = (score, item)
+            return item
+        item = entry[1]
+        if score < entry[0]:
             item["match"] = kind
-            found[key] = (score, item)
+            found[row["doc"]] = (score, item)
+        return item
+
+    def passages(expr, approximate):
+        """Add the documents whose text matches: ranked exactly, or through a sample when the
+        words are too common."""
+        probe = [r[0] for r in db.execute("SELECT rowid FROM passages WHERE passages MATCH ? LIMIT ?",
+                                          (expr, SAMPLE + 1))]
+        if not probe:
+            return
+        wanted = max(200, limit * 8)
+        if len(probe) <= SAMPLE:
+            ranked = [r[0] for r in db.execute(
+                "SELECT rowid FROM passages WHERE passages MATCH ? ORDER BY rank LIMIT ?", (expr, wanted))]
         else:
-            item = item[1]
-        if kind.endswith("passage") and item["snippet"] is None:
-            snippet, marks = unmark(" ".join(row["snippet"].split()))
-            item.update(snippet=snippet, marks=marks, page=row["page"], section=row["section"])
+            ranked = probe[:wanted]
+        marks = ",".join("?" * len(ranked))
+        rows = db.execute(f"SELECT p.id AS page_id,p.page,p.section,{COLUMNS} FROM pages p "
+                          "JOIN files f ON f.doc=p.doc JOIN docs d ON d.id=f.doc "
+                          f"WHERE p.id IN ({marks})" + filters, (*ranked, *bindings)).fetchall()
+        position = {page: index for index, page in enumerate(ranked)}
+        seen = {}
+        for row in sorted(rows, key=lambda r: (position[r["page_id"]], r["id"])):
+            if row["doc"] in seen:
+                continue
+            if len(seen) >= limit:
+                break
+            item = add(row, "fuzzy passage" if approximate else "passage",
+                       (4 if approximate else 2) + len(seen) / (limit + 1))
+            seen[row["doc"]] = True
+            if item["snippet"] is None:
+                text = db.execute(f"SELECT snippet(passages,0,'{OPEN}','{CLOSE}',' … ',18) FROM passages "
+                                  "WHERE passages MATCH ? AND rowid=?", (expr, row["page_id"])).fetchone()
+                snippet, lit = unmark(" ".join((text[0] if text else "").split()))
+                item.update(snippet=snippet, marks=lit, page=row["page"], section=row["section"])
 
     if not parts:
         if query.strip():
             return []
-        sql = f"SELECT {COLUMNS} FROM files f JOIN roots r ON r.id=f.root WHERE 1" + filters
-        for i, row in enumerate(db.execute(sql + " ORDER BY f.mtime DESC,f.id LIMIT ?", (*bindings, limit))):
+        sql = f"SELECT {COLUMNS} FROM {FILES} WHERE 1" + filters
+        for i, row in enumerate(db.execute(sql + " ORDER BY f.mtime DESC,f.id LIMIT ?", (*bindings, limit * 2))):
             add(row, "recent", i)
     else:
         def matches(expr, approximate):
             name_sql = (f"SELECT {COLUMNS} FROM names JOIN files f ON f.id=names.rowid "
-                        "JOIN roots r ON r.id=f.root WHERE names MATCH ?" + filters)
+                        "JOIN docs d ON d.id=f.doc WHERE names MATCH ?" + filters)
             if where != "text":
-                for i, row in enumerate(db.execute(name_sql + " ORDER BY rank LIMIT ?",
+                for i, row in enumerate(db.execute(name_sql + " ORDER BY bm25(names,10.0,3.0,6.0,3.0) LIMIT ?",
                                                     (expr, *bindings, limit * 2))):
                     name = fuzzy.fold(row["name"])
                     label = "fuzzy name or path" if approximate else "name or path"
@@ -219,21 +269,8 @@ def search(db, query, *, root=None, fmt=None, limit=25, exact=False, where="all"
                     if name == fuzzy.fold(query) or fuzzy.fold(Path(row["name"]).stem) == fuzzy.fold(query):
                         tier = 0
                     add(row, label, tier + i / (2 * limit + 1))
-            if where == "name":
-                return
-            text_sql = (f"SELECT {COLUMNS},p.page,p.section,"
-                        f"snippet(passages,0,'{OPEN}','{CLOSE}',' … ',18) AS snippet "
-                        "FROM passages JOIN pages p ON p.id=passages.rowid JOIN files f ON f.id=p.file "
-                        "JOIN roots r ON r.id=f.root WHERE passages MATCH ?" + filters + " ORDER BY rank")
-            seen = set()
-            for row in db.execute(text_sql, (expr, *bindings)):
-                if row["id"] in seen:
-                    continue
-                add(row, "fuzzy passage" if approximate else "passage",
-                    (4 if approximate else 2) + len(seen) / (limit + 1))
-                seen.add(row["id"])
-                if len(seen) >= limit:
-                    break
+            if where != "name":
+                passages(expr, approximate)
         primary = expression(db, parts, False, exact)
         matches(primary, False)
         if not exact and len(found) < limit:
@@ -243,7 +280,7 @@ def search(db, query, *, root=None, fmt=None, limit=25, exact=False, where="all"
             if where != "text" and len(parts) == 1 and not parts[0][1] and 2 <= len(parts[0][0]) <= 24:
                 term = parts[0][0].replace(" ", "")
                 pattern = "%" + "%".join(term) + "%"
-                sql = (f"SELECT {COLUMNS} FROM files f JOIN roots r ON r.id=f.root "
+                sql = (f"SELECT {COLUMNS} FROM {FILES} "
                        "WHERE f.folded LIKE ?" + filters + " ORDER BY length(f.name),f.id LIMIT ?")
                 for i, row in enumerate(db.execute(sql, (pattern, *bindings, limit * 2))):
                     add(row, "abbreviated name", 5 + i / (2 * limit + 1))
@@ -256,4 +293,29 @@ def search(db, query, *, root=None, fmt=None, limit=25, exact=False, where="all"
         names = [entry for entry in ranked if not entry[1]["match"].endswith("passage")]
         names = names[:limit - min(len(texts), limit // 3)]
         ranked = sorted(names + texts[:limit - len(names)], key=order)
-    return [item for _, item in ranked[:limit]]
+    results = [item for _, item in ranked[:limit]]
+    for item in results:
+        others = db.execute("SELECT root,rel FROM files WHERE doc=? ORDER BY id", (item["doc"],))
+        item["copies"] = [path for path in (str(Path(places[r["root"]]) / r["rel"]) for r in others)
+                          if path != item["path"]]
+    return results
+
+
+def by_paths(db, paths, kind="opened"):
+    """Results for the files at the given addresses that the index still knows, in that order."""
+    places = store.roots(db)
+    found, seen = [], set()
+    for path in paths:
+        for root in places:
+            if path.startswith(root["path"].rstrip("/") + "/"):
+                row = db.execute(f"SELECT {COLUMNS} FROM {FILES} WHERE f.root=? AND f.rel=?",
+                                 (root["id"], path[len(root["path"].rstrip("/")) + 1:])).fetchone()
+                if row and row["doc"] not in seen:
+                    seen.add(row["doc"])
+                    found.append({'path': path, 'root': root["path"], 'name': row["name"],
+                                  'format': row["format"], 'match': kind, 'page': None, 'section': None,
+                                  'snippet': None, 'marks': [], 'size': row["size"], 'mtime': row["mtime"],
+                                  'doc': row["doc"], 'copies': [], 'title': row["title"],
+                                  'byline': row["byline"], 'year': row["year"]})
+                break
+    return found

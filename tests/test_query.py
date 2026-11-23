@@ -7,7 +7,7 @@ import unittest
 
 from shelffind import sources
 from shelffind.query import split
-from shelffind.search import file_id, page_of, passages_of, search, spans, unmark
+from shelffind.search import document_id, page_of, passages_of, search, spans, unmark
 
 from support import Shelf
 
@@ -124,8 +124,8 @@ class OneDocument(Shelf):
         self.assertIn("A neap tide comes a week later", page["text"])
         self.assertIsNone(page_of(self.db, self.hit, 6))
         self.assertIsNone(page_of(self.db, self.hit, 0))
-        self.assertEqual(file_id(self.db, self.hit), self.db.execute(
-            "SELECT id FROM files WHERE name='TideTables.pdf'").fetchone()[0])
+        self.assertEqual(document_id(self.db, {**self.hit, "doc": None}), self.db.execute(
+            "SELECT doc FROM files WHERE name='TideTables.pdf'").fetchone()[0])
 
 
 if __name__ == "__main__":

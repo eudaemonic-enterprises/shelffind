@@ -127,7 +127,7 @@ class Commands(Shelf):
         self.assertIn(code, (0, 1))
         self.assertTrue(all(set(row) == {"status", "label", "detail", "remedy"} for row in rows))
         self.assertEqual(rows[0]["label"], "shelffind")
-        self.assertTrue(any(row["label"] == "folder" and row["detail"] == str(self.root) for row in rows))
+        self.assertTrue(any(row["label"] == "folder" and row["detail"].endswith(str(self.root)) for row in rows))
         code, out, _ = self.run_cli("doctor")
         self.assertTrue(out.startswith("[ ok ] shelffind"))
         code, out, _ = self.run_cli("cheatsheet")

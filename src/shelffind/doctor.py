@@ -58,8 +58,11 @@ def checks(directory, explicit):
         settings = None
         yield "fail", "settings", str(error), "correct the settings file"
 
-    index = directory / "index.sqlite3"
-    if not index.is_file():
+    index = directory / store.INDEX
+    if not index.is_file() and store.earlier_format(directory) == 1:
+        yield "warn", "index", f"{directory / store.EARLIER} has the earlier format", \
+            "run `shelffind upgrade`; the earlier index is kept beside the new one"
+    elif not index.is_file():
         yield "note", "index", f"none yet in {directory}", "run `shelffind roots add FOLDER` and `shelffind index`"
     else:
         try:
@@ -68,16 +71,23 @@ def checks(directory, explicit):
             try:
                 version = db.execute("PRAGMA user_version").fetchone()[0]
                 files = db.execute("SELECT count(*) FROM files").fetchone()[0]
-                waiting = db.execute("SELECT count(*) FROM files WHERE state='pending'").fetchone()[0]
-                yield "ok", "index", f"{index} (format {version}): {files:,} files, {waiting:,} waiting to be read", ""
-                for root in db.execute("SELECT * FROM roots ORDER BY id").fetchall():
+                documents = db.execute("SELECT count(DISTINCT doc) FROM files").fetchone()[0]
+                waiting = db.execute("SELECT count(DISTINCT f.doc) FROM files f JOIN docs d ON d.id=f.doc "
+                                     "WHERE d.state='pending'").fetchone()[0]
+                yield "ok", "index", (f"{index} (format {version}): {files:,} files, {documents:,} documents, "
+                                      f"{waiting:,} waiting to be read"), ""
+                for row in db.execute("SELECT * FROM roots ORDER BY id").fetchall():
+                    root = store.root_row(row)
                     if store.available(root):
-                        yield "ok", "folder", root["path"], ""
+                        yield "ok", "folder", f"{root['name']}: {root['path']}", ""
                     else:
-                        yield "warn", "folder", f"{root['path']} is not reachable now", \
+                        yield "warn", "folder", f"{root['name']}: {root['path']} is not reachable now", \
                             "mount it; its last inventory stays searchable"
             finally:
                 db.close()
+            if store.earlier_format(directory):
+                yield "note", "earlier index", f"{directory / store.EARLIER} is kept", \
+                    "`shelffind upgrade --discard-old` deletes it once the new index has served you well"
         except sqlite3.Error as error:
             yield "fail", "index", f"{index}: {error}", "run `shelffind status` for details"
 

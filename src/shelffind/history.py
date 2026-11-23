@@ -9,9 +9,9 @@ NAME = "history.jsonl"
 LIMIT = 1 << 20          # beyond this size the oldest half of the file is dropped
 
 
-def record(directory, action, query, hit=None, page=None):
+def record(directory, action, query, hit=None, page=None, when=None):
     """Remember one use of the panel. A failure to write is never an error for the user."""
-    event = {"t": int(time.time()), "act": action, "q": query}
+    event = {"t": int(time.time()) if when is None else int(when), "act": action, "q": query}
     if hit:
         event.update(path=hit.get("path"), source=hit.get("source"), id=hit.get("id"),
                      name=hit.get("name"), page=page)
@@ -52,11 +52,24 @@ def events(directory, limit=400):
     return found
 
 
-def queries(directory, earlier=()):
-    """Distinct searches, newest first, followed by those of the earlier history table."""
+def queries(directory):
+    """Distinct searches, newest first."""
     seen, found = set(), []
-    for query in [e["q"] for e in events(directory)] + list(earlier):
+    for query in (event["q"] for event in events(directory)):
         if query.strip() and query not in seen:
             seen.add(query)
             found.append(query)
+    return found
+
+
+def documents(directory, limit=30):
+    """The addresses of the documents opened lately, newest first, each once."""
+    seen, found = set(), []
+    for event in events(directory):
+        path = event.get("path")
+        if path and event.get("act") in ("open", "launch", "address") and path not in seen:
+            seen.add(path)
+            found.append(path)
+            if len(found) >= limit:
+                break
     return found

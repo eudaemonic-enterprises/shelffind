@@ -11,9 +11,9 @@ import time
 from itertools import zip_longest
 from pathlib import Path
 
-from . import fuzzy, store
+from . import fuzzy, history, store
 from .query import split
-from .search import query_terms, search
+from .search import by_paths, query_terms, search
 
 
 # Sources declared in the settings file, as name -> command with its arguments. The command
@@ -129,6 +129,11 @@ def find(db, directory, query, options, publish, cancelled=lambda: False):
     groups, errors = [], []
     if source in (None, "files"):
         local = search(db, query, **opts)
+        if not query.strip() and not (opts.get("root") or opts.get("fmt") or opts.get("folder") or typed.without):
+            # Nothing is asked yet: the documents opened lately come first.
+            lately = by_paths(db, history.documents(directory))
+            seen = {row["doc"] for row in lately}
+            local = (lately + [row for row in local if row["doc"] not in seen])[:opts["limit"]]
         for row in local:
             row["source"] = "files"
         groups.append(local)
