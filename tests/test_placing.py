@@ -553,6 +553,28 @@ class Behind(Placing):
         self.assertEqual(self.build(retry=True), (1, 0))
         self.sound()
 
+    def test_a_file_measured_by_a_run_that_wrote_no_page_is_put_to_the_sources_in_that_run(self):
+        self.write("a/book.txt")
+        self.assertEqual(self.build(), (1, 0))              # the document is read through its first file
+        self.write("b/copy.txt")                            # a copy arrives, of which the storage says nothing yet
+        asked = []
+
+        def question(directory, name, op, **fields):
+            asked.extend((Path(file["path"]).name, len(file["keys"])) for file in fields["files"])
+            return {"records": []}
+
+        usable = lambda directory, progress=None: ({"library": ["library"]}, {"library": False}, set())
+        with patch("shelffind.link.usable", side_effect=usable), patch("shelffind.sources.question", side_effect=question), \
+                patch("shelffind.sources.policy", return_value={"text": "ignore", "identify": True}):
+            self.read.clear()
+            self.assertEqual((self.build(), self.read), ((0, 0), []))   # copied, it is the document: nothing to read
+            # The source was asked about it twice in that one run: by its address, then by its checksums.
+            self.assertEqual([entry for entry in asked if entry[0] == "copy.txt"], [("copy.txt", 0), ("copy.txt", 2)])
+            del asked[:]
+            self.assertEqual((self.build(), asked), ((0, 0), []))
+        self.assertEqual(self.documents(), 1)
+        self.sound()
+
     def test_a_run_allowed_one_reading_stops_though_the_files_of_its_document_turn_out_to_differ(self):
         one = self.write("a/book.txt")
         self.write("b/book.txt", OTHER)

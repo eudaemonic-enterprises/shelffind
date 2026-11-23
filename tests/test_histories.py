@@ -4,7 +4,8 @@
 A small world is driven at random: files are written, changed, copied, moved and removed in
 two folders, one of which has a storage that tells checksums and may lag behind; two sources
 recognise files, by their address, rightly or wrongly, or by their checksum; one work in four
-is a scan, whose second page is recognised by a later run; the index is brought up to date now
+is a scan, whose second page is recognised by a later run, and one in seven cannot be read at
+all; the index is brought up to date now
 and then, by an inventory, in full, for one file, or for the recognition; a folder is forgotten
 and registered again, and a month passes. Since the test knows what every
 file holds, it can tell after each step whether a file shows a text that is not its own, and
@@ -61,6 +62,7 @@ class World:
         self.aim = None
         self.extracted = []
         self.recognised = []
+        self.stumbled = []
         self.log = []
 
     # ---- the truth ------------------------------------------------------------------------
@@ -207,6 +209,10 @@ class World:
         """True for a work that is a scan: its second page waits for a recognition."""
         return work % 4 == 0
 
+    def broken(self, work):
+        """True for a work that no reader can read: every reading of it fails."""
+        return work % 7 == 3
+
     def misled(self):
         """The files of which the storage holds other bytes under the same size and the same
         second, as after an edit within one second that it has not received yet: the stated
@@ -233,7 +239,8 @@ class World:
                 doc = store.new_document(db, file["size"], file["format"])
                 path = places[file["root"]] / file["rel"]
                 same = path.is_file() and (path.stat().st_size, path.stat().st_mtime_ns) == (file["size"], file["mtime"])
-                read = same and file["format"] in extract.SUPPORTED and self.dice.random() < 0.7
+                read = same and file["format"] in extract.SUPPORTED and self.dice.random() < 0.7 \
+                    and not self.broken(self.holds[path])           # which the earlier version could not read either
                 if read and self.scan_of(self.holds[path]):
                     db.execute("INSERT INTO pages(doc,page,section,ztext,needs_ocr) VALUES(?,1,NULL,?,0)",
                                (doc, store.deflate(path.read_bytes().decode())))
@@ -271,6 +278,9 @@ class Histories(unittest.TestCase):
 
             def reading(path, fmt, work):
                 held = world.work_of(path.read_bytes())
+                if world.broken(held):
+                    world.stumbled.append((held, fmt))
+                    raise RuntimeError("the reader stumbled")
                 world.extracted.append((held, fmt))
                 if world.scan_of(held):                     # a scan: one page of text, one still to recognise
                     return [extract.Passage(1, None, path.read_bytes().decode()), extract.Passage(2, None, "", True)]
@@ -317,9 +327,12 @@ class Histories(unittest.TestCase):
         complete = {(row["origin"], row["format"]) for row in db.execute(
             "SELECT origin,format FROM docs d WHERE origin LIKE '%sha256:%' AND NOT EXISTS "
             "(SELECT 1 FROM pages p WHERE p.doc=d.id AND p.needs_ocr=1)")}
-        recognised = len(world.recognised)
+        recognised, stumbled = len(world.recognised), len(world.stumbled)
         (done, failures), extracted = world.build(kind)
-        self.assertEqual(failures, 0, where)
+        # A reading fails only for a work that cannot be read, once in a run for each such
+        # document, and each failure is counted.
+        failed = world.stumbled[stumbled:]
+        self.assertEqual((failures, len(set(failed))), (len(failed), len(failed)), where)
         self.assertEqual(invariants.structure(db), [], where)
         self.assertEqual(invariants.actual(db), invariants.canonical(db), where)
         # No document is read a second time while the text read from its bytes is kept.
@@ -350,16 +363,27 @@ class Histories(unittest.TestCase):
         if current != {path: held for path, held in world.twin.items() if path in world.holds}:
             return
         # A full run with a storage that is up to date leaves nothing waiting, and a second run nothing to do.
-        states = "'needs-ocr','ocr-error'" if kind == "recognise" else "'pending','error'"
+        states = "'needs-ocr','ocr-error'" if kind == "recognise" else "'pending'"
         waiting = db.execute(f"SELECT f.rel FROM files f JOIN docs d ON d.id=f.doc WHERE d.state IN ({states})").fetchall()
         self.assertEqual([row["rel"] for row in waiting], [], where)
+        # A document is left as failed only when it holds a work that cannot be read, and every
+        # measured file of such a work is in a document that failed or was left to a source.
+        for file in db.execute("SELECT f.*,d.state FROM files f JOIN docs d ON d.id=f.doc").fetchall():
+            work = world.holds[places[file["root"]] / file["rel"]]
+            if file["state"] == "error":
+                works = {world.holds[places[other["root"]] / other["rel"]] for other in
+                         db.execute("SELECT root,rel FROM files WHERE doc=?", (file["doc"],))}
+                self.assertTrue(any(world.broken(held) for held in works), f"{where}: {file['rel']} is marked as failed")
+            elif kind == "full" and world.broken(work) and file["sum"] and file["format"] in extract.SUPPORTED:
+                self.assertIn(file["state"], ("covered",), f"{where}: {file['rel']} cannot be read and is {file['state']}")
         snapshot = lambda: [db.execute(question).fetchall() for question in (
             "SELECT id,doc,sum,read,asked FROM files ORDER BY id", "SELECT id,state,origin,title FROM docs ORDER BY id",
             "SELECT key,doc,basis FROM doc_keys ORDER BY key", "SELECT id,doc,file,source,ref,keys FROM records ORDER BY id")]
         before, questions = [[tuple(row) for row in rows] for rows in snapshot()], world.questions
         (done, failures), extracted = world.build(kind)
         world.log.pop()
-        self.assertEqual((done, failures, extracted, world.questions - questions), (0, 0, [], 0), f"{where}, a second full run")
+        self.assertEqual((done, failures, extracted, world.questions - questions, world.stumbled[stumbled + len(failed):]),
+                         (0, 0, [], 0, []), f"{where}, a second full run")
         self.assertEqual([[tuple(row) for row in rows] for rows in snapshot()], before, f"{where}, a second full run")
         # Files that hold the same bytes, both measured, are one document.
         seen = {}
