@@ -25,9 +25,16 @@ class Model:
     seconds: float | None = None
     version: int = 0                     # number of the search whose answers are awaited
     fresh: bool = True                   # no answer to that search has come yet
-    mode: str = "search"                 # search, apps or help
+    mode: str = "search"                 # search, apps, help, actions, passages or reading
     apps: list = field(default_factory=list)
     app: int = 0
+    actions: list = field(default_factory=list)     # (label, thing to do) for the chosen result
+    action: int = 0
+    document: dict | None = None         # the result whose passages are listed or read
+    passages: list = field(default_factory=list)
+    passage: int = 0
+    reading: dict | None = None          # the page being read: part, page, section, text, parts
+    scroll: int = 0                      # first line of the page shown
     history: list = field(default_factory=list)     # earlier searches, newest first
     recalled: int = -1
     draft: str = ""                      # what was typed before recalling an earlier search
@@ -133,18 +140,71 @@ def update(model, event, keymap):
     if model.mode == "help":
         model.mode = "search"
         return []
+    step = {"up": -1, "down": 1, "page-up": -model.page, "page-down": model.page}.get(action, 0)
     if model.mode == "apps":
         if action == "quit":
             model.mode = "search"
-        elif action in ("up", "down") and model.apps:
-            model.app = max(0, min(len(model.apps) - 1, model.app + (1 if action == "down" else -1)))
+        elif step and model.apps:
+            model.app = max(0, min(len(model.apps) - 1, model.app + step))
         elif action == "open" and model.apps:
             model.mode = "search"
             return [("launch", model.hit(), model.apps[model.app])]
         return []
+    if model.mode == "actions":
+        if action == "quit":
+            model.mode = "search"
+        elif step and model.actions:
+            model.action = max(0, min(len(model.actions) - 1, model.action + step))
+        elif action == "open" and model.actions:
+            model.mode = "search"
+            return [model.actions[model.action][1]]
+        return []
+    if model.mode == "passages":
+        chosen = model.passages[model.passage] if model.passages else None
+        if action == "quit":
+            model.mode = "search"
+        elif step and model.passages:
+            model.passage = max(0, min(len(model.passages) - 1, model.passage + step))
+        elif action == "open" and chosen:
+            return [("open", {**model.document, "page": chosen["page"], "snippet": chosen["snippet"],
+                              "marks": chosen["marks"]})]
+        elif action == "passages" and chosen:
+            return [("read", model.document, chosen["part"])]
+        elif action in ("address", "reveal", "copy"):
+            return [(action, model.document)]
+        return []
+    if model.mode == "reading":
+        page = model.reading
+        if action in ("quit", "passages"):
+            model.mode = "passages"
+        elif action in ("up", "down"):
+            model.scroll = max(0, model.scroll + step)
+        elif action in ("page-up", "page-down"):
+            return [("read", model.document, page["part"] + (1 if action == "page-down" else -1))]
+        elif action == "open":
+            return [("open", {**model.document, "page": page["page"], "snippet": None, "marks": []})]
+        elif action in ("address", "reveal", "copy"):
+            return [(action, model.document)]
+        return []
 
     if action == "quit":
         return [("quit",)]
+    if isinstance(event, Key) and event.name.startswith("alt-") and event.name[4:] in "123456789" \
+            and len(event.name) == 5:
+        index = int(event.name[4:]) - 1         # Alt-1 is the best match, next to the prompt
+        if index < len(model.results):
+            model.selected = index
+            return [("open", model.results[index])]
+        return []
+    if action == "actions" and model.hit():
+        hit = model.hit()
+        model.actions = [("Open", ("open", hit)), ("Open with another program", ("apps", hit)),
+                         ("Show in the file manager", ("reveal", hit)), ("Copy the address", ("copy", hit)),
+                         ("Give the address", ("address", hit)), ("List its passages", ("passages", hit))]
+        model.mode, model.action = "actions", 0
+        return []
+    if action == "passages" and model.hit():
+        return [("passages", model.hit())]
     if action == "help":
         model.mode = "help"
         return []

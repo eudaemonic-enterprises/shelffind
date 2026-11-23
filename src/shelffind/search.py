@@ -103,6 +103,56 @@ def spans(text, query, kind=""):
     return merged
 
 
+def file_id(db, hit):
+    """The row of a result in the index, or None when the result is not a local file."""
+    if not hit.get("root") or not hit.get("path"):
+        return None
+    found = db.execute("SELECT f.id FROM files f JOIN roots r ON r.id=f.root WHERE r.path=? AND f.rel=?",
+                       (hit["root"], str(Path(hit["path"]).relative_to(hit["root"])))).fetchone()
+    return found["id"] if found else None
+
+
+def passages_of(db, hit, query, exact=False, limit=200):
+    """The passages of one document that match `query`, in the order of its pages. Each is a
+    dict with part (its rank among the pages, from 1), page, section, snippet and marks. With no
+    words in the query, the beginning of every page is listed instead."""
+    file = file_id(db, hit)
+    if file is None:
+        return []
+    order = "(SELECT count(*) FROM pages q WHERE q.file=p.file AND q.id<=p.id)"
+    parts = query_terms(query)
+    if not parts:
+        rows = db.execute(f"SELECT {order} AS part,p.page,p.section,substr(p.text,1,240) AS snippet "
+                          "FROM pages p WHERE p.file=? ORDER BY p.id LIMIT ?", (file, limit)).fetchall()
+    else:
+        sql = (f"SELECT {order} AS part,p.page,p.section,"
+               f"snippet(passages,0,'{OPEN}','{CLOSE}',' … ',28) AS snippet FROM passages "
+               "JOIN pages p ON p.id=passages.rowid WHERE passages MATCH ? AND p.file=? ORDER BY p.id LIMIT ?")
+        rows = db.execute(sql, (expression(db, parts, False, exact), file, limit)).fetchall()
+        if not rows and not exact:
+            rows = db.execute(sql, (expression(db, parts, True, False), file, limit)).fetchall()
+    found = []
+    for row in rows:
+        snippet, marks = unmark(" ".join(row["snippet"].split()))
+        found.append({"part": row["part"], "page": row["page"], "section": row["section"],
+                      "snippet": snippet, "marks": marks})
+    return found
+
+
+def page_of(db, hit, part):
+    """The text of the `part`-th page of a document (from 1), with its page number, its section
+    and the number of parts; None when there is no such part."""
+    file = file_id(db, hit)
+    if file is None or part < 1:
+        return None
+    row = db.execute("SELECT page,section,text FROM pages WHERE file=? ORDER BY id LIMIT 1 OFFSET ?",
+                     (file, part - 1)).fetchone()
+    if row is None:
+        return None
+    total = db.execute("SELECT count(*) FROM pages WHERE file=?", (file,)).fetchone()[0]
+    return {"part": part, "page": row["page"], "section": row["section"], "text": row["text"], "parts": total}
+
+
 COLUMNS = "f.id,f.name,f.format,f.rel,f.size,f.mtime,r.path AS root"
 
 

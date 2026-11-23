@@ -190,6 +190,29 @@ class Panel(Shelf):
         session.send("\r")
         self.assertEqual(session.finish()[0], 0)
 
+    def test_passages_a_page_read_the_actions_and_the_rank_keys(self):
+        session = self.start("pick", "brass", stdout=str(self.out), cols=100, rows=24)
+        session.wait_for("1 of 2")
+        session.send("\x0f")                                # Ctrl-O: the passages of the document
+        session.wait_for("[ PASSAGES ] brass")
+        session.wait_for("▌ part 1")
+        session.send("\x0f")                                # again: the page itself
+        session.wait_for("[ PART 1 ] brass")
+        session.wait_for("  Brass compass below the deck.")
+        session.send("\x1b", pause=0.3)
+        session.wait_for("[ PASSAGES ] brass")
+        session.send("\x1b", pause=0.3)
+        session.wait_for("[ ALL ] brass")
+        session.send("\x18")                                # Ctrl-X: what can be done
+        session.wait_for("[ ACTIONS ] OrchardCalendar")
+        session.wait_for("▌ Open")
+        session.send("\x1b", pause=0.3)
+        session.wait_for("[ ALL ] brass")
+        session.wait_for("2 txt   HarbourTides")
+        session.send("\x1b2")                               # Alt-2: the second best, at once
+        code, _ = session.finish()
+        self.assertEqual((code, self.out.read_text()), (0, str(self.root / "HarbourTides.txt") + "\n"))
+
 
 if __name__ == "__main__":
     unittest.main()

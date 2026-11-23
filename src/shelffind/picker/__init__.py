@@ -8,8 +8,9 @@ import subprocess
 import threading
 from dataclasses import dataclass
 
-from .. import desktop, history, sources, store
+from .. import desktop, history, search, sources, store
 from ..config import KEYS
+from ..query import split
 from ..text import safe
 from ..tui import style
 from ..tui.app import App, Terminal
@@ -135,6 +136,20 @@ def panel(db, directory, query, options, settings, enter="open", quote=False, wi
             return True
         return False
 
+    def list_passages(hit):
+        """Ctrl-O: the passages of the chosen document, the one of the result selected first."""
+        if hit["source"] != "files":
+            model.message = "Passages are listed for the files of the folders"
+            return
+        found = search.passages_of(db, hit, split(model.query).words, model.options.get("exact", False))
+        if not found:
+            found = search.passages_of(db, hit, "")         # no match in the text: every page
+        if not found:
+            model.message = "No text of this document has been read yet"
+            return
+        model.document, model.passages, model.mode = hit, found, "passages"
+        model.passage = next((i for i, item in enumerate(found) if item["page"] == hit.get("page")), 0)
+
     def handle(event):
         if isinstance(event, Done):
             return finished(event)
@@ -148,6 +163,12 @@ def panel(db, directory, query, options, settings, enter="open", quote=False, wi
                 model.busy, model.fresh, model.message = True, True, ""
             elif kind == "open" and enter == "print":
                 start("address", effect[1])
+            elif kind == "passages":
+                list_passages(effect[1])
+            elif kind == "read":
+                page = search.page_of(db, effect[1], effect[2])
+                if page:
+                    model.reading, model.scroll, model.mode = page, 0, "reading"
             elif kind == "launch":
                 start("launch", effect[1], effect[2])
             else:

@@ -3,6 +3,7 @@
 import argparse
 import curses
 import os
+import shutil
 import sqlite3
 import subprocess
 import sys
@@ -13,7 +14,7 @@ from pathlib import Path
 from . import __version__, config, desktop, doctor, helptext, indexer, shell, sources, store
 from .picker import panel, picker
 from .text import json_text, safe
-from .tui import style
+from .tui import report, style
 
 COMMANDS = ["search", "pick", "open", "apps", "reveal", "roots", "sources", "index", "status",
             "config", "doctor", "cheatsheet", "init", "completion"]
@@ -152,10 +153,23 @@ def find(args, db, directory, settings):
         print(safe(problem), file=sys.stderr)
     if args.json:
         print(json_text(hits))
+    elif sys.stdout.isatty():
+        for line in report.results(hits, look(settings, sys.stdout)):
+            print(line)
     else:
-        for line in listing(hits, sys.stdout.isatty()):
+        for line in listing(hits, False):
             print(line)
     return int(bool(problem) and not hits)
+
+
+def look(settings, stream):
+    """The colour theme for what is printed on `stream`: none unless it is a terminal."""
+    return style.theme(settings["panel.theme"], settings.tables["theme"], os.environ, stream.isatty())
+
+
+def unicode_signs(settings, stream):
+    choice = settings["panel.glyphs"]
+    return choice == "unicode" if choice != "auto" else "utf" in (stream.encoding or "").lower()
 
 
 def execute(args, db, directory, settings):
@@ -187,15 +201,33 @@ def execute(args, db, directory, settings):
         for path in files:
             if not path.is_file() or not any(path.is_relative_to(r["path"]) for r in roots):
                 raise ValueError(f"File outside the selected roots: {path}")
-        count, failures = indexer.build(db, directory, roots, names_only=args.names_only, ocr=args.ocr,
-                                        languages=args.lang, retry=args.retry, limit=args.limit,
-                                        paths=files, progress=lambda s: print(safe(s), file=sys.stderr, flush=True))
+        live = None
+        if sys.stderr.isatty():         # at a terminal: one line follows the documents being read
+            def write(text):
+                sys.stderr.write(text)
+                sys.stderr.flush()
+            live = report.Progress(write, lambda: shutil.get_terminal_size(), look(settings, sys.stderr))
+        try:
+            count, failures = indexer.build(
+                db, directory, roots, names_only=args.names_only, ocr=args.ocr, languages=args.lang,
+                retry=args.retry, limit=args.limit, paths=files,
+                progress=live.message if live else lambda s: print(safe(s), file=sys.stderr, flush=True),
+                on_document=live.document if live else None)
+        finally:
+            if live:
+                live.clear()
         print(f"{count:,} documents processed, {failures:,} problems", file=sys.stderr)
         return int(bool(failures))
     elif args.command == "status":
         rows = coverage(db, args.errors)
         if args.json:
             print(json_text(rows))
+            return 0
+        if sys.stdout.isatty():
+            extra = [name for name in sources.registered(directory)]
+            for line in report.status(rows, look(settings, sys.stdout), __version__, extra,
+                                      unicode_signs(settings, sys.stdout), shutil.get_terminal_size().columns):
+                print(line)
             return 0
         for row in rows:
             states = ", ".join(f"{n:,} {k}" for k, n in row["states"].items())

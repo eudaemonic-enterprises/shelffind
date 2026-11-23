@@ -162,9 +162,9 @@ class Frames(unittest.TestCase):
         self.assertEqual(plain(frame(self.model(), 80, 10, self.look)), [
             "",
             "ShelfFind  39 033 files · library       enter open · tab address · ctrl-r scope",
-            "  library  On the dispersion of waves            Kelvin (1887). · publ…",
-            "  djvu     Stokes-OnTheTheoryOfOscillatoryWave…  Books › Solitons         p. 12",
-            "  pdf      Rayleigh-OnProgressiveWaves-LondonM…  Books › Dispersion",
+            "4 library  On the dispersion of waves            Kelvin (1887). · publ…",
+            "3 djvu     Stokes-OnTheTheoryOfOscillatoryWave…  Books › Solitons         p. 12",
+            "2 pdf      Rayleigh-OnProgressiveWaves-LondonM…  Books › Dispersion",
             "▌ pdf      Lamb-Hydrodynamics-CUP-1932           Books › Waves             p. 3",
             "[ ALL ] dispersion                                               1 of 4 · 18 ms",
             "│ p. 3  For waves on deep water the dispersion relation gives the frequency in…",
@@ -175,10 +175,10 @@ class Frames(unittest.TestCase):
     def test_prompt_at_the_top(self):
         self.assertEqual(plain(frame(self.model(selected=2, bottom=False), 80, 10, self.look)), [
             "[ ALL ] dispersion                                               3 of 4 · 18 ms",
-            "  pdf      Lamb-Hydrodynamics-CUP-1932           Books › Waves             p. 3",
-            "  pdf      Rayleigh-OnProgressiveWaves-LondonM…  Books › Dispersion",
+            "1 pdf      Lamb-Hydrodynamics-CUP-1932           Books › Waves             p. 3",
+            "2 pdf      Rayleigh-OnProgressiveWaves-LondonM…  Books › Dispersion",
             "▌ djvu     Stokes-OnTheTheoryOfOscillatoryWave…  Books › Solitons         p. 12",
-            "  library  On the dispersion of waves            Kelvin (1887). · publ…",
+            "4 library  On the dispersion of waves            Kelvin (1887). · publ…",
             "│ p. 12  The dispersion relation is corrected at the third order.",
             "│ ~/Books/Solitons/Stokes-OnTheTheoryOfOscillatoryWaves-CambPhilSoc-1847.djvu",
             "│ 1.2 MB · 2023-11-14 · passage",
@@ -190,8 +190,8 @@ class Frames(unittest.TestCase):
         self.assertEqual(plain(frame(self.model(selected=3, query="disp", caret=4), 50, 7, self.look)), [
             "ShelfFind  39 033 files · library      enter open",
             "▌ library  On the dispersion of waves",
-            "  djvu     Stokes-OnTheTheoryOfOscillato…   p. 12",
-            "  pdf      Rayleigh-OnProgressiveWaves-L…",
+            "3 djvu     Stokes-OnTheTheoryOfOscillato…   p. 12",
+            "2 pdf      Rayleigh-OnProgressiveWaves-L…",
             "[ ALL ] disp                       4 of 4 · 18 ms",
             "│ library · Kelvin (1887). · published full text",
             "│ bibliography",
@@ -243,6 +243,81 @@ class Frames(unittest.TestCase):
         self.assertEqual(["".join(t for t, _ in line) for line in lines],
                          ["the dispersion", "relation of deep wa…"])
         self.assertIn(("dispers", "match"), lines[0])
+
+    def test_actions_passages_and_a_page_read_in_the_panel(self):
+        model = self.model()
+        self.assertEqual(press(model, "alt-3"), [("open", model.results[2])])     # the third best at once
+        self.assertEqual(press(model, "alt-9"), [])
+        model.selected = 0
+        press(model, "ctrl-x")
+        shown = plain(frame(model, 80, 14, self.look))
+        self.assertEqual(model.mode, "actions")
+        self.assertIn("▌ Open", shown)
+        self.assertTrue(any(line.startswith("[ ACTIONS ] Lamb-Hydrodynamics-CUP-1932") for line in shown))
+        self.assertEqual(press(model, "down", "down", "enter"), [("reveal", model.results[0])])
+        self.assertEqual(model.mode, "search")
+        self.assertEqual(press(model, "ctrl-o"), [("passages", model.results[0])])
+
+        document = model.results[0]
+        model.document, model.mode, model.passage = document, "passages", 1
+        model.passages = [
+            {"part": 3, "page": 3, "section": None, "snippet": "the dispersion relation gives", "marks": [[4, 14]]},
+            {"part": 7, "page": 7, "section": None, "snippet": "anomalous dispersion of waves", "marks": [[10, 20]]},
+            {"part": 9, "page": None, "section": "Appendix", "snippet": "dispersion once more", "marks": [[0, 10]]},
+        ]
+        shown = plain(frame(model, 80, 12, self.look))
+        self.assertEqual(shown[-8:], [
+            "Lamb-Hydrodynamics-CUP-1932 · 3 passages   enter open at the page · ctrl-o read",
+            "  p. 3      the dispersion relation gives",
+            "▌ p. 7      anomalous dispersion of waves",
+            "  Appendix  dispersion once more",
+            "[ PASSAGES ] dispersion                                                  2 of 3",
+            "│ p. 7  anomalous dispersion of waves",
+            "│ ~/Books/Waves/Lamb-Hydrodynamics-CUP-1932.pdf",
+            "│",
+        ])
+        self.assertEqual(press(model, "x", "backspace"), [])            # the query rests in this screen
+        self.assertEqual(press(model, "enter"),
+                         [("open", {**document, "page": 7, "snippet": "anomalous dispersion of waves",
+                                    "marks": [[10, 20]]})])
+        self.assertEqual(press(model, "tab"), [("address", document)])
+        self.assertEqual(press(model, "up", "ctrl-o"), [("read", document, 3)])
+
+        model.mode, model.scroll = "reading", 0
+        model.reading = {"part": 3, "page": 3, "section": None, "parts": 40,
+                         "text": "Chapter 2\n\n\nFor waves on deep water the dispersion relation\ngives the frequency.\n"
+                                 + "\n".join(f"line {n}" for n in range(30))}
+        shown = plain(frame(model, 60, 9, self.look))
+        self.assertEqual(shown[:5], [
+            "Lamb-Hydrodynamics-CUP-1932 · p. 3 · p…      pgdn next page",
+            "  Chapter 2",
+            "",
+            "  For waves on deep water the dispersion relation",
+            "  gives the frequency.",
+        ])
+        self.assertEqual(shown[-1], "[ P. 3 ] dispersion                            line 1 of 34")
+        self.assertIn(("dispersion", "match"), frame(model, 60, 9, self.look)[3][0])
+        press(model, "down", "down")
+        self.assertTrue(plain(frame(model, 60, 9, self.look))[1].startswith("  For waves"))
+        for _ in range(60):
+            press(model, "down")
+        frame(model, 60, 9, self.look)
+        self.assertEqual(model.scroll, 34 - 7)                  # the last screen of the page, no further
+        self.assertEqual(press(model, "pgdn"), [("read", document, 4)])
+        self.assertEqual(press(model, "pgup"), [("read", document, 2)])
+        self.assertEqual(press(model, "enter"), [("open", {**document, "page": 3, "snippet": None, "marks": []})])
+        press(model, "esc")
+        self.assertEqual(model.mode, "passages")
+        press(model, "esc")
+        self.assertEqual(model.mode, "search")
+
+    def test_the_nine_best_rows_carry_their_rank(self):
+        lines = frame(self.model(), 80, 10, self.look)
+        self.assertEqual(lines[4][0][0], ("2 ", "hint"))
+        many = self.model(results=hits() * 4)
+        shown = plain(frame(many, 80, 24, self.look))
+        self.assertTrue(any(line.startswith("9 ") for line in shown))
+        self.assertFalse(any(line.startswith("10") for line in shown))
 
 
 if __name__ == "__main__":

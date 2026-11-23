@@ -1,11 +1,13 @@
 # Copyright 2026 Eudaemonic Enterprises Inc.
 """Filters typed inside a query narrow the search and never count as words of it."""
 import json
+import shutil
+import subprocess
 import unittest
 
 from shelffind import sources
 from shelffind.query import split
-from shelffind.search import search, spans, unmark
+from shelffind.search import file_id, page_of, passages_of, search, spans, unmark
 
 from support import Shelf
 
@@ -81,6 +83,49 @@ class Narrowing(Shelf):
         self.assertEqual(self.names("in:100%_"), ["100%_wet.txt"])
         self.assertEqual(search(self.db, "", folder="_"), search(self.db, "", folder="_", without=[]))
         self.assertEqual([hit["name"] for hit in search(self.db, "", folder="%_")], ["100%_wet.txt"])
+
+
+@unittest.skipUnless(shutil.which("gs") and shutil.which("pdftotext"), "Ghostscript and Poppler are required")
+class OneDocument(Shelf):
+    """The passages of one document, in the order of its pages, and the text of a page."""
+
+    def setUp(self):
+        super().setUp()
+        pages = ["Tides of the northern harbours", "The spring tide follows the new moon",
+                 "Charts and soundings", "A neap tide comes a week later", "Index of harbours"]
+        source = self.base / "tides.ps"
+        source.write_text("%!PS-Adobe-3.0\n/Helvetica findfont 16 scalefont setfont\n" + "".join(
+            f"72 700 moveto ({text}) show showpage\n" for text in pages))
+        self.pdf = self.root / "TideTables.pdf"
+        subprocess.run(["gs", "-q", "-dSAFER", "-dBATCH", "-dNOPAUSE", "-sDEVICE=pdfwrite",
+                        f"-sOutputFile={self.pdf}", "-f", str(source)], check=True)
+        (self.root / "notes.txt").write_text("One page of notes about a tide.")
+        self.assertEqual(self.build(), (2, 0))
+        self.hit = search(self.db, "tidetables")[0]
+
+    def test_passages_come_in_the_order_of_the_pages(self):
+        found = passages_of(self.db, self.hit, "tide")
+        self.assertEqual([(item["part"], item["page"]) for item in found], [(1, 1), (2, 2), (4, 4)])
+        self.assertEqual(found[1]["snippet"], "The spring tide follows the new moon")
+        self.assertEqual(found[1]["marks"], [[11, 15]])
+        self.assertEqual([item["page"] for item in passages_of(self.db, self.hit, '"neap tide"')], [4])
+        self.assertEqual([item["page"] for item in passages_of(self.db, self.hit, "tyde")], [2, 4])   # by spelling
+        self.assertEqual(passages_of(self.db, self.hit, "glacier"), [])
+        every = passages_of(self.db, self.hit, "")
+        self.assertEqual([item["page"] for item in every], [1, 2, 3, 4, 5])
+        self.assertTrue(every[2]["snippet"].startswith("Charts and soundings"))
+        note = search(self.db, "notes")[0]
+        self.assertEqual([(item["part"], item["page"]) for item in passages_of(self.db, note, "tide")], [(1, None)])
+        self.assertEqual(passages_of(self.db, {"root": None, "path": None}, "tide"), [])
+
+    def test_a_page_is_read_by_its_rank_in_the_document(self):
+        page = page_of(self.db, self.hit, 4)
+        self.assertEqual((page["page"], page["parts"]), (4, 5))
+        self.assertIn("A neap tide comes a week later", page["text"])
+        self.assertIsNone(page_of(self.db, self.hit, 6))
+        self.assertIsNone(page_of(self.db, self.hit, 0))
+        self.assertEqual(file_id(self.db, self.hit), self.db.execute(
+            "SELECT id FROM files WHERE name='TideTables.pdf'").fetchone()[0])
 
 
 if __name__ == "__main__":

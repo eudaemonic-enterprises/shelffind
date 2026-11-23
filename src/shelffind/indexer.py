@@ -49,7 +49,9 @@ def update_text(db, root, row, ocr, languages, known):
 
 
 def build(db, directory, selected, *, names_only=False, ocr=False, languages="eng",
-          retry=False, limit=None, progress=print, paths=()):
+          retry=False, limit=None, progress=print, paths=(), on_document=None):
+    """Refresh the inventory, then read the waiting documents. `progress(text)` receives the
+    messages; `on_document(done, total, name)` is called before each document is read."""
     done = failures = 0
     known = set()
     ready = []
@@ -70,6 +72,7 @@ def build(db, directory, selected, *, names_only=False, ocr=False, languages="en
         states = ["needs-ocr"] if ocr else ["pending"]
         if retry:
             states.append("ocr-error" if ocr else "error")
+        queues = []
         for root in ready:
             query = "SELECT * FROM files WHERE root=? AND state IN (" + ",".join("?" * len(states)) + ")"
             params = [root["id"], *states]
@@ -79,13 +82,18 @@ def build(db, directory, selected, *, names_only=False, ocr=False, languages="en
                     continue
                 query += " AND rel IN (" + ",".join("?" * len(rels)) + ")"
                 params += rels
-            queue = db.execute(query + " ORDER BY id", params).fetchall()
+            queues.append((root, db.execute(query + " ORDER BY id", params).fetchall()))
+        total = sum(len(queue) for _, queue in queues)
+        total = total if limit is None else min(total, limit)
+        for root, queue in queues:
             for row in queue:
                 if limit is not None and done >= limit:
                     return done, failures
                 if not store.available(root):
                     progress(f"Disconnected: {root['path']}; saved completed work")
                     return done, failures + 1
+                if on_document:
+                    on_document(done, total, row["rel"])
                 try:
                     update_text(db, root, row, ocr, languages, known)
                 except READ_ERRORS as exc:
