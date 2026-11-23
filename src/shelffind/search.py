@@ -70,7 +70,9 @@ def spans(text, query, kind=""):
         if end > start:
             found.append([origin[start], origin[end - 1] + 1])
 
-    words = [(m.start(), m.end()) for m in re.finditer(r"[^\W_]+", folded)]
+    # The words of the name, a name in CamelCase being cut where a capital begins a word.
+    pieces = [(m.start(), m.end()) for m in re.finditer(
+        r"[^\W\d_]?[^\W\d_A-Z]+|[A-Z]+(?![^\W\d_A-Z])|\d+", text)]
     for term, _ in query_terms(query):
         for word in term.split():
             hits = [m.start() for m in re.finditer(re.escape(word), folded)]
@@ -79,11 +81,11 @@ def spans(text, query, kind=""):
             if hits or len(word) < 3:
                 continue
             bound = 1 if len(word) < 7 else 2
-            close = [(fuzzy.distance(word, folded[a:b], bound), a, b) for a, b in words]
+            close = [(fuzzy.distance(word, fuzzy.fold(text[a:b]), bound), a, b) for a, b in pieces]
             close = [c for c in close if c[0] <= bound]
             if close:
                 _, a, b = min(close)
-                keep(a, b)
+                found.append([a, b])
     if not found and "abbreviated" in kind:
         position = 0
         for char in "".join(fuzzy.words(query)):
@@ -104,7 +106,14 @@ def spans(text, query, kind=""):
 COLUMNS = "f.id,f.name,f.format,f.rel,f.size,f.mtime,r.path AS root"
 
 
-def search(db, query, *, root=None, fmt=None, limit=25, exact=False, where="all"):
+def containing(text):
+    """A LIKE pattern that finds `text` anywhere, its own % and _ taken literally."""
+    return "%" + text.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_") + "%"
+
+
+def search(db, query, *, root=None, fmt=None, limit=25, exact=False, where="all", folder=None, without=()):
+    """Rank the files that match `query`. `folder` keeps the files whose path contains it, and
+    `without` drops those whose name or path contains one of its words."""
     if not 1 <= limit <= 500:
         raise ValueError("Choose a limit from 1 to 500")
     filters, bindings = "", []
@@ -114,6 +123,12 @@ def search(db, query, *, root=None, fmt=None, limit=25, exact=False, where="all"
     if fmt:
         filters += " AND f.format=?"
         bindings.append(fmt.lower().lstrip("."))
+    if folder:
+        filters += " AND lower(f.rel) LIKE ? ESCAPE '\\'"
+        bindings.append(containing(folder.lower()))
+    for word in without:
+        filters += " AND lower(f.rel) NOT LIKE ? ESCAPE '\\' AND f.folded NOT LIKE ? ESCAPE '\\'"
+        bindings += [containing(word.lower()), containing(fuzzy.fold(word))]
     parts = query_terms(query)
     found = {}
     def add(row, kind, score):

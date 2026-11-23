@@ -8,6 +8,7 @@ import time
 from dataclasses import dataclass
 from pathlib import Path
 
+from ..query import split
 from ..search import spans
 from ..text import safe
 from ..tui.width import cells, clip, clip_start, take
@@ -181,7 +182,7 @@ def row(hit, chosen, model, look, width, label_room=4):
     room = width - width_of(lead) - cells(where)
     name = title(hit)
     try:
-        ranges = spans(name, model.query, hit.get("match") or "")
+        ranges = spans(name, split(model.query).words, hit.get("match") or "")
     except ValueError:
         ranges = []
     place = crumbs(hit, look)
@@ -193,7 +194,7 @@ def row(hit, chosen, model, look, width, label_room=4):
         shorten = clip_start if hit["source"] == "files" else clip      # keep the deepest folders
         shown = shorten(place, place_room, look.sign("dots"))
         try:
-            lit = spans(shown, model.query)
+            lit = spans(shown, split(model.query).words)
         except ValueError:
             lit = []
         place_pieces = [("  ", None)] + fill(marked(shown, lit, "folder"), place_room)

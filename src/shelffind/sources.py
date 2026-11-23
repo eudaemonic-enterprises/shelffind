@@ -11,7 +11,8 @@ import time
 from itertools import zip_longest
 from pathlib import Path
 
-from . import fuzzy
+from . import fuzzy, store
+from .query import split
 from .search import query_terms, search
 
 
@@ -109,8 +110,22 @@ def combine(groups, limit):
 
 
 def find(db, directory, query, options, publish, cancelled=lambda: False):
+    """Search the files, then each outside source. Filters typed in the query (`ext:`, `in:`,
+    `src:`, `-word`) are taken out of it first and win over the options."""
     opts = dict(options)
     source = opts.pop("source", None)
+    typed = split(query)
+    query = typed.words
+    source = typed.source or source
+    if typed.fmt:
+        opts["fmt"] = typed.fmt
+    if typed.place:
+        named = [r["path"] for r in store.roots(db) if Path(r["path"]).name.lower() == typed.place.lower()]
+        if len(named) == 1:
+            opts["root"] = named[0]
+        else:
+            opts["folder"] = typed.place
+    opts["without"] = typed.without
     groups, errors = [], []
     if source in (None, "files"):
         local = search(db, query, **opts)
@@ -118,7 +133,9 @@ def find(db, directory, query, options, publish, cancelled=lambda: False):
             row["source"] = "files"
         groups.append(local)
         publish(local, "")
-    if source == "files" or opts.get("root"):
+    folder = opts.pop("folder", None)
+    without = [fuzzy.fold(word) for word in opts.pop("without")]
+    if source == "files" or opts.get("root") or folder:
         if source not in (None, "files"):
             raise ValueError("A folder filter selects the files source")
         return
@@ -149,6 +166,8 @@ def find(db, directory, query, options, publish, cancelled=lambda: False):
                 if not isinstance(record, dict) or not all(isinstance(record.get(k),str)
                                                            and record[k] for k in ("id","name")):
                     raise ValueError("Each result needs a string id and name")
+                if any(word in fuzzy.fold(record["name"]) for word in without):
+                    continue
                 rows.append({"source": name, "id": record["id"], "name": record["name"], "path": None, "root": None,
                                  "format": record.get("format"), "match": record.get("match") or "catalogue",
                                  "page": record.get("page"), "section": record.get("section"),
