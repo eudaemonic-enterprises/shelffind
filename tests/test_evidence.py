@@ -393,6 +393,21 @@ class Samples(Evidence):
             found = search(self.db, word)
             self.assertEqual({found[0]["path"], *found[0]["copies"]}, pair)
 
+    def test_a_full_reading_parts_two_files_joined_on_their_samples_whichever_is_measured_first(self):
+        two = self.write("b/book.txt", self.bravo)          # the one listed first is not the one read
+        self.build(names_only=True)
+        one = self.write("a/book.txt", self.alpha)
+        self.assertEqual(self.build(paths=[one]), (1, 0))
+        self.assertEqual(self.build(), (0, 0))              # the other joins it on its samples
+        self.assertEqual(self.documents(), 1)
+        other = self.write("c/other.txt", "x" * len(self.alpha))
+        self.build(names_only=True)
+        self.told(other)                                    # a work of that size is known by its checksum:
+        self.assertEqual(self.build(), (2, 0))              # files of that size are read in full, and the two part
+        self.each_has_its_own()
+        self.assertEqual(self.build(), (0, 0))
+        self.assertEqual((one.read_text()[300:307], two.read_text()[300:307]), (" ALPHA ", " BRAVO "))
+
     def test_the_storage_of_the_folder_tells_them_apart_before_they_are_joined(self):
         self.twin()
         one = self.write("a/book.txt", self.alpha)
