@@ -52,7 +52,8 @@ def parser():
     trial.add_argument("query", nargs="*", help="Words the source surely knows (default: the)")
     ix = cmds.add_parser("index", help="Refresh names and continue reading document text")
     mode = ix.add_mutually_exclusive_group()
-    mode.add_argument("--names-only", action="store_true", help="Only update the file inventory")
+    mode.add_argument("--names-only", action="store_true",
+                      help="Update the list of files and ask the sources and the storage about them; open no file")
     mode.add_argument("--ocr", action="store_true", help="Recognize pages missing embedded text")
     ix.add_argument("--lang", default="eng", help="Installed Tesseract languages, e.g. eng+fra")
     ix.add_argument("--retry", action="store_true", help="Include previous extraction or OCR failures")
