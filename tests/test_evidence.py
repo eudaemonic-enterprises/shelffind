@@ -265,6 +265,21 @@ class Ambiguity(Evidence):
         self.assertEqual(self.db.execute("SELECT state FROM docs WHERE id=?", (kept,)).fetchone()[0], "indexed")
         self.assertEqual(self.db.execute("SELECT count(*) FROM passages WHERE passages MATCH 'first'").fetchone()[0], 1)
 
+    def test_the_files_of_a_document_merged_into_another_are_its_copies(self):
+        self.write("a/book.txt")
+        self.write("b/book.txt")
+        self.build(names_only=True)
+        with self.db:                                       # as an earlier version left them: each read for itself
+            for doc in self.docs().values():
+                self.db.execute("INSERT INTO pages(doc,page,section,ztext,needs_ocr) VALUES(?,1,NULL,?,0)",
+                                (doc, store.deflate("Tide tables of the northern harbours.")))
+            self.db.execute("UPDATE docs SET state='indexed'")
+            self.db.execute("UPDATE files SET read=1")
+        self.assertEqual(self.build(), (0, 0))              # their fingerprints show one document
+        self.assertEqual(self.documents(), 1)
+        self.assertEqual(self.db.execute("SELECT count(*) FROM files WHERE read=1").fetchone()[0], 1)
+        self.assertEqual(self.db.execute("SELECT count(*) FROM pages").fetchone()[0], 1)
+
     def test_a_copy_that_waits_for_its_recognition_keeps_the_document_waiting(self):
         with self.db:
             failed, waiting = store.new_document(self.db, 9, "pdf"), store.new_document(self.db, 9, "pdf")
@@ -442,6 +457,27 @@ class Reading2(Evidence):
         self.assertEqual(self.build(), (1, 0))
         self.assertEqual(names(self.db, "southern capes"), ["two/book.txt"])
         self.assertEqual(one.read_text()[:4], "Tide")
+
+    def test_no_page_is_recognised_through_a_file_that_nothing_proves_to_be_the_one_read(self):
+        one = self.write("one/book.txt")
+        self.build()
+        with self.db:
+            self.db.execute("UPDATE pages SET needs_ocr=1")
+            self.db.execute("UPDATE docs SET state='needs-ocr'")
+        self.unprinted()                                    # read by an earlier version: no fingerprint yet
+        self.write("two/book.txt", OTHER)
+        self.build(names_only=True)
+        ids = self.ids()
+        with self.db:                                       # a source takes the two for one work
+            for rel in ("one/book.txt", "two/book.txt"):
+                link.attach(self.db, ids[rel], "library", {"id": "W1", "keys": ["sha256:" + "aa" * 32]}, set())
+        self.assertEqual(self.documents(), 1)
+        one.unlink()                                        # the file that was read is gone before any fingerprint
+        recognise = lambda source, fmt, work, page, lang: source.read_text()[:60]
+        with patch("shelffind.extract.recognize", side_effect=recognise):
+            self.assertEqual(self.build(ocr=True), (1, 1))
+        self.assertEqual(self.db.execute("SELECT count(*) FROM pages WHERE needs_ocr=1").fetchone()[0], 1)
+        self.assertEqual(search(self.db, "southern capes"), [])
 
     def test_an_inventory_opens_no_file(self):
         self.write("old.txt")
@@ -659,6 +695,21 @@ class Twin(Evidence):
         self.assertEqual(search(self.db, "northern harbours"), [])          # not known yet, and nothing was guessed
         self.assertEqual(self.build(names_only=True), (0, 0))               # it answers again
         self.assertEqual(names(self.db, "northern harbours"), ["Filed/book.txt"])
+
+    def test_what_was_measured_of_a_file_goes_when_the_file_changes(self):
+        import hashlib
+        self.twin()
+        path = self.write("book.txt")
+        self.build()
+        measured = lambda: self.db.execute("SELECT sum,asked,print FROM files").fetchone()
+        self.assertEqual(measured()["sum"], "md5:" + hashlib.md5(LARGE.encode()).hexdigest())
+        with self.db:
+            self.db.execute("UPDATE files SET asked='library'")
+        path.write_text(OTHER)                              # other bytes at the same address
+        os.utime(path, (1_800_000_000, 1_800_000_000))
+        self.assertEqual(self.build(names_only=True), (0, 0))
+        self.assertEqual(tuple(measured()), ("md5:" + hashlib.md5(OTHER.encode()).hexdigest(), "", None))
+        self.assertEqual(search(self.db, "northern harbours"), [])
 
     def test_a_twin_that_lags_behind_the_folder_says_nothing_of_a_file(self):
         lagging = self.base / "twin"

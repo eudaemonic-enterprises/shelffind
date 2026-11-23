@@ -178,8 +178,10 @@ def upgrade(directory, progress=lambda text: None, wait=20.0):
                     time.sleep(0.2)
             partial = directory / f"{store.INDEX}.partial.{os.getpid()}"
             try:
+                # A program that has the old index open keeps it for as long as it runs: waiting
+                # for it at length would only delay the message that asks to close it.
                 old = sqlite3.connect((directory / store.EARLIER).as_uri() + "?mode=rw", uri=True,
-                                      timeout=max(wait, 0.1))
+                                      timeout=max(min(wait, 3.0), 0.1))
             except sqlite3.Error as fault:
                 raise ValueError(f"The earlier index cannot be opened for its conversion: {fault}") from None
             old.row_factory = sqlite3.Row
