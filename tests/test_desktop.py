@@ -106,6 +106,30 @@ class Viewers(Shelf):
         with patch("shelffind.desktop.output", side_effect=lambda *argv: next(answers)):
             self.assertIsNone(desktop.default_handler(self.doc))
 
+    def test_applications_are_offered_by_the_names_people_know(self):
+        entries = self.base / "share/applications"
+        for name, shown in {"org.gnome.Papers.desktop": "Document Viewer", "org.gnome.Evince.desktop": "Evince",
+                            "com.google.Chrome.desktop": "Google Chrome", "google-chrome.desktop": "Google Chrome",
+                            "com.github.xournalpp.xournalpp.desktop": "Xournal++",
+                            "okularApplication_pdf.desktop": "Okular"}.items():
+            (entries / name).write_text(f"[Desktop Entry]\nType=Application\nName={shown}\nName[fr]=Autre\nExec=x %U\n")
+        self.assertEqual(desktop.label("org.gnome.Papers.desktop"), "Document Viewer (Papers)")
+        self.assertEqual(desktop.label("com.github.xournalpp.xournalpp.desktop"), "Xournal++")
+        self.assertEqual(desktop.label("okularApplication_pdf.desktop"), "Okular")
+        self.assertEqual(desktop.label("unknown.to.Anyone.desktop"), "unknown.to.Anyone")
+        listed = ["com.google.Chrome.desktop", "com.github.xournalpp.xournalpp.desktop", "google-chrome.desktop",
+                  "okularApplication_pdf.desktop", "org.gnome.Evince.desktop", "org.gnome.Papers.desktop"]
+        with patch("shelffind.desktop.applications", return_value=listed), \
+                patch("shelffind.desktop.default_handler", return_value="org.gnome.Papers.desktop"):
+            self.assertEqual(desktop.choices(self.doc), [
+                ("org.gnome.Papers.desktop", "Document Viewer (Papers) (opens it by default)"),
+                ("com.google.Chrome.desktop", "Google Chrome"),             # one line for the two entries of Chrome
+                ("com.github.xournalpp.xournalpp.desktop", "Xournal++"),
+                ("okularApplication_pdf.desktop", "Okular"),
+                ("org.gnome.Evince.desktop", "Evince")])
+            code, out, _ = self.run_cli("apps", str(self.doc))
+            self.assertEqual(out.splitlines()[1], "com.google.Chrome.desktop  Google Chrome")
+
     def test_a_viewer_that_fails_at_once_is_reported_and_one_that_stays_is_left_alone(self):
         folder = self.fake_tool("failing-viewer", "echo 'cannot open display' >&2\nexit 3\n")
         self.fake_tool("patient-viewer", "sleep 5\n")

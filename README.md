@@ -103,7 +103,7 @@ shelffind open --with org.gnome.Evince.desktop ~/Documents/atlas.pdf
 shelffind reveal ~/Documents/atlas.pdf
 ```
 
-Documents open through the desktop (GIO and `gtk-launch`). A page is passed to the viewers known to accept one: Evince, Papers, Atril, Xreader, Okular, Zathura, Sioyek, DjView and the web browsers; others open at the first page unless a command is given under `[open]`. `reveal` asks the file manager of the desktop, whichever it is. `apps` lists the actual desktop IDs registered for that file's MIME type.
+Documents open through the desktop (GIO and `gtk-launch`). A page is passed to the viewers known to accept one: Evince, Papers, Atril, Xreader, Okular, Zathura, Sioyek, DjView and the web browsers; others open at the first page unless a command is given under `[open]`. `reveal` asks the file manager of the desktop, whichever it is. `apps` lists the applications registered for that kind of file, each with its identifier, which `open --with` takes, and the name you know it by; F2 in the panel offers the same list by those names, the application that opens the file by default first.
 
 ## Optional search sources
 

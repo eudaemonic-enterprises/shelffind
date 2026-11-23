@@ -26,7 +26,8 @@ class Model:
     version: int = 0                     # number of the search whose answers are awaited
     fresh: bool = True                   # no answer to that search has come yet
     mode: str = "search"                 # search, apps, help, actions, passages or reading
-    apps: list = field(default_factory=list)
+    apps: list = field(default_factory=list)        # the applications offered for the result, as identifiers
+    app_names: list = field(default_factory=list)   # the same, as the names people know them by
     app: int = 0
     actions: list = field(default_factory=list)     # (label, thing to do) for the chosen result
     action: int = 0

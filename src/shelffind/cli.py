@@ -316,7 +316,9 @@ def main(argv=None):
                     desktop.launch(target["path"], args.app, page=args.page,
                                    custom=custom if isinstance(custom, list) else None)
                 elif args.command == "apps":
-                    print("\n".join(desktop.applications(target["path"])))
+                    # The identifier, which `open --with` takes, then the name people know.
+                    for name, shown in desktop.choices(target["path"]):
+                        print(safe(f"{name}  {shown}"))
                 else:
                     desktop.reveal(target["path"])
             else:

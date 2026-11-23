@@ -207,6 +207,11 @@ def row(hit, chosen, model, look, width, label_room=4, rank=0):
     return fill(lead + name_pieces + place_pieces + [(where, "page")], width), base
 
 
+def application_names(model):
+    """The applications offered, by the names people know them by where these are known."""
+    return model.app_names if len(model.app_names) == len(model.apps) else model.apps
+
+
 def listing(model, look, width, rows):
     """At most `rows` rows of the list. Under a prompt at the bottom the best match is the
     lowest row."""
@@ -216,7 +221,7 @@ def listing(model, look, width, rows):
     if model.mode == "apps":
         first = max(0, model.app - rows + 1)
         lines = []
-        for index, name in enumerate(model.apps[first:first + rows], first):
+        for index, name in enumerate(application_names(model)[first:first + rows], first):
             chosen = index == model.app
             lines.append((fill([((look.sign("marker") if chosen else " ") + " ", "marker"),
                                 (clip(safe(name), width - 2), None)], width), "selected" if chosen else None))
@@ -316,7 +321,8 @@ def header(model, look, width):
 
 def prompt(model, look, width):
     if model.mode == "apps":
-        left = [("[ OPEN WITH ] ", "scope"), (clip(safe(model.apps[model.app]) if model.apps else "", width - 16), "prompt")]
+        left = [("[ OPEN WITH ] ", "scope"),
+                (clip(safe(application_names(model)[model.app]) if model.apps else "", width - 16), "prompt")]
         return sides(left, [("enter choose" + look.sign("dot") + "esc back", "hint")], width), None
     if model.mode == "actions":
         left = [("[ ACTIONS ] ", "scope"), (clip(title(model.hit()) if model.hit() else "", width - 14), "prompt")]
