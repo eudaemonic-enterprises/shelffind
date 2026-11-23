@@ -185,7 +185,7 @@ def row(hit, chosen, model, look, width, label_room=4):
     except ValueError:
         ranges = []
     place = crumbs(hit, look)
-    name_room = room if room < 44 or not place else max(24, room * 3 // 5)
+    name_room = room if room < 44 or not place else min(72, max(24, room * 3 // 5))
     name_pieces = fill(cut(marked(name, ranges, "title" if chosen else None), name_room, look.sign("dots")),
                        name_room)
     place_room = room - name_room - 2
@@ -317,7 +317,7 @@ def frame(model, cols, rows, look):
     """The whole panel: `rows` lines of at most `cols - 1` cells. What is shown is kept together
     next to the prompt; the unused lines of the band stay empty on the far side."""
     width = max(1, cols - 1)
-    below = min(look.preview, max(0, rows - 5))
+    below = 0 if model.mode == "help" else min(look.preview, max(0, rows - 5))
     top = 1 if look.help and rows - below >= 4 else 0
     body = max(1, rows - top - 1 - below)
     model.page = max(1, body - 1)           # the step of PgUp and PgDn follows the list shown

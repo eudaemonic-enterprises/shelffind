@@ -145,7 +145,7 @@ def panel(db, directory, query, options, settings, enter="open", quote=False, wi
                 return True
             if kind == "search":
                 model.version = searches.submit(model.query, model.options)
-                model.busy, model.message = True, ""
+                model.busy, model.fresh, model.message = True, True, ""
             elif kind == "open" and enter == "print":
                 start("address", effect[1])
             elif kind == "launch":

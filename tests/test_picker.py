@@ -123,12 +123,15 @@ class Keys(unittest.TestCase):
         self.assertEqual(press(Model(), "enter", "tab", "f2"), [])     # nothing to act on
 
     def test_an_answer_keeps_the_chosen_document_and_old_answers_are_dropped(self):
-        model = Model(results=hits(), selected=2, version=7, busy=True)
+        model = Model(results=hits(), selected=2, version=7, busy=True, fresh=False)
         update(model, Reply(6, [], "", 0.1), KEYMAP)
         self.assertEqual(len(model.results), 4)
         later = [hits()[3], hits()[2]]
         update(model, Reply(7, later, "", 0.02), KEYMAP)
         self.assertEqual((model.selected, model.busy, model.seconds), (1, False, 0.02))
+        model.fresh = True                          # a new search: its first answer starts at the best
+        update(model, Reply(7, hits(), "", 0.02), KEYMAP)
+        self.assertEqual((model.selected, model.fresh), (0, False))
         model.query = "nothing"
         update(model, Reply(7, [], "", 0.01), KEYMAP)
         self.assertEqual(model.message, "No matches")

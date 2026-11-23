@@ -24,6 +24,7 @@ class Model:
     busy: bool = False
     seconds: float | None = None
     version: int = 0                     # number of the search whose answers are awaited
+    fresh: bool = True                   # no answer to that search has come yet
     mode: str = "search"                 # search, apps or help
     apps: list = field(default_factory=list)
     app: int = 0
@@ -113,7 +114,10 @@ def update(model, event, keymap):
     search, open, address, reveal, copy, apps, launch, quit."""
     if isinstance(event, Reply):
         if event.version == model.version:
-            current = model.hit()
+            # The first answer to a new search selects the best match; later answers to the
+            # same search (those of outside sources) leave the selection on its document.
+            current = None if model.fresh else model.hit()
+            model.fresh = False
             model.results, model.busy, model.seconds = event.rows, False, event.seconds
             model.message = event.message or ("" if event.rows or not model.query.strip() else "No matches")
             model.selected = 0
