@@ -3,14 +3,13 @@
 import contextlib
 import fcntl
 import os
-from pathlib import Path
 import re
 import sqlite3
 import stat
+from pathlib import Path
 
 from . import fuzzy
-from .extract import file_format, SUPPORTED
-
+from .extract import SUPPORTED, file_format
 
 SCHEMA = """
 CREATE TABLE roots (

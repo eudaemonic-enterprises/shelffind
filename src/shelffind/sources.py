@@ -1,15 +1,15 @@
 # Copyright 2026 Eudaemonic Enterprises Inc.
 """Optional search providers registered explicitly by the local user."""
 import fcntl
-from itertools import zip_longest
 import json
 import os
-from pathlib import Path
 import re
 import signal
 import subprocess
 import tempfile
 import time
+from itertools import zip_longest
+from pathlib import Path
 
 from . import fuzzy
 from .search import query_terms, search
@@ -17,7 +17,11 @@ from .search import query_terms, search
 
 def registered(directory):
     config = directory / "sources.json"
-    return json.loads(config.read_text()) if config.exists() else {}
+    data = json.loads(config.read_text()) if config.exists() else {}
+    if not isinstance(data, dict) or not all(isinstance(k, str) and isinstance(v, str)
+                                             for k, v in data.items()):
+        raise ValueError("Invalid sources.json: expected source names and executable paths")
+    return data
 
 
 def configure(directory, name, program):
@@ -86,10 +90,14 @@ def find(db, directory, query, options, publish, cancelled=lambda: False):
             row["source"] = "files"
         groups.append(local)
         publish(local, "")
-    programs = registered(directory)
     if source == "files" or opts.get("root"):
         if source not in (None, "files"):
             raise ValueError("A folder filter selects the files source")
+        return
+    try:
+        programs = registered(directory)
+    except (OSError, ValueError) as exc:
+        publish(combine(groups, opts["limit"]), f"Source configuration: {exc}")
         return
     if source:
         if source not in programs:
@@ -101,24 +109,24 @@ def find(db, directory, query, options, publish, cancelled=lambda: False):
         return
     terms = [{"text":t, "literal":literal, "alternatives":[] if literal or opts["exact"] else fuzzy.spellings(db,t)}
              for t,literal in query_terms(query)]
-    request = dict(op="search", query=query, terms=terms, exact=opts["exact"],
-                   limit=opts["limit"], format=opts.get("fmt"), where=opts.get("where", "all"))
+    request = {"op": "search", "query": query, "terms": terms, "exact": opts["exact"],
+                   "limit": opts["limit"], "format": opts.get("fmt"), "where": opts.get("where", "all")}
     for name, program in programs.items():
         try:
             data = call(program, request, cancelled)
             if not isinstance(data, list):
-                raise ValueError("Expected an array of results")
+                raise TypeError("Expected an array of results")
             rows = []
             for record in data[:opts["limit"]]:
                 if not isinstance(record, dict) or not all(isinstance(record.get(k),str)
                                                            and record[k] for k in ("id","name")):
                     raise ValueError("Each result needs a string id and name")
-                rows.append(dict(source=name, id=record["id"], name=record["name"], path=None, root=None,
-                                 format=record.get("format"), match=record.get("match") or "catalogue",
-                                 page=record.get("page"), section=record.get("section"),
-                                 snippet=record.get("snippet"), byline=record.get("byline"), availability=record.get("availability")))
+                rows.append({"source": name, "id": record["id"], "name": record["name"], "path": None, "root": None,
+                                 "format": record.get("format"), "match": record.get("match") or "catalogue",
+                                 "page": record.get("page"), "section": record.get("section"),
+                                 "snippet": record.get("snippet"), "byline": record.get("byline"), "availability": record.get("availability")})
             groups.append(rows)
-        except (OSError, ValueError) as exc:
+        except (OSError, TypeError, ValueError) as exc:
             errors.append(f"{name}: {exc}")
         publish(combine(groups, opts["limit"]), " | ".join(errors))
 

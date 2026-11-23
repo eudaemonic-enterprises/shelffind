@@ -1,20 +1,21 @@
 # Copyright 2026 Eudaemonic Enterprises Inc.
 """Command-line interface to ShelfFind."""
 import argparse
-from contextlib import closing
 import curses
 import json
-from pathlib import Path
 import sqlite3
 import subprocess
 import sys
+from contextlib import closing
+from pathlib import Path
 
-from . import desktop, indexer, sources, store
+from . import __version__, desktop, indexer, sources, store
 from .picker import picker
 
 
 def parser():
     p = argparse.ArgumentParser(prog="shelffind", description="Find documents by name, folder, or passage.")
+    p.add_argument("--version", action="version", version=f"ShelfFind {__version__}")
     p.add_argument("--data-dir", type=Path, default=store.state_directory(), help="Private index directory")
     cmds = p.add_subparsers(dest="command")
     rs = cmds.add_parser("roots", help="Choose document folders").add_subparsers(dest="action", required=True)
@@ -63,8 +64,8 @@ def coverage(db, errors):
     for root in store.roots(db):
         counts = dict(db.execute("SELECT state,count(*) FROM files WHERE root=? GROUP BY state",
                                  (root["id"],)))
-        row = dict(path=root["path"], available=store.available(root), scanned=root["scanned"],
-                   problem=root["problem"], files=sum(counts.values()), states=counts)
+        row = {"path": root["path"], "available": store.available(root), "scanned": root["scanned"],
+                   "problem": root["problem"], "files": sum(counts.values()), "states": counts}
         if errors:
             row["errors"] = [dict(r) for r in db.execute("SELECT rel,error FROM files WHERE root=? "
                                                         "AND error IS NOT NULL", (root["id"],))]
@@ -116,7 +117,7 @@ def execute(args, db, directory):
             for e in row.get("errors", []):
                 print(f"  {e['rel']}: {e['error']}")
     elif args.command == "search":
-        opts = dict(root=args.root, fmt=args.fmt, exact=args.exact, limit=args.limit, source=args.source, where=args.where)
+        opts = {"root": args.root, "fmt": args.fmt, "exact": args.exact, "limit": args.limit, "source": args.source, "where": args.where}
         query = " ".join(args.query)
         if not args.json and not args.list and sys.stdin.isatty() and sys.stdout.isatty():
             curses.wrapper(picker, db, directory, query, opts)

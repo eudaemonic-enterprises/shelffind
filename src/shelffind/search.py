@@ -48,9 +48,9 @@ def search(db, query, *, root=None, fmt=None, limit=25, exact=False, where="all"
         key = row["id"]
         item = found.get(key)
         if item is None:
-            item = dict(path=str(Path(row["root"]) / row["rel"]), root=row["root"],
-                        name=row["name"], format=row["format"], match=kind, page=None,
-                        section=None, snippet=None)
+            item = {'path': str(Path(row["root"]) / row["rel"]), 'root': row["root"],
+                        'name': row["name"], 'format': row["format"], 'match': kind, 'page': None,
+                        'section': None, 'snippet': None}
             found[key] = (score, item)
         elif score < item[0]:
             item = item[1]
@@ -58,7 +58,7 @@ def search(db, query, *, root=None, fmt=None, limit=25, exact=False, where="all"
             found[key] = (score, item)
         else:
             item = item[1]
-        if "snippet" in row.keys() and item["snippet"] is None:
+        if kind.endswith("passage") and item["snippet"] is None:
             item.update(snippet=" ".join(row["snippet"].split()), page=row["page"], section=row["section"])
 
     if not parts:

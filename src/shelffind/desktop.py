@@ -1,8 +1,8 @@
 # Copyright 2026 Eudaemonic Enterprises Inc.
 """Desktop integration. Pass URIs as separate arguments to the desktop programs."""
 import os
-from pathlib import Path
 import subprocess
+from pathlib import Path
 
 
 def uri(path):
@@ -13,7 +13,7 @@ def uri(path):
 
 
 def output(*argv):
-    result = subprocess.run(argv, capture_output=True, text=True, timeout=15,
+    result = subprocess.run(argv, capture_output=True, text=True, timeout=15, check=False,
                             env={**os.environ, "LC_ALL": "C"})
     if result.returncode:
         raise ValueError(result.stderr.strip() or f"{argv[0]} exited with {result.returncode}")

@@ -2,11 +2,11 @@
 import contextlib
 import io
 import json
-from pathlib import Path
 import shutil
 import subprocess
 import tempfile
 import unittest
+from pathlib import Path
 from unittest.mock import patch
 from zipfile import ZipFile
 
@@ -153,6 +153,25 @@ class Collection(unittest.TestCase):
             desktop.reveal(doc)
             self.assertEqual(popen.call_args.args[0], ["nautilus","--select",doc.as_uri()])
 
+    def test_version_without_index_and_invalid_optional_configuration(self):
+        fresh = self.base / "unopened"
+        output = io.StringIO()
+        with contextlib.redirect_stdout(output), self.assertRaises(SystemExit) as exit_status:
+            main(["--data-dir", str(fresh), "--version"])
+        self.assertEqual(exit_status.exception.code, 0)
+        self.assertIn("ShelfFind", output.getvalue())
+        self.assertFalse(fresh.exists())
+        (self.root / "compass.txt").write_text("direction")
+        self.build()
+        (self.data / "sources.json").write_text("{")
+        observed = []
+        opts = {"fmt": None, "root": None, "limit": 5, "exact": False}
+        for source in ("files", None):
+            sources.find(self.db, self.data, "compass", {**opts, "source": source},
+                         lambda rows, message: observed.append((rows, message)))
+            self.assertEqual(observed[-1][0][0]["name"], "compass.txt")
+            self.assertEqual(bool(observed[-1][1]), source is None)
+
     def test_provider_federation_failure_and_resolution(self):
         doc = self.root / "orchid.txt"
         doc.write_text("local document")
@@ -163,7 +182,7 @@ class Collection(unittest.TestCase):
                         "if r['op']=='search' else {'path':" + repr(str(doc)) + "}))\n")
         tool.chmod(0o700)
         sources.configure(self.data,"catalogue",tool)
-        opts = dict(source=None, fmt=None, root=None, limit=5, exact=False)
+        opts = {"source": None, "fmt": None, "root": None, "limit": 5, "exact": False}
         batches = []
         sources.find(self.db,self.data,"orchid",opts,lambda rows,msg:batches.append((rows,msg)))
         self.assertEqual([r["source"] for r in batches[-1][0]],["files","catalogue"])

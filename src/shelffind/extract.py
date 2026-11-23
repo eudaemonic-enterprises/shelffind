@@ -1,15 +1,14 @@
 # Copyright 2026 Eudaemonic Enterprises Inc.
 """Read document text locally. The original document is always opened read-only."""
-from contextlib import contextmanager
-from dataclasses import dataclass
 import gzip
-from html.parser import HTMLParser
-from pathlib import Path
 import posixpath
-import re
 import resource
 import subprocess
 import tempfile
+from contextlib import contextmanager
+from dataclasses import dataclass
+from html.parser import HTMLParser
+from pathlib import Path
 from urllib.parse import unquote
 from xml.etree import ElementTree
 from zipfile import ZipFile

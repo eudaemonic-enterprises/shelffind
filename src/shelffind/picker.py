@@ -40,11 +40,14 @@ class Searches:
                 version, query, opts = request
                 if version != self.version:
                     continue
-                db.set_progress_handler(lambda: version != self.version, 2000)
+                def cancelled(ticket=version):
+                    return ticket != self.version
+
+                db.set_progress_handler(cancelled, 2000)
                 try:
-                    def publish(rows, message):
-                        self.replies.put((version, rows, message))
-                    sources.find(db, self.directory, query, opts, publish, lambda: version != self.version)
+                    def publish(rows, message, ticket=version):
+                        self.replies.put((ticket, rows, message))
+                    sources.find(db, self.directory, query, opts, publish, cancelled)
                 except sources.Cancelled:
                     continue
                 except (sqlite3.Error, ValueError) as exc:
@@ -93,7 +96,11 @@ def picker(screen, db, directory, query, options):
     roots = [None] + [r["path"] for r in store.roots(db)]
     formats = [None] + [r[0] for r in db.execute("SELECT DISTINCT format FROM files WHERE format!='' ORDER BY format")]
     history = [r[0] for r in db.execute("SELECT query FROM history ORDER BY used DESC LIMIT 100")]
-    channels = [None, "files", *sources.registered(directory)]
+    channels = [None, "files"]
+    try:
+        channels.extend(sources.registered(directory))
+    except (OSError, ValueError):
+        pass  # The search response carries the configuration diagnostic.
     history_pos = -1
     searches = Searches(directory)
     dirty, results, selected, message = True, [], 0, ""

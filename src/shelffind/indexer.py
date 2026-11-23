@@ -1,12 +1,11 @@
 # Copyright 2026 Eudaemonic Enterprises Inc.
 """Inventory first. Commit extracted text per file and OCR per page."""
-from pathlib import Path
 import subprocess
+from pathlib import Path
 from xml.etree.ElementTree import ParseError
 from zipfile import BadZipFile
 
 from . import extract, fuzzy, store
-
 
 READ_ERRORS = (OSError, ValueError, KeyError, RuntimeError, EOFError, subprocess.TimeoutExpired,
                BadZipFile, ParseError)
