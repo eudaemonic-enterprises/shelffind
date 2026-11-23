@@ -708,24 +708,27 @@ def by_measure(db, row, mine):
     return target
 
 
+def disproved(db, row):
+    """Drop what the sources say of a file never measured and that a measure refutes: the
+    sources will be asked about the file again."""
+    dropped = [record["id"] for record in db.execute("SELECT id,keys FROM records WHERE file=?", (row["id"],)).fetchall()
+               if refuted(db, row["size"], row["format"], record["keys"].split())[0]]
+    if dropped:
+        db.executemany("DELETE FROM records WHERE id=?", [(number,) for number in dropped])
+        db.execute("UPDATE files SET asked='' WHERE id=?", (row["id"],))
+
+
 def by_word(db, row):
     """The document of a file that was never measured: the one that a measure knows by the
     checksums the sources give for the file; otherwise one that it shares with the files of
     its size and format for which the sources give the same checksums; otherwise its own. A
     word that a measure refutes is dropped, and the source will be asked about the file again."""
     file, fmt, size = row["id"], row["format"], row["size"]
-    while True:
-        keys = said(db, file)
-        wrong, known = refuted(db, size, fmt, keys)
-        if not wrong:
-            break
-        dropped = [record["id"] for record in db.execute("SELECT id,keys FROM records WHERE file=?", (file,)).fetchall()
-                   if refuted(db, size, fmt, record["keys"].split())[0]]
-        if not dropped:
-            keys, known = [], None                  # the sources contradict a measure only together
-            break
-        db.executemany("DELETE FROM records WHERE id=?", [(number,) for number in dropped])
-        db.execute("UPDATE files SET asked='' WHERE id=?", (file,))
+    disproved(db, row)
+    keys = said(db, file)
+    wrong, known = refuted(db, size, fmt, keys)
+    if wrong:
+        keys, known = [], None                      # the sources contradict a measure only together
     names = [f"{key}@{fmt}#{size}" for key in keys]
     if known is not None:
         target, names = known, []
@@ -774,6 +777,7 @@ def place(db, file):
     if mine:
         return by_measure(db, row, [mine[kind] for kind in sorted(mine)])
     if row["read"] and has_pages(db, row["doc"]):
+        disproved(db, row)
         retitle(db, row["doc"])
         return row["doc"]
     return by_word(db, row)

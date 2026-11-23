@@ -13,13 +13,22 @@ The folders and the sources in one list, with the text attached to documents.
 The text that ShelfFind reads now belongs to a document, not to an address. A renamed or moved
 file keeps its text, and a document kept in several places is read once and shown on one row
 that names its copies. A document is known by the checksums of its whole content alone, never by
-a likeness of name, size and date. A file joins a document by a measure, the checksum that the
-storage of a folder gives without any reading when the folder has an rclone twin and that one
-full reading gives otherwise, or on the word of a source that knows the work by its checksum.
-A measure outranks a word: two different checksums keep two documents apart, what was measured
-of a file refutes what a source says of it, and two documents that were both read become one by
-a measure only. What a source says is kept with the very file it was said of. An inventory
-alone opens no file. A document whose last file has gone keeps its text for a month.
+a likeness of name, size and date. Where a file belongs follows from what is measured of it
+and from what the sources say of it, whatever the order in which this came to be known. A
+measured file belongs to the document known by its checksums, which the storage of a folder
+gives without any reading when the folder has an rclone twin and which one full reading gives
+otherwise; a file that was never measured is placed by the word of a source that knows the work
+by its checksum. A measure outranks a word: a statement that a measure refutes is dropped,
+whichever file was measured, and `shelffind index` proves against the storage of a folder what
+the sources said of its files. What a source says is kept with the very file it was said of.
+
+A document is read from a copy of its file made on this machine in one pass, during which the
+checksums are computed: the pages kept are those of the very bytes the checksums describe, and
+only a file measured to hold these bytes completes them. A copy that contradicts the checksum
+of the storage is made a second time. A failed reading is the fault of the document that the
+file holds, and a file that cannot be copied leaves the document to its other files. An
+inventory alone opens no file. A document whose last file has gone keeps its text for a month,
+with what the sources said of its bytes.
 
 Sources speak a second, richer version of their exchange, described in `docs/sources.md`, with
 a helper of one file for writing one and `shelffind sources check NAME` for trying one. A
@@ -52,8 +61,9 @@ for keeping the folders in order.
 
 The index has a new form, kept in a new file. An index of version 0.2 is converted by copy the
 first time the panel or `shelffind index` runs, and by `shelffind upgrade`: every file comes
-over as a document of its own with the pages read from it, and the first `shelffind index`
-that follows measures the files that were read, so that copies are joined. The earlier index
+over as a document of its own with the pages read from it. Those pages stay with their file
+alone until the first `shelffind index` that follows reads the file in full once, which ties
+them to its bytes; copies are joined from then on. The earlier index
 is taken exclusively while it is copied, which is refused for as long as another program has
 it open, marked as converted before the new one takes its name, and deleted only by
 `shelffind upgrade --discard-old`, as long as it is exactly what the new index was made

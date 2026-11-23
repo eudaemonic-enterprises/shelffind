@@ -152,7 +152,7 @@ def structure(db):
         if record["home"] != record["doc"]:
             found.append(f"record {record['id']} is not with the document of its file")
         mine = (record["sum"] or "").split()
-        if against(given, mine) or (mine and refuted(db, record["size"], record["format"], sorted({*given, *mine}))[0]):
+        if against(given, mine) or refuted(db, record["size"], record["format"], sorted({*given, *mine}))[0]:
             found.append(f"record {record['id']} is kept although a measure refutes it")
     if db.execute("SELECT count(*) FROM names").fetchone()[0] != len(files):
         found.append("the names searched are not those of the files")

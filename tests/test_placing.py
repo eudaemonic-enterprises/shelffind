@@ -282,6 +282,24 @@ class Statements(Placing):
         self.sound()
 
 
+class Collisions(Placing):
+    def test_a_file_that_shares_one_checksum_with_a_document_and_differs_by_the_other_stays_apart(self):
+        self.write("a/book.txt")
+        self.write("b/book.txt", OTHER)
+        self.build(names_only=True)
+        ids = self.ids()
+        with self.db:                                       # two files built to share an MD5: their SHA-256 tells them apart
+            indexer.joined(self.db, ids["a/book.txt"], ["md5:" + "aa" * 16, "sha256:" + "11" * 32])
+            indexer.joined(self.db, ids["b/book.txt"], ["md5:" + "aa" * 16, "sha256:" + "22" * 32])
+        docs = self.docs()
+        self.assertNotEqual(docs["a/book.txt"], docs["b/book.txt"])
+        held = lambda rel: sorted(row["key"][:9] for row in self.db.execute("SELECT key FROM doc_keys WHERE doc=?", (docs[rel],)))
+        self.assertEqual((held("a/book.txt"), held("b/book.txt")), (["md5:aaaaa", "sha256:11"], ["sha256:22"]))
+        self.assertEqual(self.build(), (2, 0))              # each is read for itself
+        self.assertEqual((names(self.db, "northern harbours"), names(self.db, "southern capes")),
+                         (["a/book.txt"], ["b/book.txt"]))
+
+
 class Reading3(Placing):
     """One reading, of the right bytes, charged to the right document."""
 
