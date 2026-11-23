@@ -152,7 +152,7 @@ def joined(db, file, keys):
     doc = row["doc"]
     if store.against(keys, store.keys_of(db, doc)):
         if row["read"]:
-            store.disown(db, doc, file)
+            store.disown(db, doc, file, measured=True)
         else:
             doc = store.set_apart(db, file)
     elif not row["read"] and db.execute("SELECT 1 FROM pages WHERE doc=? LIMIT 1", (doc,)).fetchone():

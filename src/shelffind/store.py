@@ -396,11 +396,16 @@ def set_apart(db, file):
     return apart
 
 
-def disown(db, doc, file):
+def disown(db, doc, file, measured=False):
     """The document `doc` was read from the file `file`, and what the sources said of it turned
     out not to describe that file. The document stays the file's, with its text; the word of the
     sources is withdrawn from it, and the other files that nothing but that word had joined to
-    it get documents of their own, about which the sources will be asked again."""
+    it get documents of their own, about which the sources will be asked again. When it was a
+    measure of the file that showed it (`measured`), the sources are asked again about the file
+    itself too: the measure now guards it against the word that was wrong, and the others may
+    say again what they said rightly."""
+    if measured:
+        db.execute("UPDATE files SET asked='' WHERE id=?", (file,))
     db.execute("DELETE FROM doc_keys WHERE doc=? AND basis='source'", (doc,))
     db.execute("DELETE FROM records WHERE doc=?", (doc,))
     db.execute("UPDATE docs SET title=NULL,byline=NULL,year=NULL WHERE id=?", (doc,))
