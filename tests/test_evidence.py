@@ -578,13 +578,13 @@ class Words(Evidence):
         self.assertEqual(self.documents(), 2)               # their SHA-256 differ: they are two
 
     def test_a_file_leaves_when_the_file_its_document_was_read_from_is_measured_otherwise(self):
-        self.write("a/book.txt")
+        one = self.write("a/book.txt")
         two = self.write("b/book.txt", OTHER)
-        self.build(paths=[self.root / "a/book.txt"])
+        self.build(paths=[one])
         self.unmeasured()                                   # the first was read by an earlier version
-        key = "sha256:" + "aa" * 32
+        key = self.sha(one)                                 # what the source says is true of the first,
         self.assertTrue(self.say("a/book.txt", "W1", key))
-        self.assertTrue(self.say("b/book.txt", "W1", key))  # a source takes the second for the first
+        self.assertTrue(self.say("b/book.txt", "W1", key))  # and wrong of the second, which it takes for the first
         row = {"size": two.stat().st_size, "mtime": two.stat().st_mtime_ns}
         with self.db:                                       # the storage tells the MD5 of the second, kept with it
             indexer.joined(self.db, self.ids()["b/book.txt"], [indexer.whole_checksums(two, row)[0]], local=False)
