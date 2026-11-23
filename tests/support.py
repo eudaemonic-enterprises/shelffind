@@ -16,7 +16,7 @@ from shelffind.cli import main
 RCLONE = """#!/usr/bin/env python3
 import datetime, hashlib, json, os, sys
 args = sys.argv[1:]
-twin = os.environ["SHELFFIND_TEST_TWIN"]
+twin = args[-1] if os.path.isdir(args[-1]) else os.environ["SHELFFIND_TEST_TWIN"]    # a folder stands for itself
 with open(args[args.index("--files-from-raw") + 1], encoding="utf-8") as listing:
     names = [line.rstrip("\\n") for line in listing if line.rstrip("\\n")]
 with open(os.environ["SHELFFIND_TEST_TWIN_LOG"], "a", encoding="utf-8") as log:

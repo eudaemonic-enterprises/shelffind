@@ -548,6 +548,33 @@ class Words(Evidence):
         self.assertIn(fuse.document(self.db, "library", {"id": "X", "keys": [key]}), docs.values())
         self.assertTrue(two.exists())
 
+    def test_a_word_does_not_join_two_documents_that_other_checksums_keep_apart(self):
+        one = self.write("a/book.txt")
+        self.write("b/book.txt", OTHER)
+        self.assertEqual(self.build(paths=[one]), (1, 0))   # the first is read and measured
+        self.assertTrue(self.say("b/book.txt", "W9", "sha256:" + "ee" * 32))
+        row = {"size": one.stat().st_size, "mtime": one.stat().st_mtime_ns}
+        record = {"id": "C1", "keys": [indexer.whole_checksums(one, row)[0]], "title": "By Its MD5"}
+        with self.db:                                       # another source gives the second the MD5 of the first
+            self.assertTrue(link.attach(self.db, self.ids()["b/book.txt"], "catalogue", record, set()))
+        self.assertEqual(self.documents(), 2)               # their SHA-256 differ: they are two
+
+    def test_a_file_leaves_when_the_file_its_document_was_read_from_is_measured_otherwise(self):
+        self.write("a/book.txt")
+        two = self.write("b/book.txt", OTHER)
+        self.build(paths=[self.root / "a/book.txt"])
+        self.unmeasured()                                   # the first was read by an earlier version
+        key = "sha256:" + "aa" * 32
+        self.assertTrue(self.say("a/book.txt", "W1", key))
+        self.assertTrue(self.say("b/book.txt", "W1", key))  # a source takes the second for the first
+        row = {"size": two.stat().st_size, "mtime": two.stat().st_mtime_ns}
+        with self.db:                                       # the storage tells the MD5 of the second, kept with it
+            indexer.joined(self.db, self.ids()["b/book.txt"], [indexer.whole_checksums(two, row)[0]], local=False)
+        self.assertEqual(self.documents(), 1)
+        self.assertEqual(self.build(), (1, 0))              # the first is measured: the second is not that document
+        self.assertEqual((names(self.db, "northern harbours"), names(self.db, "southern capes")),
+                         (["a/book.txt"], ["b/book.txt"]))
+
     def test_two_checksums_of_one_kind_in_one_record_are_no_checksum(self):
         self.write("a/book.txt")
         self.build(names_only=True)
@@ -884,6 +911,22 @@ class Twin(Evidence):
         self.assertEqual(self.build(names_only=True), (0, 0))
         self.assertEqual(tuple(measured()), ("md5:" + hashlib.md5(OTHER.encode()).hexdigest(), ""))
         self.assertEqual(search(self.db, "northern harbours"), [])
+
+    def test_what_the_storage_of_one_folder_tells_settles_a_file_of_another_in_the_same_inventory(self):
+        self.twin()
+        annex = self.base / "Annex"
+        annex.mkdir()
+        self.run_cli("roots", "add", str(annex))
+        store.declare({"Reading Room": {"path": str(self.root), "remote": str(self.root)},
+                       "Annex": {"path": str(annex), "remote": str(annex)}})
+        (annex / "book.txt").write_text(LARGE)
+        with patch.dict(os.environ, {"SHELFFIND_TEST_TWIN_SILENT": "1"}):
+            self.assertEqual(self.build(), (1, 0))          # read in the annex while its storage gave no answer
+        self.write("copy.txt", when=1_800_000_000)          # a copy in the folder that is gone through first
+        with self.unread():
+            self.assertEqual(self.build(names_only=True), (0, 0))
+        self.assertEqual(self.documents(), 1)
+        self.assertEqual(len(search(self.db, "northern harbours")[0]["copies"]), 1)
 
     def test_a_twin_that_lags_behind_the_folder_says_nothing_of_a_file(self):
         lagging = self.base / "twin"
