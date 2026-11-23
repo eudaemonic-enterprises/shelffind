@@ -167,6 +167,16 @@ def queries(directory):
     return found
 
 
+def openings(directory):
+    """How many times each document was opened lately, as address -> number."""
+    counted = {}
+    for event in events(directory):
+        path = event.get("path")
+        if path and event.get("act") in ("open", "launch"):
+            counted[path] = counted.get(path, 0) + 1
+    return counted
+
+
 def documents(directory, limit=30):
     """The addresses of the documents opened lately, newest first, each once."""
     seen, found = set(), []

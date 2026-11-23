@@ -182,6 +182,29 @@ class Words(Reading):
         self.assertEqual(history.documents(self.data), [str(old)])
         self.assertEqual(history.queries(self.data), ["tides"])
 
+    def test_a_document_opened_often_comes_first_among_matches_of_its_kind(self):
+        for name in ("almanac-a.txt", "almanac-b.txt", "almanac-c.txt"):
+            self.write(name, f"The {name[8]} almanac of tides. " * 3000)
+        self.write("tides.txt", "Nothing but the word almanac. " * 3000)
+        self.build()
+        options = {"root": None, "fmt": None, "exact": False, "limit": 10, "source": None, "where": "all"}
+
+        def listed():
+            answers = []
+            sources.find(self.db, self.data, "almanac", options, lambda rows, message: answers.append(rows))
+            return [hit["name"] for hit in answers[-1]]
+
+        before = listed()
+        self.assertEqual((sorted(before[:3]), before[3]), (["almanac-a.txt", "almanac-b.txt", "almanac-c.txt"], "tides.txt"))
+        last = before[2]                                    # the least of the three matches by name
+        for _ in range(2):
+            history.record(self.data, "open", "almanac", {"path": str(self.root / last), "source": "files", "name": last})
+        passage = {"path": str(self.root / "tides.txt"), "source": "files", "name": "tides.txt"}
+        for _ in range(5):
+            history.record(self.data, "open", "almanac", passage)
+        # The favourite leads the matches by name; the passage stays behind every match by name.
+        self.assertEqual(listed(), [last, before[0], before[1], "tides.txt"])
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -278,7 +278,12 @@ def find(db, directory, query, options, publish, cancelled=lambda: False):
             for shown in rows:
                 shown["source"] = "files"
             publish(rows, "")
-        local = search(db, query, **opts, interim=early)
+        # The documents opened lately, on this machine or on those that share their journals.
+        often = {}
+        for path, times in (history.openings(directory) if query.strip() else {}).items():
+            for shown in by_paths(db, [path]):
+                often[shown["doc"]] = often.get(shown["doc"], 0) + times
+        local = search(db, query, **opts, interim=early, often=often)
         if not query.strip() and not (opts.get("root") or opts.get("fmt") or opts.get("folder") or typed.without):
             # Nothing is asked yet: the documents opened lately come first.
             lately = by_paths(db, history.documents(directory))

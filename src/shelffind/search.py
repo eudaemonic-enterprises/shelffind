@@ -319,12 +319,13 @@ def scored_pages(db, expr):
 
 
 def search(db, query, *, root=None, fmt=None, limit=25, exact=False, where="all", folder=None, without=(),
-           interim=None):
+           interim=None, often=None):
     """Rank the documents that match `query`, one result per document: a document with several
     copies is shown through the copy that matched best, and names the others. `folder` keeps the
     files whose path contains it, and `without` drops those whose name or path contains one of
     its words. `interim(results)` receives the matches by name as soon as they are known, while
-    the passages are still being searched."""
+    the passages are still being searched. `often` tells how many times each document was opened
+    lately, as document -> number: among matches of the same kind, those opened often come first."""
     if not 1 <= limit <= 500:
         raise ValueError("Choose a limit from 1 to 500")
     places = {row["id"]: row["path"] for row in store.roots(db)}
@@ -391,7 +392,12 @@ def search(db, query, *, root=None, fmt=None, limit=25, exact=False, where="all"
 
     def ranked():
         """The results so far, the best first, with their copies and their passages."""
-        order = lambda entry: (entry[0], entry[1]["path"])
+        def order(entry):
+            # A document opened often moves up among the matches of its own kind, never past
+            # a better kind of match.
+            score, item = entry
+            kind = int(score)
+            return (kind, score - kind - min(0.9, 0.3 * (often or {}).get(item["doc"], 0)), item["path"])
         listed = sorted(found.values(), key=order)
         if where == "all" and len(listed) > limit:
             # Names would fill the list alone: a third of it is kept for passages, which no key
