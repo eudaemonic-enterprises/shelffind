@@ -6,6 +6,52 @@ ShelfFind follows semantic versioning. Before version 1.0 a minor version may ch
 JSON keys and the exit codes that other programs rely on are kept from one version to the next and
 are covered by tests.
 
+## 0.3.0
+
+The folders and the sources in one list, with the text attached to documents.
+
+The text that ShelfFind reads now belongs to a document, not to an address. A renamed or moved
+file keeps its text, a document kept in several places is read once and shown on one row that
+names its copies, and a file written anew elsewhere is recognised by a fingerprint of its
+content. The inventory alone settles one case, a file with the name, the size and the date of a
+file that is there; everything else is settled by content, never by a likeness of size and date.
+A document whose last file has gone keeps its text for a month.
+
+Sources speak a second, richer version of their exchange, described in `docs/sources.md`, with
+a helper of one file for writing one and `shelffind sources check NAME` for trying one. A
+source says what it can do, gives titles, authors, checksums, warnings, notes and actions, and
+tells which files of the folders it knows. A document that the folders and a source both hold
+then appears once, on the row of the file, under its true title, and is found by the words of
+that title. When the source holds the text of a file, ShelfFind does not read the file itself.
+The panel names such rows by their work, shows the page as it is printed, lists the actions of
+the source under Ctrl-X and the passages the source finds under Ctrl-O, and opens the copy on
+a disk of this machine in preference to one that comes through a network. A source of the
+first version keeps working unchanged. `contrib/zotero.py` is a complete source for a local
+Zotero library.
+
+Search stays fast on a large index. Measured on a million pages, every search answers within
+two tenths of a second: passages are ranked exactly while at most twenty thousand pages match
+and through pages taken at regular intervals beyond, the excerpt is cut around the place where
+most words of the query meet, and the matches by name are shown before the passages are
+searched. In the text only the last word of a query is completed, from four letters. Spelling
+suggestions give the usual word first. Documents opened often rise among matches of their kind.
+
+Several machines can share the journal of searches and of opened documents, through a folder
+kept in step or a remote of rclone (`[share]`, `shelffind sync`, `shelffind machine`); nothing is
+shared unless asked for. The settings can name the folders (`[roots.NAME]`), with their rclone
+twin, whose checksums recognise a moved file without reading it. The list of files is refreshed
+beside the panel when it is old. `shelffind report copies`, `unlinked` and `names` print lists
+for keeping the folders in order.
+
+The index has a new form, kept in a new file. An index of version 0.2 is converted by copy the
+first time the panel or `shelffind index` runs, and by `shelffind upgrade`; the earlier index is
+locked while it is copied, marked as converted before the new one takes its name, and deleted
+only by `shelffind upgrade --discard-old`, as long as it is exactly what the new index was made
+from. `status` reports from an earlier index without converting it, and a script that meets a
+large earlier index receives exit code 75. The JSON of `search` gains `copies`, `title`,
+`byline`, `year` and, for a file a source knows, `record`, `flags`, `notes` and `fast`; the keys
+of version 0.2 are kept. The full-screen screen of version 0.1, kept for one version, is removed.
+
 ## 0.2.2
 
 The list of applications that F2 opens, and the `apps` command, now name each application as
