@@ -619,7 +619,8 @@ def claim(db, doc, key, basis):
             if against([key], [other for other in keys_of(db, doc) if other != name]):
                 return doc
             db.execute("UPDATE doc_keys SET doc=?,basis='content' WHERE key=?", (doc, name))
-            return doc
+            release(db, owner["doc"])           # the files that this word alone had brought there follow it
+            return db.execute("SELECT doc FROM doc_keys WHERE key=?", (name,)).fetchone()["doc"]
     elif has_pages(db, doc) and has_pages(db, owner["doc"]):
         return doc
     kept = merge(db, owner["doc"], doc)

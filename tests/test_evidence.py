@@ -405,6 +405,24 @@ class Words(Evidence):
         self.assertEqual((names(self.db, "northern harbours"), names(self.db, "southern capes")),
                          (["a/book.txt"], ["b/other.txt"]))
 
+    def test_a_file_brought_by_a_word_follows_the_checksum_to_the_document_that_is_measured(self):
+        one = self.write("a/book.txt")
+        self.write("b/book.txt", OTHER)
+        other = self.write("c/other.txt", OTHER)
+        self.build(paths=[one])
+        self.unmeasured()                                   # the first was read by an earlier version
+        key = self.sha(other)
+        self.assertTrue(self.say("a/book.txt", "W2", key))  # a source takes the first for another work,
+        self.assertTrue(self.say("b/book.txt", "W2", key))  # and rightly says that the second is that work
+        docs = self.docs()
+        self.assertEqual(docs["a/book.txt"], docs["b/book.txt"])
+        with self.db:                                       # the third file is measured: it is that work
+            row = self.db.execute("SELECT size,mtime FROM files WHERE rel='c/other.txt'").fetchone()
+            indexer.joined(self.db, self.ids()["c/other.txt"], indexer.whole_checksums(other, row))
+        docs = self.docs()
+        self.assertEqual((docs["b/book.txt"], docs["a/book.txt"] != docs["c/other.txt"]), (docs["c/other.txt"], True))
+        self.assertEqual(names(self.db, "northern harbours"), ["a/book.txt"])
+
     def test_a_wrong_word_about_a_file_that_was_read_costs_it_nothing(self):
         self.write("a/book.txt")
         other = self.write("b/other.txt", OTHER)
