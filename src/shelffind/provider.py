@@ -178,7 +178,8 @@ def answer(request, *, name=None, search, resolve=None, identify=None, pages=Non
             return found, None
         if op == "resolve":
             return {key: found[key] for key in ("path", "uri") if key in found}, None
-        return [{**row, "name": row.get("name") or row["title"]} for row in found["results"]], None
+        # A caller of the first version shows `name`: it is given the title of the work.
+        return [{**row, "name": row.get("title") or row["name"]} for row in found["results"]], None
     except Refusal as refusal:
         error = {"code": refusal.code, "message": str(refusal), "retry": refusal.retry}
     except Fault as fault:

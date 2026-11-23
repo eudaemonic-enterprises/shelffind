@@ -29,7 +29,7 @@ The codes are `unavailable` (not now), `invalid` (the question is not understood
 
 ## Version 1
 
-A source of version 1 knows two questions and answers them without `ok`. It keeps working unchanged, and ShelfFind sends it nothing else.
+A source of version 1 knows two questions and answers them without `ok`. It keeps working unchanged, and ShelfFind sends it nothing else. A source written for version 2 with the helper below answers version 1 as well: `name` then carries the title of the work, which is what a caller of that version shows.
 
 ```json
 {"version": 1, "op": "search", "query": "orchid", "terms": [{"text": "orchid", "literal": false, "alternatives": ["orchis"]}],
@@ -65,7 +65,7 @@ A program that fails this question, or answers anything else, is taken for a sou
 | `ops` | The questions the source answers, among `search`, `resolve`, `identify`, `pages` and `act`. Only `search` is required. |
 | `name` | A name for people. The registered name stays the one used in commands. |
 | `text` | True when the source holds the full text of its documents and `search` finds passages in it. |
-| `network` | True when an answer needs the network. Such a source is asked only when the user asks for it, never at each letter typed. |
+| `network` | True when `search`, `identify` or `pages` need the network. Such a source is asked only when the user asks for it, never at each letter typed. `resolve` and `act`, which the user starts on one result, may use the network whatever this says. |
 | `actions` | What can be done with a result besides opening it: `name`, a `label` for the menu, and the kind of `result` (see `act`). |
 
 ## search
@@ -77,9 +77,11 @@ A program that fails this question, or answers anything else, is taken for a sou
  "exact": false, "where": "all", "format": null, "limit": 25, "within": null, "budget_ms": 800}
 ```
 
-`terms` gives the words of the query as ShelfFind understood them: folded to lower case without accents, a quoted phrase as one `literal` term, and for each word the spellings ShelfFind would also accept. Every term must be met; a term that is not literal may also be met by one of its alternatives, and the last such term may be the beginning of a longer word. `where` is `name` for the description of a record (title, authors, year), `text` for passages, and `all` for both. `format` keeps the records whose file has that extension. `budget_ms` is the time after which a partial answer is worth more than a complete one.
+`terms` gives the words of the query as ShelfFind understood them: folded to lower case without accents, a quoted phrase as one `literal` term, and for each word the spellings ShelfFind would also accept. Every term must be met; a term that is not literal may also be met by one of its alternatives. In the description of a record every such term may be the beginning of a longer word; in the text ShelfFind itself completes only the last term, and only from four letters, since completing short common beginnings over a large text is slow, and a source does well to do the same. `where` is `name` for the description of a record (title, authors, year), `text` for passages, and `all` for both. `format` keeps the records whose file has that extension. `budget_ms` is the time after which a partial answer is worth more than a complete one; it is a wish, not a limit.
 
 `within` is null, or the `id` of one record: the answer then lists the passages of that record alone, in the order of its pages.
+
+`partial` is true when the results were not chosen among all that match: the words were so common that only a sample of the matches was ranked, or the time ran out. An answer cut at `limit` is not partial.
 
 ```json
 {"ok": true, "partial": false, "results": [
@@ -95,11 +97,11 @@ A program that fails this question, or answers anything else, is taken for a sou
 | `id` | Required. A string that names the result to the source in later questions. It is never shown. |
 | `title` | Required, unless `name` is given. The title of the work. |
 | `name` | The name of the file the record holds, if it has one. |
-| `byline`, `year`, `venue` | Authors as they should be shown, year, journal or publisher. |
+| `byline`, `year`, `venue` | Authors as they should be shown, without the year, which is given apart; the year; journal or publisher. |
 | `format`, `size` | Extension and size in bytes of the file the record holds. |
 | `match` | What matched, in a word or two: it is shown on the row. A value ending in `passage` marks a match in the text. |
 | `page`, `page_label`, `section` | The page of the passage counted from 1 in the file, which the viewer opens; the number printed on that page; a chapter or part. |
-| `snippet`, `marks` | The passage on one line, and the ranges `[start, end)` of the matched words in it. |
+| `snippet`, `marks` | The passage on one line, and the ranges `[start, end)` of the matched words in it, counted in characters (Unicode code points) of the snippet as it is given. |
 | `keys` | Checksums of the file this result stands for, as `sha256:` or `md5:` followed by lower-case hexadecimal digits. ShelfFind recognises by them a file of the folders. |
 | `path` | The absolute address of a copy on this machine that can be opened at once. |
 | `fetch` | True when `resolve` can obtain the file, even slowly. |
@@ -145,7 +147,7 @@ A file the source does not know is left out of the answer. `basis` says how the 
 {"ok": true, "total": 636, "pages": [{"page": 380, "label": "363", "text": "…"}]}
 ```
 
-Pages are counted from 1 in the order of the file. ShelfFind uses this question to show a page inside the panel.
+Pages are counted from 1 in the order of the file. ShelfFind uses this question to show a page inside the panel. A range past the end, or a `count` of zero, is answered by an empty list with the `total`. A record whose text is not ready yet is refused with `unavailable` and `"retry": true`, and a record without text with `not_found`.
 
 ## act
 

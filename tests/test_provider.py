@@ -50,6 +50,10 @@ class Answers(unittest.TestCase):
         old, failure = self.ask({"version": 1, "op": "search", "query": "tide", "terms": [], "limit": 5})
         self.assertIsNone(failure)
         self.assertEqual((old[0]["id"], old[0]["name"]), ("a1", "Tide Tables"))
+        # A caller of the first version shows `name`: it receives the title, not the name of the file.
+        both, _ = answer({"version": 1, "op": "search", "query": "tide", "terms": []},
+                         search=lambda request: [{"id": "b1", "title": "Tide Tables", "name": "tt-1936.pdf"}])
+        self.assertEqual(both[0]["name"], "Tide Tables")
 
     def test_a_refusal_an_accident_and_a_faulty_answer_are_all_answers(self):
         refused, _ = self.ask({"version": 2, "op": "search", "query": "refuse", "terms": []})
