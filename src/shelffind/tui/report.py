@@ -1,6 +1,7 @@
 # Copyright 2026 Eudaemonic Enterprises Inc.
 """What the commands print at a terminal: results with colours and links, the table of the
 folders, and one live line while documents are read. A pipe receives the plain forms instead."""
+import time
 from pathlib import Path
 
 from ..text import safe
@@ -104,6 +105,25 @@ def status(rows, theme, version, sources, unicode=True, width=100):
             yield theme.render([("  " + clip(safe(f"{fault['rel']}: {fault['error']}"), max(20, width - 3)), "muted")])
     yield ""
     yield theme.render([("Sources".ljust(name_room + 2), "muted"), (dot.join(["files", *sources]), None)])
+
+
+def ago(seconds):
+    """A span of time in the largest unit that fits: 40 s, 12 min, 3 h, 5 days."""
+    for unit, size in (("days", 86400), ("h", 3600), ("min", 60)):
+        if seconds >= size:
+            return f"{int(seconds // size)} {unit}"
+    return f"{int(max(0, seconds))} s"
+
+
+def machines(here, last, theme, unicode=True, now=None):
+    """The line of `status` on the machines that share their journals with this one."""
+    now = time.time() if now is None else now
+    dot = " · " if unicode else " - "
+    others = sorted(last.get("machines", {}).values(), key=lambda card: card.get("name") or "")
+    told = [f"{safe(here['name'])} (here)"] + [
+        f"{safe(card.get('name') or '?')}, shared {ago(now - card.get('updated', 0))} ago" for card in others]
+    when = f"last exchange {ago(now - last['synced'])} ago" if last.get("synced") else "no exchange yet: shelffind sync"
+    yield theme.render([("Machines".ljust(10), "muted"), (dot.join(told), None), (dot + when, "muted")])
 
 
 class Progress:

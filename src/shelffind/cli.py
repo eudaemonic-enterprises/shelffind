@@ -165,9 +165,14 @@ def status(args, rows, directory, settings):
         print(json_text(rows))
     elif sys.stdout.isatty():
         extra = [name for name in sources.registered(directory)]
-        for line in report.status(rows, look(settings, sys.stdout), __version__, extra,
+        theme = look(settings, sys.stdout)
+        for line in report.status(rows, theme, __version__, extra,
                                   unicode_signs(settings, sys.stdout), shutil.get_terminal_size().columns):
             print(line)
+        if sharing.carrier(settings) is not None:
+            for line in report.machines(machine.identity(directory), sharing.last(directory), theme,
+                                        unicode_signs(settings, sys.stdout)):
+                print(line)
     else:
         for row in rows:
             states = ", ".join(f"{n:,} {k}" for k, n in row["states"].items())

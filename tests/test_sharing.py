@@ -196,6 +196,29 @@ class Identity(Machines):
             self.assertEqual(run_main(data, "sync", "--quiet")[1], "")
             shown = json.loads(run_main(data, "config", "show", "--json")[1])
             self.assertEqual(shown["share.folder"]["value"], str(self.shared))
+            rows = json.loads(run_main(data, "doctor", "--json")[1])
+            self.assertTrue(any(row["label"] == "shared place" and "1 machine listed" in row["detail"] for row in rows))
+
+    def test_status_names_the_machines_that_share(self):
+        import re
+        from shelffind.tui import report, style
+
+        class Plain:
+            """The text of what a theme would colour."""
+            theme = style.theme("plain", {}, {}, terminal=False)
+
+            def render(self, pieces, base=None):
+                return re.sub(r"\x1b\[[0-9;]*m", "", self.theme.render(pieces, base))
+
+        plain = Plain()
+        last = {"synced": 1000, "machines": {"a" * 16: {"name": "office", "updated": 400},
+                                              "b" * 16: {"name": "laptop", "updated": 1000 - 3 * 86400}}}
+        self.assertEqual(list(report.machines({"id": "c" * 16, "name": "home"}, last, plain, now=4600)),
+                         ["Machines  home (here) · laptop, shared 3 days ago · office, shared 1 h ago"
+                          " · last exchange 1 h ago"])
+        self.assertIn("no exchange yet", next(report.machines({"id": "c" * 16, "name": "home"}, {}, plain)))
+        self.assertEqual([report.ago(s) for s in (5, 59, 60, 3599, 3600, 86400 * 2)],
+                         ["5 s", "59 s", "1 min", "59 min", "1 h", "2 days"])
 
 
 if __name__ == "__main__":

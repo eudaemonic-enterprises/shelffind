@@ -7,7 +7,7 @@ import subprocess
 import sys
 from pathlib import Path
 
-from . import __version__, config, desktop, sources, store
+from . import __version__, config, desktop, sharing, sources, store
 from .tui import style
 
 READERS = [
@@ -143,6 +143,17 @@ def checks(directory, explicit):
                 ("" if found else f"correct it or run `shelffind sources remove {name}`")
     except (OSError, ValueError) as error:
         yield "fail", "sources", str(error), "correct sources.json in the data folder"
+
+    try:
+        place = sharing.carrier(config.load(directory, explicit))
+    except ValueError:
+        place = None
+    if place is not None:
+        try:
+            cards = place.names("machines")
+            yield "ok", "shared place", f"reachable; {len(cards)} machine{'s' * (len(cards) != 1)} listed there", ""
+        except (OSError, ValueError) as error:
+            yield "warn", "shared place", str(error), "check share.folder or share.remote in the settings"
 
     colours = style.depth(os.environ, sys.stdout.isatty())
     words = {0: "no colour", 16: "16 colours", 256: "256 colours", 1 << 24: "full colour"}[colours]
