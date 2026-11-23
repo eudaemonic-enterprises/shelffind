@@ -1,0 +1,286 @@
+# Copyright 2026 Eudaemonic Enterprises Inc.
+"""A text is attached to a file only on evidence: the cases in which a likeness could mislead."""
+import os
+import shutil
+import time
+import unittest
+import zlib
+from pathlib import Path
+from unittest.mock import patch
+
+from shelffind import history, indexer, store
+from shelffind.search import search
+
+from test_identity import LARGE, OTHER, Reading
+
+
+def names(db, query):
+    return sorted(hit["path"].rsplit("/", 2)[-2] + "/" + hit["name"] for hit in search(db, query))
+
+
+class Likeness(Reading):
+    def test_an_edit_that_keeps_the_size_and_the_second_is_read_again(self):
+        first, second = self.write("a/book.txt"), self.write("b/book.txt")
+        os.utime(first, ns=(100, 100))
+        os.utime(second, ns=(100, 100))
+        self.assertEqual(self.build(), (1, 0))
+        second.write_text(OTHER)
+        os.utime(second, ns=(900, 900))                     # the same second, the same size
+        self.read.clear()
+        self.assertEqual(self.build(), (1, 0))
+        self.assertEqual(self.read, ["book.txt"])
+        self.assertEqual(names(self.db, "northern harbours"), ["a/book.txt"])
+        self.assertEqual(names(self.db, "southern capes"), ["b/book.txt"])
+        self.assertEqual(self.build(), (0, 0))
+
+    def test_a_known_name_is_looked_up_before_a_stamp_whose_file_is_gone(self):
+        alpha, blue = self.write("alpha.txt"), self.write("blue.txt", OTHER)
+        self.build()
+        alpha.unlink()
+        copy = self.root / "copies" / "blue.txt"
+        copy.parent.mkdir()
+        shutil.copy2(blue, copy)                            # the same bytes and date as blue.txt
+        self.read.clear()
+        self.build()
+        self.assertEqual(names(self.db, "southern capes"), ["Reading Room/blue.txt", "copies/blue.txt"][:1])
+        self.assertEqual(len(search(self.db, "southern capes")[0]["copies"]), 1)
+        self.assertEqual(search(self.db, "northern harbours"), [])
+
+    def test_a_file_of_the_size_of_a_lost_document_is_compared_in_every_folder(self):
+        old = self.write("old.txt")
+        annex = self.base / "Annex"
+        annex.mkdir()
+        self.run_cli("roots", "add", str(annex))
+        self.build()
+        old.unlink()
+        for folder in (self.root, annex):                   # another text of the same size, in two folders
+            (folder / "new.txt").write_text(OTHER)
+            os.utime(folder / "new.txt", (1_800_000_000, 1_800_000_000))
+        self.read.clear()
+        self.build()
+        self.assertEqual(search(self.db, "northern harbours"), [])
+        found = search(self.db, "southern capes")
+        self.assertEqual((len(found), len(found[0]["copies"])), (1, 1))
+        self.assertEqual(self.db.execute("SELECT count(*) FROM files WHERE maybe IS NOT NULL").fetchone()[0], 0)
+        self.assertEqual(self.build(), (0, 0))
+
+    def test_a_document_read_before_fingerprints_existed_is_never_guessed_from_its_size(self):
+        old = self.write("old.txt")
+        self.build()
+        self.db.execute("DELETE FROM doc_keys WHERE key LIKE 'fp:%'")       # as an index converted from the earlier one
+        self.db.commit()
+        old.unlink()
+        self.write("new.txt", OTHER, when=1_800_000_000)
+        self.read.clear()
+        self.assertEqual(self.build(), (1, 0))
+        self.assertEqual(self.read, ["new.txt"])
+        self.assertEqual(names(self.db, "southern capes"), ["Reading Room/new.txt"])
+        self.assertEqual(search(self.db, "northern harbours"), [])
+
+    def test_such_a_document_gets_its_fingerprint_at_the_next_reading_of_its_folder(self):
+        path = self.write("old.txt")
+        self.build()
+        self.db.execute("DELETE FROM doc_keys WHERE key LIKE 'fp:%'")
+        self.db.commit()
+        self.build()
+        self.assertEqual(self.db.execute("SELECT count(*) FROM doc_keys WHERE key LIKE 'fp:%'").fetchone()[0], 1)
+        os.utime(path, (1_800_000_000, 1_800_000_000))      # so that a mere new date reads nothing again
+        self.read.clear()
+        self.assertEqual(self.build(), (1, 0))
+        self.assertEqual(self.read, [])
+
+    def test_a_file_that_changes_while_it_is_compared_proves_nothing(self):
+        self.write("a/book.txt")
+        self.build()
+        other = self.write("b/other.txt", OTHER, when=1_800_000_000)
+        real = indexer.fingerprint
+
+        def racing(path, fmt):
+            if path == other:               # rewritten, between the look at its date and its reading,
+                other.write_text(LARGE)     # into the very content of a document already known
+            return real(path, fmt)
+
+        with patch("shelffind.indexer.fingerprint", side_effect=racing):
+            self.assertEqual(self.build(), (1, 1))
+        self.assertEqual(names(self.db, "northern harbours"), ["a/book.txt"])
+        self.assertEqual(self.db.execute("SELECT count(*) FROM doc_keys WHERE key LIKE 'fp:%'").fetchone()[0], 1)
+        self.assertEqual(self.build(), (1, 0))              # the next inventory sees the file as it is now,
+        found = search(self.db, "northern harbours")        # a second copy of the first document
+        self.assertEqual((len(found), found[0]["copies"]), (1, [str(other)]))
+
+    def test_the_same_bytes_under_two_formats_are_read_by_each_reader(self):
+        self.write("notes.txt")
+        self.write("notes.md")
+        self.assertEqual(self.build(), (2, 0))
+        self.assertEqual(sorted(self.read), ["notes.md", "notes.txt"])
+        self.assertEqual(self.documents(), 2)
+        path = self.root / "notes.txt"
+        self.assertNotEqual(indexer.fingerprint(path, "txt"), indexer.fingerprint(path, "md"))
+        self.assertEqual(indexer.fingerprint(path, "txt"), indexer.fingerprint(self.root / "notes.md", "txt"))
+
+    def test_a_failed_reading_leaves_no_fingerprint_behind(self):
+        self.write("first.txt")
+        with patch("shelffind.extract.passages", side_effect=RuntimeError("the reader stumbled")):
+            self.assertEqual(self.build(), (1, 1))
+        self.assertEqual(self.db.execute("SELECT count(*) FROM doc_keys WHERE key LIKE 'fp:%'").fetchone()[0], 0)
+        self.write("second.txt", when=1_800_000_000)        # a healthy copy under another date
+        self.assertEqual(self.build(), (1, 0))
+        self.assertEqual(names(self.db, "northern harbours"), ["Reading Room/second.txt"])
+        self.assertEqual(self.build(retry=True), (1, 0))    # the first is now known by its content
+        self.assertEqual(len(search(self.db, "northern harbours")[0]["copies"]), 1)
+
+
+class Robustness(Reading):
+    @unittest.skipIf(os.geteuid() == 0, "The administrator reads every file")
+    def test_a_copy_that_cannot_be_read_does_not_hide_one_that_can(self):
+        first, second = self.write("a/book.txt"), self.write("b/book.txt")
+        hidden = min(first, second, key=lambda p: self.root.joinpath(p).as_posix())
+        hidden.chmod(0)
+        self.addCleanup(hidden.chmod, 0o600)
+        self.assertEqual(self.build(), (1, 0))
+        self.assertEqual(len(search(self.db, "northern harbours")), 1)
+
+    def test_one_damaged_document_does_not_stop_the_others(self):
+        self.write("damaged.txt")
+        self.write("sound.txt", OTHER)
+        original = indexer.extract.passages
+
+        def reader(path, fmt, work):
+            if path.name == "damaged.txt":
+                raise zlib.error("invalid stored block lengths")
+            return original(path, fmt, work)
+
+        with patch("shelffind.extract.passages", side_effect=reader):
+            self.assertEqual(self.build(), (2, 1))
+        self.assertEqual(names(self.db, "southern capes"), ["Reading Room/sound.txt"])
+        self.assertIn("invalid stored block lengths", self.db.execute("SELECT error FROM docs WHERE state='error'").fetchone()[0])
+
+    def test_a_folder_replaced_while_a_command_waited_is_not_read_under_its_number(self):
+        self.write("kept.txt")
+        stale = store.roots(self.db)[0]
+        self.run_cli("roots", "remove", "Reading Room")
+        annex = self.base / "Annex"
+        annex.mkdir()
+        (annex / "new.txt").write_text("A new folder.")
+        self.run_cli("roots", "add", str(annex))
+        said = []
+        self.assertEqual(indexer.build(self.db, self.data, [stale], progress=said.append), (0, 1))
+        self.assertTrue(any("No longer a registered folder" in text for text in said))
+        self.assertEqual(self.db.execute("SELECT count(*) FROM files").fetchone()[0], 0)
+        self.assertNotEqual(store.roots(self.db)[0]["id"], stale["id"])     # a number is never used twice
+
+    def test_folders_are_chosen_by_their_name_first(self):
+        for side in ("east", "west"):
+            (self.base / side / "books").mkdir(parents=True)
+            self.run_cli("roots", "add", str(self.base / side / "books"))
+        self.assertEqual(store.roots(self.db, "books")[0]["path"], str(self.base / "east" / "books"))
+        self.assertEqual(store.roots(self.db, "books-2")[0]["path"], str(self.base / "west" / "books"))
+        self.assertEqual(store.roots(self.db, "BOOKS-2")[0]["name"], "books-2")
+        with self.assertRaises(ValueError):
+            store.roots(self.db, "nowhere")
+
+    def test_a_dollar_sign_in_an_address_is_only_a_dollar_sign(self):
+        priced = self.base / "receipts$NOT_SET"
+        priced.mkdir()
+        (priced / "bill.txt").write_text("Paid in full.")
+        self.assertEqual(self.run_cli("roots", "add", str(priced))[0], 0)
+        self.build()
+        self.assertEqual(search(self.db, "bill")[0]["path"], str(priced / "bill.txt"))
+
+
+class Lost(Reading):
+    def test_a_small_file_touched_or_renamed_keeps_its_text_without_a_second_reading(self):
+        note = self.write("note.txt", "A short note on the tides.")
+        self.build()
+        self.read.clear()
+        os.utime(note, (1_800_000_000, 1_800_000_000))
+        self.assertEqual(self.build(), (1, 0))
+        note.rename(self.root / "renamed.txt")
+        self.assertEqual(self.build(), (1, 0))
+        self.assertEqual(self.read, [])
+        self.assertEqual(names(self.db, "short note"), ["Reading Room/renamed.txt"])
+        self.assertEqual(self.documents(), 1)
+
+    def test_a_document_without_file_keeps_its_text_for_a_month_and_no_longer(self):
+        path = self.write("book.txt")
+        self.build()
+        path.unlink()
+        self.build()
+        self.assertEqual(self.db.execute("SELECT count(*) FROM pages").fetchone()[0], 1)
+        with self.db:
+            store.tend_orphans(self.db, now=int(time.time()) + store.KEEP - 60)
+        self.assertEqual(self.documents(), 1)
+        with self.db:
+            store.tend_orphans(self.db, now=int(time.time()) + store.KEEP + 60)
+        self.assertEqual((self.documents(), self.db.execute("SELECT count(*) FROM pages").fetchone()[0]), (0, 0))
+        self.assertEqual(self.db.execute("SELECT count(*) FROM passages WHERE passages MATCH 'harbours'").fetchone()[0], 0)
+
+    def test_forgetting_a_folder_forgets_what_it_lost_earlier(self):
+        path = self.write("book.txt")
+        self.write("unread.bin", "x")
+        self.build()
+        path.unlink()
+        self.build()
+        self.assertEqual(self.documents(), 2)               # the lost document waits with its text
+        self.run_cli("roots", "remove", "Reading Room")
+        self.assertEqual((self.documents(), self.db.execute("SELECT count(*) FROM pages").fetchone()[0]), (0, 0))
+
+    def test_what_a_source_said_survives_a_merge_in_preference_to_its_silence(self):
+        with self.db:
+            one = store.new_document(self.db, "stamp:1:1:txt", 1, "txt")
+            two = store.new_document(self.db, "stamp:1:2:txt", 1, "txt")
+            other = store.new_document(self.db, "stamp:2:2:txt", 2, "txt")
+            self.db.execute("INSERT INTO records(doc,source,ref,text) VALUES(?,'library','',0)", (one,))
+            self.db.execute("INSERT INTO records(doc,source,ref,title,text) VALUES(?,'library','W1','Tides',1)", (two,))
+            self.db.execute("UPDATE docs SET title='Tides' WHERE id=?", (two,))
+            kept = store.merge(self.db, one, two)
+            self.assertIsNone(store.merge(self.db, kept, other))            # another size: another document
+        self.assertEqual(self.db.execute("SELECT ref FROM records WHERE doc=?", (kept,)).fetchall()[0][0], "W1")
+        self.assertEqual(self.db.execute("SELECT title FROM docs WHERE id=?", (kept,)).fetchone()[0], "Tides")
+        self.assertEqual(self.documents(), 2)
+
+
+class Journal(unittest.TestCase):
+    def setUp(self):
+        import tempfile
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.data = Path(tmp.name)
+
+    def test_the_journal_is_never_seen_half_written(self):
+        hit = {"path": "/shelf/a.pdf", "source": "files", "name": "a.pdf"}
+        history.record(self.data, "open", "tides", hit, when=200)
+        with patch("shelffind.history.os.replace", side_effect=KeyboardInterrupt), self.assertRaises(KeyboardInterrupt):
+            history.absorb(self.data, [(100, "winds")])
+        self.assertEqual(history.queries(self.data), ["tides"])             # what was there is still there
+        self.assertEqual([p.name for p in self.data.iterdir() if p.name.startswith("history.jsonl.")], [])
+        self.assertTrue(history.absorb(self.data, [(100, "winds")]))
+        self.assertTrue(history.absorb(self.data, [(100, "winds")]))
+        self.assertEqual(history.queries(self.data), ["tides", "winds"])
+        with (self.data / history.NAME).open() as journal:
+            self.assertEqual(len(journal.readlines()), 2)
+
+    def test_a_damaged_line_hides_nothing_else_and_limits_are_kept(self):
+        hit = {"path": "/shelf/a.pdf", "source": "files", "name": "a.pdf"}
+        history.record(self.data, "open", "tides", hit)
+        with (self.data / history.NAME).open("ab") as journal:
+            journal.write(b'{"t": 1, "q": "cut \xe2\x82\n')
+        history.record(self.data, "open", "winds", {**hit, "path": "/shelf/b.pdf"})
+        self.assertEqual(history.queries(self.data), ["winds", "tides"])
+        self.assertEqual(history.documents(self.data), ["/shelf/b.pdf", "/shelf/a.pdf"])
+        self.assertEqual(history.documents(self.data, 1), ["/shelf/b.pdf"])
+        self.assertEqual((history.events(self.data, 0), history.documents(self.data, 0)), ([], []))
+        self.assertFalse(history.absorb(self.data / "history.jsonl" / "impossible", [(1, "x")]))
+
+    def test_the_oldest_half_goes_when_the_journal_is_full(self):
+        with patch.object(history, "LIMIT", 600):
+            for number in range(40):
+                history.record(self.data, "search", f"query number {number}")
+        found = history.queries(self.data)
+        self.assertEqual(found[0], "query number 39")
+        self.assertLess(len(found), 40)
+        self.assertGreater(len(found), 4)
+
+
+if __name__ == "__main__":
+    unittest.main()

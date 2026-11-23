@@ -36,6 +36,10 @@ def lines_of(directory):
 
 
 def rewrite(directory, lines):
+    """Put a new journal in the place of the present one, in one step. The caller is the one
+    writer, so a file left beside the journal by a writer that was killed can be removed."""
+    for left in directory.glob(NAME + ".*"):
+        left.unlink(missing_ok=True)
     with tempfile.NamedTemporaryFile(mode="w", encoding="utf-8", dir=directory, prefix=NAME + ".", delete=False) as out:
         try:
             os.fchmod(out.fileno(), 0o600)
@@ -45,7 +49,11 @@ def rewrite(directory, lines):
         except BaseException:
             os.unlink(out.name)
             raise
-    os.replace(out.name, directory / NAME)
+    try:
+        os.replace(out.name, directory / NAME)
+    except BaseException:
+        os.unlink(out.name)
+        raise
 
 
 def record(directory, action, query, hit=None, page=None, when=None):
