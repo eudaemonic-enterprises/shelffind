@@ -144,14 +144,21 @@ class Linked(Shelf):
         return told
 
     def test_a_file_the_library_holds_is_not_read_and_is_found_by_its_title(self):
+        self.assertEqual(self.build(names_only=True), (0, 0))
+        keys = lambda basis: {row[0] for row in self.db.execute("SELECT key FROM doc_keys WHERE basis=?", (basis,))}
+        # After an inventory the book is known by the word of the library, kept under the
+        # format and the size it was said of.
+        self.assertEqual((keys("source"), keys("content")), ({f"{self.checksum}@txt#{len(BOOK)}"}, set()))
+        self.assertEqual(self.states(), {"scan-0042.txt": "covered", "notes.txt": "pending"})
         self.assertEqual(self.build(), (1, 0))
-        self.assertEqual(self.read, ["notes.txt"])
+        self.assertEqual(self.read, ["notes.txt"])          # the book is not read for its text,
         self.assertEqual(self.states(), {"scan-0042.txt": "covered", "notes.txt": "indexed"})
         found = search(self.db, "nonlinear whitham")
         self.assertEqual([(hit["name"], hit["title"], hit["byline"], hit["year"]) for hit in found],
                          [("scan-0042.txt", "Linear and Nonlinear Waves", "G. B. Whitham", "1974")])
-        keys = {row[0] for row in self.db.execute("SELECT key FROM doc_keys WHERE basis='source'")}
-        self.assertEqual(keys, {f"{self.checksum}@txt#{len(BOOK)}"})    # kept under the format and the size it was said of
+        # but measured once, which proves what the library said: it is now known by that measure.
+        self.assertEqual(keys("source"), set())
+        self.assertIn(self.checksum + "@txt", keys("content"))
         self.assertEqual(self.build(), (0, 0))              # nothing more to ask, nothing to read
         code, out, _ = self.run_cli("status", "--json")
         self.assertEqual(json.loads(out)[0]["states"], {"covered": 1, "indexed": 1})

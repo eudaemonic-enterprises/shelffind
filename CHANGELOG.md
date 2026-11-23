@@ -19,8 +19,8 @@ measured file belongs to the document known by its checksums, which the storage 
 gives without any reading when the folder has an rclone twin and which one full reading gives
 otherwise; a file that was never measured is placed by the word of a source that knows the work
 by its checksum. A measure outranks a word: a statement that a measure refutes is dropped,
-whichever file was measured, and `shelffind index` proves against the storage of a folder what
-the sources said of its files. What a source says is kept with the very file it was said of.
+whichever file was measured, and `shelffind index` proves what the sources said of each file,
+by the checksum of its storage or by one reading. What a source says is kept with the very file it was said of.
 
 A document is read from a copy of its file made on this machine in one pass, during which the
 checksums are computed: the pages kept are those of the very bytes the checksums describe, and

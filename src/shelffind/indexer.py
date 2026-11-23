@@ -195,8 +195,9 @@ def waiting(db, root, only=None, reading=False, thorough=False):
     those of which a source gave a checksum, which is then proved or refuted. For a reading in
     full (`reading`), which costs one: the files whose pages were read by an earlier version
     and never tied to bytes, which only a reading does; and, in a folder without storage, the
-    files of the size and format of a document known by a checksum. In a folder with a storage
-    the latter wait for the storage to answer."""
+    files of the size and format of a document known by a checksum and, with `thorough`, those
+    of which a source gave a checksum. In a folder with a storage these wait for the storage
+    to answer."""
     lacking = "coalesce(f.sum,'')=''" if reading else "instr(coalesce(f.sum,''),'md5:')=0"
     rows = db.execute(f"SELECT {FILE},f.doc,f.read AND d.origin IS NULL AS untied,"
                       "EXISTS (SELECT 1 FROM records r WHERE r.file=f.id AND r.keys!='') AS said "
@@ -210,7 +211,8 @@ def waiting(db, root, only=None, reading=False, thorough=False):
         alike = {}                                  # size and format -> the documents known by a checksum
         for doc in db.execute("SELECT d.id,d.size,d.format FROM docs d WHERE EXISTS (SELECT 1 FROM doc_keys k WHERE k.doc=d.id)"):
             alike.setdefault((doc["size"], doc["format"]), set()).add(doc["id"])
-        return [row for row in rows if row["untied"] or alike.get((row["size"], row["format"]), set()) - {row["doc"]}]
+        return [row for row in rows if row["untied"] or (thorough and row["said"])
+                or alike.get((row["size"], row["format"]), set()) - {row["doc"]}]
     several = {(doc["size"], doc["format"]) for doc in
                db.execute("SELECT size,format FROM docs GROUP BY size,format HAVING count(*)>1")}
     return [row for row in rows if not row["untied"]
@@ -277,7 +279,7 @@ def settle(db, roots, chosen, progress, reads=True, failed=None, asked=None, tho
     """Compare the files of the folders with the documents already known, as far as it has not
     been done: see `waiting` for the files concerned. Where a folder has an rclone twin, its
     storage is asked, which costs no reading. Then, when `reads` allows, the files of the
-    folders without twin are read in full. What a reading teaches may make a file of another
+    folders without twin are read in full, once each. What a reading teaches may make a file of another
     folder worth reading: the folders are gone through again for as long as something is
     learnt. `chosen` limits the work, per folder, to some addresses. Returns the number of
     files that could not be read; `failed` collects them, and `asked` the files of which the
@@ -298,7 +300,8 @@ def settle(db, roots, chosen, progress, reads=True, failed=None, asked=None, tho
             if stopped:
                 silent.add(root["id"])
         for root in roots if reads else ():
-            found, missed = read_in_full(db, root, waiting(db, root, chosen[root["id"]], reading=True), progress, failed)
+            rows = waiting(db, root, chosen[root["id"]], reading=True, thorough=thorough)
+            found, missed = read_in_full(db, root, rows, progress, failed)
             learnt += found
             failures += missed
         if not learnt:
@@ -443,6 +446,7 @@ def build(db, directory, selected, *, names_only=False, ocr=False, languages="en
                 if row["id"] not in failed:     # said already: it could not be read for its comparison
                     candidates.setdefault(row["doc"], []).append((root, row))
         total = len(candidates)
+        taken, charged = False, set()
         for seen, (doc, copies) in enumerate(candidates.items()):
             if limit is not None and done >= limit:
                 break
@@ -454,7 +458,8 @@ def build(db, directory, selected, *, names_only=False, ocr=False, languages="en
                     break
                 # The file is followed to the document it is in now: a comparison may have
                 # placed it elsewhere, and its document may have been read through another file.
-                if root["id"] in offline or waiting_of(row["id"]) is None:
+                now = waiting_of(row["id"])
+                if root["id"] in offline or now is None or now["id"] in charged:
                     continue
                 if not store.available(root):       # the other folders go on being read
                     progress(f"Disconnected: {root['path']}; saved completed work")
@@ -462,6 +467,7 @@ def build(db, directory, selected, *, names_only=False, ocr=False, languages="en
                     failures += 1
                     continue
                 try:
+                    taken = True
                     done += update_text(db, root, row, ocr, languages)
                 except sqlite3.Error:
                     raise
@@ -486,6 +492,7 @@ def build(db, directory, selected, *, names_only=False, ocr=False, languages="en
                     with db:
                         db.execute("UPDATE docs SET state=?,error=? WHERE id=(SELECT doc FROM files WHERE id=?)",
                                    (failing, str(exc)[:1200], row["id"]))
+                    charged.update(row["doc"] for row in db.execute("SELECT doc FROM files WHERE id=?", (row["id"],)))
                     progress(f"Could not read {row['rel']}: {exc}")
                     failures += 1
                     done += 1
@@ -508,9 +515,9 @@ def build(db, directory, selected, *, names_only=False, ocr=False, languages="en
                 done += 1
             if done // 100 > before // 100:
                 progress(f"{done // 100 * 100:,} documents processed")
-        if done:
+        if taken:
             # What was just read may be what other files hold, and what the sources know by its
-            # checksum: the files of its size are compared with it now, so that the next run
-            # finds nothing left to do.
+            # checksum: the files of its size are compared with it now, and the sources are
+            # asked about the files just measured, so that the next run finds nothing left to do.
             acquaint(True, True)
     return done, failures

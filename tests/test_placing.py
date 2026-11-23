@@ -167,6 +167,20 @@ class Statements(Placing):
         self.assertEqual(self.db.execute("SELECT asked FROM files WHERE rel='a/book.txt'").fetchone()[0], "")
         self.sound()
 
+    def test_a_statement_about_a_file_read_by_an_earlier_version_is_dropped_when_a_measure_refutes_it(self):
+        one = self.write("a/book.txt")
+        self.build()
+        self.unmeasured()                                   # read by an earlier version: no word places it
+        small = self.write("b/small.txt", "A short note.")
+        self.build(names_only=True)
+        self.assertTrue(self.say("a/book.txt", "W9", self.sums(small), title="Taken For A Note"))
+        self.assertEqual(names(self.db, "taken for a note"), ["a/book.txt"])
+        self.measure("b/small.txt")                         # the note is measured: a file of another size is not it
+        self.assertEqual(names(self.db, "taken for a note"), [])
+        self.assertEqual(self.db.execute("SELECT count(*) FROM records").fetchone()[0], 0)
+        self.assertEqual(names(self.db, "northern harbours"), ["a/book.txt"])
+        self.sound()
+
     def test_a_statement_that_names_the_checksums_of_two_documents_is_not_kept(self):
         one, two = self.write("a/book.txt"), self.write("b/book.txt", OTHER)
         self.write("c/book.txt", THIRD)
@@ -427,6 +441,32 @@ class Reading3(Placing):
         self.assertEqual(names(self.db, "southern capes"), ["b/book.txt"])
         self.sound()
 
+    def test_a_document_that_failed_is_not_tried_again_through_its_copies_in_the_same_run(self):
+        for number in range(3):
+            self.write(f"copies/{number}.txt")
+        self.build(names_only=True)
+        for number in range(3):
+            self.measure(f"copies/{number}.txt")
+        tried = []
+
+        def failing(source, fmt, work):
+            tried.append(source.name)
+            raise RuntimeError("the reader stumbled")
+
+        with patch("shelffind.extract.passages", side_effect=failing):
+            self.assertEqual((self.build(), len(tried)), ((1, 1), 1))
+            self.assertEqual((self.build(retry=True), len(tried)), ((1, 1), 2))    # once more when asked, and once only
+        self.assertEqual(self.build(retry=True), (1, 0))
+        self.sound()
+
+    def test_what_a_run_has_just_read_is_compared_at_once_with_the_files_of_its_size(self):
+        self.write("a/book.txt")
+        self.write("b/book.txt", OTHER)
+        self.assertEqual(self.build(limit=1), (1, 0))       # one is read; the other is measured, for it could be the same
+        self.assertEqual(self.db.execute("SELECT count(*) FROM files WHERE coalesce(sum,'')=''").fetchone()[0], 0)
+        self.assertEqual((self.documents(), len(self.read)), (2, 1))
+        self.sound()
+
     def test_a_run_reads_no_more_documents_than_it_was_allowed(self):
         one = self.write("a/book.txt")
         self.write("b/book.txt", OTHER)
@@ -516,6 +556,20 @@ class Storage2(Placing):
         self.assertEqual(self.build(limit=0), (0, 0))       # and a complete run asks the storage, which refutes it
         self.assertEqual(names(self.db, "wrong work"), [])
         self.assertEqual(self.db.execute("SELECT sum FROM files").fetchone()[0], self.sums(path)[0])
+        self.sound()
+
+    def test_a_complete_run_proves_by_one_reading_what_a_source_said_where_no_storage_does(self):
+        path = self.write("book.txt")
+        self.build(names_only=True)
+        wrong = ["md5:" + hashlib.md5(OTHER.encode()).hexdigest()]
+        self.assertTrue(self.say("book.txt", "W1", wrong, title="Wrong Work"))
+        self.assertEqual(self.build(names_only=True), (0, 0))       # an inventory believes it
+        self.assertEqual(names(self.db, "wrong work"), ["Reading Room/book.txt"])
+        self.assertEqual(self.build(limit=0), (0, 0))       # a complete run reads the file once, which refutes it
+        self.assertEqual(names(self.db, "wrong work"), [])
+        self.assertEqual(self.db.execute("SELECT sum FROM files").fetchone()[0].split(), self.sums(path))
+        with patch("shelffind.indexer.whole_checksums", side_effect=AssertionError("read a second time")):
+            self.assertEqual(self.build(limit=0), (0, 0))
         self.sound()
 
     def test_in_a_folder_with_a_storage_no_file_is_read_in_full_to_be_compared(self):
@@ -680,12 +734,31 @@ class Practical(Placing):
         self.assertEqual(self.db.execute("SELECT count(*) FROM records WHERE file IS NULL").fetchone()[0], 1)   # with the measured bytes
         self.assertEqual(names(self.db, "said work"), ["Reading Room/said.txt"])
 
+    def test_a_folder_that_is_forgotten_takes_with_it_what_was_said_of_its_files_alone(self):
+        annex = self.base / "Annex"
+        annex.mkdir()
+        self.run_cli("roots", "add", str(annex))
+        one = self.write("book.txt")
+        (annex / "copy.txt").write_text(LARGE)
+        self.build(names_only=True)
+        self.measure("book.txt")
+        copy = self.db.execute("SELECT f.id FROM files f JOIN roots r ON r.id=f.root WHERE r.name='Annex'").fetchone()[0]
+        with self.db:                                       # the copy is said to be the book, and bears a card that names no bytes
+            self.assertTrue(link.say(self.db, copy, "library", {"id": "W1", "keys": self.sums(one), "title": "Known Work"}, set()))
+            self.assertTrue(link.say(self.db, copy, "catalogue", {"id": "C1", "title": "Loose Card"}, set()))
+        self.assertEqual(self.documents(), 1)
+        self.run_cli("roots", "remove", "Annex")
+        self.assertEqual([row["source"] for row in self.db.execute("SELECT source FROM records")], ["library"])
+        self.assertEqual((names(self.db, "known work"), names(self.db, "loose card")), (["Reading Room/book.txt"], []))
+        self.sound()
+
     def test_the_copy_of_a_document_is_made_on_a_disk_unless_another_folder_is_named(self):
         with patch.dict(os.environ, {"TMPDIR": str(self.base)}):
             self.assertIsNone(indexer.scratch())
         with patch.dict(os.environ):
             os.environ.pop("TMPDIR", None)
-            self.assertIn(indexer.scratch(), ("/var/tmp", None))
+            on_disk = os.path.isdir("/var/tmp") and os.access("/var/tmp", os.W_OK | os.X_OK)
+            self.assertEqual(indexer.scratch(), "/var/tmp" if on_disk else None)
 
     def test_a_copy_left_by_a_run_that_was_cut_short_is_removed_a_day_later(self):
         old, recent = self.base / "shelffind-copy-old", self.base / "shelffind-copy-recent"
