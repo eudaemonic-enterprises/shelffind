@@ -6,6 +6,14 @@ ShelfFind follows semantic versioning. Before version 1.0 a minor version may ch
 JSON keys and the exit codes that other programs rely on are kept from one version to the next and
 are covered by tests.
 
+## 0.2.2
+
+The list of applications that F2 opens, and the `apps` command, now name each application as
+people know it (Google Chrome, Okular, Evince), with the word of its identifier added when the
+two have nothing in common, as in Document Viewer (Papers). The application that opens the
+file by default comes first and is marked, and two entries of one application make one line.
+The identifier is still what `open --with` takes, and `apps` prints it before the name.
+
 ## 0.2.1
 
 The second half of the panel's comfort. Ctrl-O lists the passages of the chosen document in the
