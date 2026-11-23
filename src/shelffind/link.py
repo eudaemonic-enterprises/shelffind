@@ -7,9 +7,8 @@ true title and authors, which then find the file, the checksums of the work, by 
 are known to be the same document, and whether the source holds its text, in which case
 ShelfFind does not read it.
 
-What a source says is its word, and is taken as such (see `store`): it joins a file that was
-never read to a document, never two documents that were both read, and never against what was
-measured of a file.
+What a source says is its word, and is taken as such (see `store`): it places a file that was
+never measured, and nothing else. A word that a measure refutes is not kept.
 """
 import json
 import re
@@ -36,60 +35,43 @@ def checksums(record):
     return given if len({key.split(":", 1)[0] for key in given}) == len(given) else []
 
 
-def withdraw(db, file, name):
-    """Drop what the source `name` said of the file `file`, with the checksums that only its
-    word had given to the document."""
-    said = db.execute("SELECT doc FROM records WHERE file=? AND source=?", (file, name)).fetchone()
-    if said is not None:
-        db.execute("DELETE FROM records WHERE file=? AND source=?", (file, name))
-        store.unback(db, said["doc"])
-        store.retitle(db, said["doc"])
-        store.release(db, said["doc"])          # a file that only this word had brought there leaves
+def say(db, file, name, record, known=None):
+    """Keep what the source `name` says now of the file `file`: that it is the work `record`,
+    or nothing (None). Returns True when a record is kept.
 
-
-def attach(db, file, name, record, known):
-    """Keep what the source `name` says of the file `file`: that it is the work `record`.
-    Returns False when the record is not kept.
-
-    The checksums of the record speak of the bytes of this file. A file whose own checksum,
-    measured by a reading or given by its storage, differs from the record's is not that work,
-    whatever its address suggests, and neither is a file of which another source says
-    otherwise: a measure will tell which of the two is right. A document that carries another
-    checksum of the same kind, on the strength of its other files, does not describe this file,
-    which then gets a document of its own; unless the document was read from this very file, in
-    which case it stays the file's, and what was said of the others leaves with them. The file
-    then joins the document that the checksums of the record name, if there is one."""
-    row = db.execute("SELECT doc,sum,read FROM files WHERE id=?", (file,)).fetchone()
+    What the source said of the file before is replaced in every case, and so is what it had
+    said of a file of the same document that has gone since. The checksums of a record speak
+    of the bytes of this file: a record is not kept when a measure refutes it, that of the
+    file itself, or that of the document known by those checksums, which then has another size
+    or another checksum of the same kind. The file is then placed by what is said of it, when
+    it was never measured (see `store.place`)."""
+    row = db.execute("SELECT doc,size,format,sum FROM files WHERE id=?", (file,)).fetchone()
     if row is None:
         return False
-    keys = checksums(record)
-    if store.against(keys, (row["sum"] or "").split()):
-        return False
-    for other in db.execute("SELECT keys FROM records WHERE file=? AND source!=?", (file, name)):
-        if store.against(keys, other["keys"].split()):
-            return False
-    withdraw(db, file, name)                    # what the same source said of the file before is replaced,
-    row = db.execute("SELECT doc,sum,read FROM files WHERE id=?", (file,)).fetchone()   # and may have been its only tie
-    doc = row["doc"]
-    if store.against(keys, store.keys_of(db, doc)):
-        if row["read"]:
-            store.part(db, doc, file, keys)
-        else:
-            doc = store.set_apart(db, file)
-    for key in keys:
-        doc = store.claim(db, doc, key, "source")
-    doc = db.execute("SELECT doc FROM files WHERE id=?", (file,)).fetchone()["doc"]
-    title, byline = record.get("title") or "", record.get("byline") or ""
-    year = "" if record.get("year") is None else str(record["year"])
-    db.execute("INSERT INTO records(doc,file,source,ref,keys,title,byline,year,flags,basis,text,local) "
-               "VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",
-               (doc, file, name, record["id"], " ".join(keys), title, byline, year, json.dumps(record.get("flags") or []),
-                record.get("basis") or "", int(record.get("text") is True), record.get("path")))
-    store.retitle(db, doc)
-    store.part_strangers(db, doc)
-    if title:
-        fuzzy.remember_names(db, (title, byline), known)
-    return True
+    changed = db.execute("DELETE FROM records WHERE (file=? OR (doc=? AND file IS NULL)) AND source=?",
+                         (file, row["doc"], name)).rowcount
+    kept = False
+    if record is not None:
+        keys, mine = checksums(record), (row["sum"] or "").split()
+        if not store.against(keys, mine) and not store.refuted(db, row["size"], row["format"], sorted({*keys, *mine}))[0]:
+            title, byline = record.get("title") or "", record.get("byline") or ""
+            year = "" if record.get("year") is None else str(record["year"])
+            number = db.execute(
+                "INSERT INTO records(doc,file,source,ref,keys,title,byline,year,flags,basis,text,local) "
+                "VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",
+                (row["doc"], file, name, record["id"], " ".join(keys), title, byline, year,
+                 json.dumps(record.get("flags") or []), record.get("basis") or "", int(record.get("text") is True),
+                 record.get("path"))).lastrowid
+            db.executemany("INSERT OR IGNORE INTO record_keys(key,record) VALUES(?,?)", [(key, number) for key in keys])
+            kept = True
+            if title and known is not None:
+                fuzzy.remember_names(db, (title, byline), known)
+    if changed or kept:
+        doc = store.replace(db, file)
+        if kept and doc != row["doc"]:              # the same holds in the document the file is in now
+            db.execute("DELETE FROM records WHERE doc=? AND file IS NULL AND source=?", (doc, name))
+            store.retitle(db, doc)
+    return kept
 
 
 def usable(directory, progress=lambda text: None):
@@ -145,24 +127,25 @@ def link(db, directory, selected, progress=lambda text: None, everything=False):
         return 0
     recognised = 0
     known = set()
-    places = [root["id"] for root in selected]
-    among = f"root IN ({','.join('?' * len(places))})"
     for name in found:
         mark = f" {name} "
-        clear = f"UPDATE files SET asked=trim(replace(' '||asked||' ',?,' ')) WHERE {ASKED}>0 AND {among}"
-        last = db.execute("SELECT value FROM meta WHERE key=?", (f"asked:{name}",)).fetchone()
-        with db:
-            if everything:
-                db.execute(clear, (mark, mark, *places))
-            elif last is None or time.time() - float(last["value"]) > AGAIN:
-                # The files it did not know are asked about again, since it may have learnt them.
-                db.execute(clear + " AND NOT EXISTS (SELECT 1 FROM records r WHERE r.file=files.id AND r.source=?)",
-                           (mark, mark, *places, name))
-                db.execute("INSERT OR REPLACE INTO meta(key,value) VALUES(?,?)", (f"asked:{name}", str(time.time())))
+        clear = f"UPDATE files SET asked=trim(replace(' '||asked||' ',?,' ')) WHERE {ASKED}>0 AND root=?"
         spoken, answering = 0, True
         for root in selected:
             if not answering:
                 break
+            # Each folder has its own clock, so that a folder asked alone, again and again,
+            # does not postpone the questions about the others.
+            clock = f"asked:{name}:{root['id']}"
+            last = db.execute("SELECT value FROM meta WHERE key=?", (clock,)).fetchone()
+            with db:
+                if everything:
+                    db.execute(clear, (mark, mark, root["id"]))
+                elif last is None or time.time() - float(last["value"]) > AGAIN:
+                    # The files it did not know are asked about again, since it may have learnt them.
+                    db.execute(clear + " AND NOT EXISTS (SELECT 1 FROM records r WHERE r.file=files.id AND r.source=?)",
+                               (mark, mark, root["id"], name))
+                    db.execute("INSERT OR REPLACE INTO meta(key,value) VALUES(?,?)", (clock, str(time.time())))
             waiting = db.execute(f"SELECT id,rel,size,mtime,sum FROM files WHERE root=? AND {ASKED}=0 ORDER BY id",
                                  (root["id"], mark)).fetchall()
             for start in range(0, len(waiting), BATCH):
@@ -179,14 +162,12 @@ def link(db, directory, selected, progress=lambda text: None, everything=False):
                     answering = False
                     break
                 with db:
-                    seen = set()
+                    told = {}
                     for record in answer["records"]:
-                        if 0 <= record["n"] < len(batch) and record["n"] not in seen:
-                            seen.add(record["n"])
-                            spoken += attach(db, batch[record["n"]]["id"], name, record, known)
-                    for number, row in enumerate(batch):
-                        if number not in seen:      # what it said of the file before, it says no more
-                            withdraw(db, row["id"], name)
+                        if 0 <= record["n"] < len(batch):
+                            told.setdefault(record["n"], record)
+                    for number, row in enumerate(batch):    # what it said of a file before, it says anew or no more
+                        spoken += say(db, row["id"], name, told.get(number), known)
                     db.executemany(f"UPDATE files SET asked=trim(asked||' '||?) WHERE id=? AND {ASKED}=0",
                                    [(name, row["id"], mark) for row in batch])
         if spoken:

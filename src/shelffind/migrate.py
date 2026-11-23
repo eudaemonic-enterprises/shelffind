@@ -32,6 +32,8 @@ from . import __version__, fuzzy, history, store
 
 RETIRED = store.RETIRED         # the format number an old index receives once it has been converted
 ORIGIN = "converted_from"       # in the new index: the print of the old index it was made from
+TABLES = {"roots", "files", "pages", "history", "words"}    # what an index of version 0.2 holds,
+SEARCHED = {"names", "passages", "spelling"}                # and its tables of words, each kept in several
 
 
 def refuse_development(directory):
@@ -86,7 +88,31 @@ def exclusively(old):
     mode = old.execute("PRAGMA journal_mode").fetchone()[0]
     if str(mode).lower() != "wal":
         raise ValueError(f"The earlier index is not kept as version 0.2 keeps it (journal mode {mode}): it is left "
-                         "as it is. Give it back its mode with `PRAGMA journal_mode=WAL`, then run this again")
+                         "as it is. Close every program that has it open, give it back its mode with "
+                         "`PRAGMA journal_mode=WAL`, then run this again")
+    # Another program may have changed the index between the first look at it and this moment,
+    # from which it can no longer: it is looked at again, now that it is this program's alone.
+    version = old.execute("PRAGMA user_version").fetchone()[0]
+    unknown = strangers(old)
+    if version not in (1, RETIRED) or unknown:
+        what = f"tables that this version does not know ({', '.join(unknown)})" if unknown else f"the format {version}"
+        raise ValueError(f"The earlier index has {what}: it is not an index that this version can convert, "
+                         "and it is left as it is")
+
+
+def strangers(old):
+    """The tables of an old index that an index of version 0.2 does not have: what they hold
+    would be neither converted nor counted in the print of the index."""
+    found = []
+    with rows(old, "SELECT name FROM sqlite_master WHERE type='table' ORDER BY name") as tables:
+        for row in tables:
+            name = row[0]
+            base, _, part = name.rpartition("_")
+            if name in TABLES or name in SEARCHED or name.startswith("sqlite_") \
+                    or (base in SEARCHED and part in ("config", "content", "data", "docsize", "idx")):
+                continue
+            found.append(name)
+    return found
 
 
 def searches(old):
@@ -135,7 +161,8 @@ def copy(old, new, progress):
             if count % 20000 == 0:
                 progress(f"Converting the index: {count:,} pages of text")
     fuzzy.remember_text(new, texts)
-    # The file a document's pages were read from: its checksum will be that of the document.
+    # The file the pages of a document were read from: they stay with that file, and with it
+    # alone, until a measure of the file tells what bytes they belong to.
     new.execute("UPDATE files SET read=1 WHERE EXISTS (SELECT 1 FROM pages p WHERE p.doc=files.doc)")
     new.execute("INSERT INTO meta(key,value) VALUES(?,?)", (ORIGIN, print_of(old)))
 

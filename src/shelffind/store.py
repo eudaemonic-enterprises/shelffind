@@ -36,7 +36,7 @@ from .config import expand
 from .extract import SUPPORTED, file_format
 
 INDEX, EARLIER = "index2.sqlite3", "index.sqlite3"
-FORMAT = 2
+FORMAT = 3
 RETIRED = 101           # the format number of an earlier index once it has been converted
 KEEP = 30 * 86400       # seconds a document keeps its text after its last file has gone
 SUMS = ("md5:", "sha256:")      # the checksums of a whole file that documents are known by
@@ -49,7 +49,7 @@ CREATE TABLE roots (
 );
 CREATE TABLE docs (
     id INTEGER PRIMARY KEY AUTOINCREMENT, size INTEGER NOT NULL, format TEXT NOT NULL, state TEXT NOT NULL,
-    error TEXT, title TEXT, byline TEXT, year TEXT, gone INTEGER, gone_from INTEGER
+    error TEXT, title TEXT, byline TEXT, year TEXT, gone INTEGER, gone_from INTEGER, origin TEXT
 );
 CREATE INDEX docs_state ON docs(state, id);
 CREATE INDEX docs_size ON docs(size, format);
@@ -101,7 +101,11 @@ CREATE TABLE records (
 );
 CREATE INDEX records_doc ON records(doc);
 CREATE INDEX records_ref ON records(source, ref);
-PRAGMA user_version=2;
+CREATE TABLE record_keys (
+    key TEXT NOT NULL, record INTEGER NOT NULL REFERENCES records ON DELETE CASCADE, PRIMARY KEY (key, record)
+) WITHOUT ROWID;
+CREATE INDEX record_keys_record ON record_keys(record);
+PRAGMA user_version=3;
 """
 
 
@@ -184,6 +188,9 @@ def connect(directory, upgrade=True):
                 db.executescript("BEGIN IMMEDIATE;\n" + SCHEMA + "\nCOMMIT;")
     elif version != FORMAT:
         db.close()
+        if version == 2:
+            raise ValueError(f"{filename} was made by a trial of this version and cannot be used: move it away; "
+                             "the earlier index kept beside it, if any, is then converted again")
         raise ValueError(f"Unsupported index schema {version}")
     if db.execute("PRAGMA journal_mode").fetchone()[0] != "wal":
         db.execute("PRAGMA journal_mode=WAL")       # a converted index takes it at its first opening
@@ -432,8 +439,46 @@ def against(one, other):
     return any(kind in other and not one[kind] & other[kind] for kind in one)
 
 
-def keys_of(db, doc):
-    return [row["key"] for row in db.execute("SELECT key FROM doc_keys WHERE doc=?", (doc,))]
+def keys_of(db, doc, basis=None):
+    """The checksums by which a document is known, without the format they are kept under:
+    all of them, or those of one basis, "content" for the measured ones."""
+    rows = db.execute("SELECT key,basis FROM doc_keys WHERE doc=? ORDER BY key", (doc,))
+    return [row["key"].split("@")[0] for row in rows if basis is None or row["basis"] == basis]
+
+
+def holder(db, key, fmt):
+    """The document known, by a measure, to hold the checksum `key` under the format `fmt`."""
+    row = db.execute("SELECT doc FROM doc_keys WHERE key=?", (f"{key}@{fmt}",)).fetchone()
+    return row["doc"] if row else None
+
+
+def refuted(db, size, fmt, keys):
+    """Whether what was measured refutes that a file of this size and format has the checksums
+    `keys`, and otherwise the document that a measure knows by them: (refuted, document or
+    None). A statement is refuted when its checksums are those of two documents, of a document
+    of another size, or of a document that carries another checksum of the same kind."""
+    known = {doc for doc in (holder(db, key, fmt) for key in keys) if doc is not None}
+    if not known:
+        return False, None
+    if len(known) > 1:
+        return True, None
+    doc = known.pop()
+    if db.execute("SELECT size FROM docs WHERE id=?", (doc,)).fetchone()["size"] != size \
+            or against(keys, keys_of(db, doc, "content")):
+        return True, None
+    return False, doc
+
+
+def said(db, file):
+    """The checksums that the sources give for a file, one of each kind, when what they say
+    agrees: sources that contradict one another say nothing of what the file holds."""
+    given = [row["keys"].split() for row in db.execute("SELECT keys FROM records WHERE file=? ORDER BY id", (file,))]
+    if any(against(one, other) for number, one in enumerate(given) for other in given[number + 1:]):
+        return []
+    found = {}
+    for keys in given:
+        found.update(sums(" ".join(keys)))
+    return [found[kind] for kind in sorted(found)]
 
 
 def describe(db, doc):
@@ -454,17 +499,6 @@ def retitle(db, doc):
     describe(db, doc)
 
 
-def unback(db, doc):
-    """Withdraw from a document the checksums it held on the word of a source, when no record
-    of the document gives them any more."""
-    backed = set()
-    for row in db.execute("SELECT keys FROM records WHERE doc=?", (doc,)):
-        backed.update(row["keys"].split())
-    for row in db.execute("SELECT key FROM doc_keys WHERE doc=? AND basis='source'", (doc,)).fetchall():
-        if row["key"].split("@")[0] not in backed:
-            db.execute("DELETE FROM doc_keys WHERE key=?", (row["key"],))
-
-
 def blanks(db, doc):
     """How far the reading of a document went: (pages still to recognise, pages), with a large
     first number for a document without pages."""
@@ -472,165 +506,340 @@ def blanks(db, doc):
     return (waiting if pages else 1 << 30, pages)
 
 
-def set_apart(db, file, follow=False):
-    """Give a file a document of its own, when the document it was in turned out not to describe
-    it. What was measured of the file stays with it, and what the sources said of that very
-    file goes with it; the document it leaves keeps its text and what was said of its other
-    files. A checksum that was said of this file alone goes with it too; one that the document
-    it leaves still holds for its other files stays there, and never draws the file back. With
-    `follow`, for a file that leaves because the word that had brought it is gone, a checksum
-    that a third document holds lets the file join that document, as the word of a source may.
-    Returns the document of the file afterwards, or None when the file is not there."""
-    row = db.execute("SELECT root,size,format,doc FROM files WHERE id=?", (file,)).fetchone()
+def unread(db, doc):
+    """A document has lost its pages: it waits for a reading again."""
+    db.execute("UPDATE docs SET state=CASE WHEN state='covered' THEN 'covered' WHEN format IN "
+               f"({','.join('?' * len(SUPPORTED))}) THEN 'pending' ELSE 'name-only' END,error=NULL,origin=NULL WHERE id=?",
+               (*sorted(SUPPORTED), doc))
+    db.execute("UPDATE files SET read=0 WHERE doc=?", (doc,))
+
+
+def hand_over(db, old, new):
+    """The pages of the document `old` were read from a file that belongs to the document
+    `new`: they go there with it. When `new` has pages of its own, both were read from the same
+    bytes: the reading that went furthest is kept, and a page recognised in the other only is
+    taken from it. Returns True when the pages of `new` are, afterwards, those that came."""
+    told = {row["id"]: row for row in db.execute("SELECT id,state,error FROM docs WHERE id IN (?,?)", (old, new))}
+    came = True
+    if has_pages(db, new):
+        rank = {"indexed": 0, "needs-ocr": 1, "ocr-error": 1}
+        worth = lambda doc: (rank.get(told[doc]["state"], 9), blanks(db, doc)[0])
+        came = worth(old) < worth(new)
+        keep, drop = (old, new) if came else (new, old)
+        theirs = {row["page"]: row["ztext"] for row in db.execute(
+            "SELECT page,ztext FROM pages WHERE doc=? AND needs_ocr=0 AND page IS NOT NULL", (drop,))}
+        if theirs and blanks(db, keep)[1] == blanks(db, drop)[1]:
+            for row in db.execute("SELECT id,page FROM pages WHERE doc=? AND needs_ocr=1", (keep,)).fetchall():
+                if row["page"] in theirs:
+                    db.execute("UPDATE pages SET ztext=?,needs_ocr=0 WHERE id=?", (theirs[row["page"]], row["id"]))
+        db.execute("DELETE FROM pages WHERE doc=?", (drop,))
+        state, error = told[keep]["state"], told[keep]["error"]
+        if state in rank and blanks(db, keep)[0] == 0:
+            state, error = "indexed", None
+        elif state == "ocr-error" and told[drop]["state"] == "needs-ocr":
+            state, error = "needs-ocr", None        # the other reading waited for an ordinary recognition
+    else:
+        state, error = told[old]["state"], told[old]["error"]
+    if came:
+        db.execute("UPDATE pages SET doc=? WHERE doc=?", (new, old))
+        db.execute("UPDATE files SET read=0 WHERE doc=?", (new,))
+        db.execute("UPDATE docs SET origin=NULL WHERE id=?", (new,))
+    if state in ("indexed", "needs-ocr", "ocr-error"):
+        db.execute("UPDATE docs SET state=?,error=? WHERE id=?", (state, error, new))
+    unread(db, old)
+    return came
+
+
+def cards(db, old, new):
+    """What the sources said of files that are gone, and that the document `old` kept, is said
+    of the bytes that the document `new` is now known to hold: it goes there, the latest word
+    of each source being the one kept."""
+    db.execute("UPDATE records SET doc=? WHERE doc=? AND file IS NULL", (new, old))
+    db.execute("DELETE FROM records WHERE doc=? AND file IS NULL AND id NOT IN "
+               "(SELECT max(id) FROM records WHERE doc=? AND file IS NULL GROUP BY source)", (new, new))
+
+
+def tidy(db, doc, root=None):
+    """Put in order a document that a file has just left. A document held together by the
+    words of sources alone is made anew from what is said of the files it keeps. A document
+    without any file keeps, for the day a file that holds its bytes is found again, the pages
+    that a measure ties to those bytes and what the sources said of the bytes it is known by;
+    it is forgotten at once when it has neither."""
+    if db.execute("SELECT 1 FROM files WHERE doc=? LIMIT 1", (doc,)).fetchone():
+        if has_pages(db, doc) or keys_of(db, doc, "content"):
+            retitle(db, doc)
+        else:
+            regroup(db, doc)
+        return
+    told = db.execute("SELECT origin FROM docs WHERE id=?", (doc,)).fetchone()
+    if told is None:
+        return
+    if told["origin"] is None:
+        db.execute("DELETE FROM pages WHERE doc=?", (doc,))     # nothing can tell whose pages they were
+    if not keys_of(db, doc):
+        db.execute("DELETE FROM records WHERE doc=?", (doc,))   # nor of what bytes this was said
+    if has_pages(db, doc) or db.execute("SELECT 1 FROM records WHERE doc=? LIMIT 1", (doc,)).fetchone():
+        db.execute("UPDATE docs SET gone=?,gone_from=? WHERE id=? AND gone IS NULL", (int(time.time()), root, doc))
+        retitle(db, doc)
+    else:
+        db.execute("DELETE FROM docs WHERE id=?", (doc,))
+
+
+def move(db, file, target, reader=False):
+    """Put a file in another document, with what the sources said of that very file."""
+    row = db.execute("SELECT root,doc FROM files WHERE id=?", (file,)).fetchone()
+    if row["doc"] == target:
+        return
+    db.execute("UPDATE files SET doc=?,read=? WHERE id=?", (target, int(reader), file))
+    db.execute("UPDATE records SET doc=? WHERE file=?", (target, file))
+    db.execute("UPDATE docs SET gone=NULL,gone_from=NULL WHERE id=?", (target,))
+    tidy(db, row["doc"], row["root"])
+
+
+def own(db, doc, file):
+    """True when a document has this one file and is known by no measure: it can become
+    whatever that file turns out to be."""
+    others = db.execute("SELECT 1 FROM files WHERE doc=? AND id!=? LIMIT 1", (doc, file)).fetchone()
+    return others is None and not keys_of(db, doc, "content")
+
+
+def regroup(db, doc):
+    """Make anew the documents of files that only the words of sources hold together, after one
+    of them left or after something else was said or measured: each file starts again as a
+    document of its own and is placed by what is said of it now."""
+    if has_pages(db, doc) or keys_of(db, doc, "content"):
+        return
+    files = db.execute("SELECT id,size,format FROM files WHERE doc=? ORDER BY id", (doc,)).fetchall()
+    db.execute("DELETE FROM doc_keys WHERE doc=?", (doc,))
+    db.execute("DELETE FROM records WHERE doc=? AND file IS NULL", (doc,))
+    for row in files[1:]:
+        apart = new_document(db, row["size"], row["format"])
+        db.execute("UPDATE files SET doc=?,read=0 WHERE id=?", (apart, row["id"]))
+        db.execute("UPDATE records SET doc=? WHERE file=?", (apart, row["id"]))
+    for row in files:
+        place(db, row["id"])
+
+
+def purge(db, doc):
+    """Drop what the sources said of the files of a document and that its measured checksums
+    refute; a file that such a word alone had brought is placed again."""
+    carried = keys_of(db, doc, "content")
+    astray = []
+    for record in db.execute("SELECT r.id,r.file,r.keys,f.sum FROM records r LEFT JOIN files f ON f.id=r.file "
+                             "WHERE r.doc=?", (doc,)).fetchall():
+        if against(record["keys"].split(), carried):
+            db.execute("DELETE FROM records WHERE id=?", (record["id"],))
+            if record["file"] is not None:
+                db.execute("UPDATE files SET asked='' WHERE id=?", (record["file"],))
+                if not record["sum"]:
+                    astray.append(record["file"])
+    for file in astray:
+        place(db, file)
+    retitle(db, doc)
+
+
+def by_measure(db, row, mine):
+    """The document of a file of which the checksums `mine` were measured: the one known by
+    them, which the file joins whatever was said of it; otherwise a document of its own, known
+    by them from now on. The pages that were read from this very file, and that no reading in
+    full has tied to other bytes, go with it."""
+    file, here, fmt = row["id"], row["doc"], row["format"]
+    target = None
+    for key in mine:
+        doc = holder(db, key, fmt)
+        if doc is not None and not against(mine, keys_of(db, doc, "content")) \
+                and db.execute("SELECT size FROM docs WHERE id=?", (doc,)).fetchone()["size"] == row["size"]:
+            target = doc
+            break
+    if target is None:
+        if own(db, here, file):
+            target = here
+            db.execute("DELETE FROM doc_keys WHERE doc=?", (here,))     # what was said of it is a word no more
+        else:
+            target = new_document(db, row["size"], fmt)
+    reader = bool(row["read"])
+    if target != here:
+        origin = db.execute("SELECT origin FROM docs WHERE id=?", (here,)).fetchone()["origin"]
+        reader = reader and has_pages(db, here) and "sha256:" not in (origin or "") and hand_over(db, here, target)
+        move(db, file, target, reader)
+    for key in mine:
+        name = f"{key}@{fmt}"
+        db.execute("INSERT OR IGNORE INTO doc_keys(key,doc,basis) VALUES(?,?,'content')", (name, target))
+        # The files that were this work on the word of a source alone are placed again: with
+        # this document when the word can be true of them, and without their word otherwise.
+        for group in db.execute("SELECT DISTINCT k.doc,d.size FROM doc_keys k JOIN docs d ON d.id=k.doc "
+                                "WHERE k.key>? AND k.key<?", (name + "#", name + "$")).fetchall():
+            if db.execute("SELECT 1 FROM files WHERE doc=? LIMIT 1", (group["doc"],)).fetchone():
+                regroup(db, group["doc"])
+            else:                                   # the work whose file had gone is found again
+                if group["size"] == row["size"]:
+                    cards(db, group["doc"], target)
+                db.execute("DELETE FROM docs WHERE id=?", (group["doc"],))
+        # A source that said this checksum of a file measured to be another document, or of
+        # the bytes of another document, is refuted by the two measures.
+        for record in db.execute(
+                "SELECT r.id,r.file,r.doc FROM record_keys k JOIN records r ON r.id=k.record JOIN docs d ON d.id=r.doc "
+                "LEFT JOIN files f ON f.id=r.file WHERE k.key=? AND d.format=? AND r.doc!=? "
+                "AND (coalesce(f.sum,'')!='' OR (r.file IS NULL AND EXISTS "
+                "(SELECT 1 FROM doc_keys c WHERE c.doc=r.doc AND c.basis='content')))", (key, fmt, target)).fetchall():
+            db.execute("DELETE FROM records WHERE id=?", (record["id"],))
+            if record["file"] is not None:
+                db.execute("UPDATE files SET asked='' WHERE id=?", (record["file"],))
+            retitle(db, record["doc"])
+    if reader and has_pages(db, target):
+        origin = db.execute("SELECT origin FROM docs WHERE id=?", (target,)).fetchone()["origin"]
+        if origin is None or ("sha256:" not in origin and len(mine) > 1):
+            db.execute("UPDATE docs SET origin=? WHERE id=?", (" ".join(mine), target))
+    purge(db, target)
+    return target
+
+
+def by_word(db, row):
+    """The document of a file that was never measured: the one that a measure knows by the
+    checksums the sources give for the file; otherwise one that it shares with the files of
+    its size and format for which the sources give the same checksums; otherwise its own. A
+    word that a measure refutes is dropped, and the source will be asked about the file again."""
+    file, fmt, size = row["id"], row["format"], row["size"]
+    while True:
+        keys = said(db, file)
+        wrong, known = refuted(db, size, fmt, keys)
+        if not wrong:
+            break
+        dropped = [record["id"] for record in db.execute("SELECT id,keys FROM records WHERE file=?", (file,)).fetchall()
+                   if refuted(db, size, fmt, record["keys"].split())[0]]
+        if not dropped:
+            keys, known = [], None                  # the sources contradict a measure only together
+            break
+        db.executemany("DELETE FROM records WHERE id=?", [(number,) for number in dropped])
+        db.execute("UPDATE files SET asked='' WHERE id=?", (file,))
+    names = [f"{key}@{fmt}#{size}" for key in keys]
+    if known is not None:
+        target, names = known, []
+    else:
+        groups = sorted(found["doc"] for found in db.execute(
+            f"SELECT DISTINCT doc FROM doc_keys WHERE key IN ({','.join('?' * len(names))})", names)) if names else []
+        here = db.execute("SELECT doc FROM files WHERE id=?", (file,)).fetchone()["doc"]
+        if groups:
+            target = groups[0]
+            for other in groups[1:]:                # said to be one work: one document
+                db.execute("UPDATE files SET doc=? WHERE doc=?", (target, other))
+                db.execute("UPDATE records SET doc=? WHERE doc=?", (target, other))
+                db.execute("UPDATE doc_keys SET doc=? WHERE doc=?", (target, other))
+                db.execute("DELETE FROM docs WHERE id=?", (other,))
+        elif own(db, here, file) and not has_pages(db, here):
+            target = here
+            db.execute("DELETE FROM doc_keys WHERE doc=?", (here,))
+        else:
+            target = new_document(db, size, fmt)
+    move(db, file, target)
+    for name in names:
+        db.execute("INSERT OR IGNORE INTO doc_keys(key,doc,basis) VALUES(?,?,'source')", (name, target))
+    retitle(db, target)
+    return target
+
+
+def place(db, file):
+    """Put a file in the document that the facts name, and return that document.
+
+    A file that was measured belongs to the document known by its checksums. A file that was
+    not, and that the pages of its document were read from by an earlier version, keeps that
+    document to itself until it is measured. Any other file is placed by what the sources say
+    of it. The result depends on what is measured and said now, and not on the order in which
+    it came to be known."""
+    row = db.execute("SELECT id,doc,format,size,sum,read FROM files WHERE id=?", (file,)).fetchone()
     if row is None:
         return None
+    mine = sums(row["sum"])
+    if mine:
+        return by_measure(db, row, [mine[kind] for kind in sorted(mine)])
+    if row["read"] and has_pages(db, row["doc"]):
+        retitle(db, row["doc"])
+        return row["doc"]
+    return by_word(db, row)
+
+
+def replace(db, file):
+    """Place a file again after what the sources say of it has changed."""
+    row = db.execute("SELECT doc,sum,read FROM files WHERE id=?", (file,)).fetchone()
+    if row is None:
+        return None
+    doc = row["doc"]
+    if row["sum"] or has_pages(db, doc) or keys_of(db, doc, "content") \
+            or db.execute("SELECT count(*) FROM files WHERE doc=?", (doc,)).fetchone()[0] == 1:
+        return place(db, file)
+    regroup(db, doc)                                # held with others by words alone: all are placed again
+    return db.execute("SELECT doc FROM files WHERE id=?", (file,)).fetchone()["doc"]
+
+
+def measure(db, file, measured, local=True):
+    """Keep the checksums `measured` of the whole of a file, computed by a full reading
+    (`local`) or given by its storage, and put the file in the document known by them. Returns
+    True when something was learnt. The caller holds the transaction.
+
+    A reading outranks the storage, which never replaces what a reading found. What a source
+    said of this very file, and that the measure contradicts, was said of other bytes: it is
+    dropped. The sources that did not know the file are asked about it again, since they may
+    know it by its checksum."""
+    row = db.execute("SELECT sum FROM files WHERE id=?", (file,)).fetchone()
+    if row is None:
+        return False
+    known, new = sums(row["sum"]), sums(" ".join(measured))
+    kept = {**known, **new} if local else {**new, **known}
+    if kept == known:
+        return False
+    mine = [kept[kind] for kind in sorted(kept)]
+    db.execute("UPDATE files SET sum=? WHERE id=?", (" ".join(mine), file))
+    db.executemany("DELETE FROM records WHERE id=?", [(record["id"],) for record in db.execute(
+        "SELECT id,keys FROM records WHERE file=?", (file,)).fetchall() if against(record["keys"].split(), mine)])
+    place(db, file)
+    # Nor is a word kept that the measure refutes together with what was measured elsewhere.
+    told = db.execute("SELECT doc,size,format FROM files WHERE id=?", (file,)).fetchone()
+    refuted_now = [record["id"] for record in db.execute("SELECT id,keys FROM records WHERE file=?", (file,)).fetchall()
+                   if refuted(db, told["size"], told["format"], sorted({*record["keys"].split(), *mine}))[0]]
+    if refuted_now:
+        db.executemany("DELETE FROM records WHERE id=?", [(number,) for number in refuted_now])
+        retitle(db, told["doc"])
+    still = " ".join(record["source"] for record in db.execute("SELECT source FROM records WHERE file=? ORDER BY source", (file,)))
+    db.execute("UPDATE files SET asked=? WHERE id=?", (still, file))
+    return True
+
+
+def leave(db, file):
+    """A file is gone from its address, or holds other bytes there: what was known of it was
+    known of bytes that are no longer there. What a source said of it stays with its document
+    when the document is known by the checksums of the file, measured, or by those the source
+    gave: it is then said of those bytes, wherever a file that holds them is found again.
+    Anything else that was said of the file is dropped, and so are the pages read from it when
+    no measure ties them to its bytes.
+    Returns the document the file was in, to be put in order once the file is out of it."""
+    row = db.execute("SELECT doc,sum,read FROM files WHERE id=?", (file,)).fetchone()
+    doc = row["doc"]
+    carried = set(keys_of(db, doc))
+    measured = bool(set((row["sum"] or "").split()) & carried)
+    for record in db.execute("SELECT id,keys FROM records WHERE file=?", (file,)).fetchall():
+        if measured or set(record["keys"].split()) & carried:
+            db.execute("UPDATE records SET file=NULL WHERE id=?", (record["id"],))
+        else:
+            db.execute("DELETE FROM records WHERE id=?", (record["id"],))
+    cards(db, doc, doc)
+    if row["read"] and db.execute("SELECT origin FROM docs WHERE id=?", (doc,)).fetchone()["origin"] is None:
+        db.execute("DELETE FROM pages WHERE doc=?", (doc,))
+        unread(db, doc)
+    return doc
+
+
+def afresh(db, file):
+    """Another file stands at the address of this one: nothing that was known of the file
+    holds for it. It starts again as a document of its own."""
+    row = db.execute("SELECT root,size,format FROM files WHERE id=?", (file,)).fetchone()
+    if row is None:
+        return None
+    old = leave(db, file)
     apart = new_document(db, row["size"], row["format"])
-    db.execute("UPDATE files SET doc=?,read=0 WHERE id=?", (apart, file))
-    said = [key for record in db.execute("SELECT keys FROM records WHERE file=?", (file,)) for key in record["keys"].split()]
-    db.execute("UPDATE records SET doc=? WHERE file=?", (apart, file))
-    unback(db, row["doc"])
-    retitle(db, row["doc"])
-    for key in said:
-        owner = db.execute("SELECT doc FROM doc_keys WHERE key=?", (f"{key}@{row['format']}",)).fetchone()
-        if owner is None or (follow and owner["doc"] != row["doc"]):
-            apart = claim(db, apart, key, "source")
-    retitle(db, apart)
-    tend_orphans(db, row["root"], drop=False)
+    db.execute("UPDATE files SET doc=?,read=0,sum=NULL,asked='' WHERE id=?", (apart, file))
+    db.execute("UPDATE names SET title='',byline='' WHERE rowid=?", (file,))
+    tidy(db, old, row["root"])
     return apart
-
-
-def release(db, doc):
-    """Set apart the files of a document that nothing ties to it any more. A file belongs to a
-    document because the document was read from it, because a checksum measured of the file is
-    one the document carries, or because a source says of the file a checksum that the
-    document carries. When the word that had brought a file is withdrawn or refuted, the file
-    is a document of its own again."""
-    files = db.execute("SELECT id,read,sum FROM files WHERE doc=?", (doc,)).fetchall()
-    if len(files) < 2:
-        return
-    carried = {key.split("@")[0] for key in keys_of(db, doc)}
-    for row in files:
-        said = {key for record in db.execute("SELECT keys FROM records WHERE file=?", (row["id"],))
-                for key in record["keys"].split()}
-        if not row["read"] and not carried & (said | set((row["sum"] or "").split())):
-            set_apart(db, row["id"], follow=True)
-
-
-def part(db, doc, file, keys):
-    """The document `doc` is that of the file `file`, of which `keys` are the checksums: every
-    statement to the contrary leaves the document. What was said of another of its files goes
-    away with that file, what was said of this file or of none is dropped, and the checksums
-    that contradict are removed."""
-    for record in db.execute("SELECT id,file,keys FROM records WHERE doc=?", (doc,)).fetchall():
-        if against(record["keys"].split(), keys):
-            if record["file"] is None or record["file"] == file:
-                db.execute("DELETE FROM records WHERE id=?", (record["id"],))
-            else:
-                set_apart(db, record["file"])
-    for key in keys_of(db, doc):
-        if against([key], keys):
-            db.execute("DELETE FROM doc_keys WHERE key=? AND doc=?", (key, doc))
-    unback(db, doc)
-    retitle(db, doc)
-    release(db, doc)
-
-
-def part_strangers(db, doc):
-    """A file whose own measure contradicts the checksums of its document is not that document:
-    it leaves, and is known by its own."""
-    carried = keys_of(db, doc)
-    for row in db.execute("SELECT id,sum FROM files WHERE doc=? AND sum IS NOT NULL", (doc,)).fetchall():
-        if against(row["sum"].split(), carried):
-            apart = set_apart(db, row["id"])
-            for key in row["sum"].split():
-                apart = claim(db, apart, key, "content")
-
-
-def merge(db, one, other):
-    """Two documents turned out to be the same: make them one and return it. The document whose
-    reading went furthest is kept, a page recognised in the other only is taken from it, and the
-    files, the keys and the records of the other go to the one kept. Documents of two formats
-    are not merged, since each is read by its own reader, nor documents of two sizes or with
-    different checksums of one kind, which cannot hold the same bytes: None is returned. The
-    caller holds the transaction, and answers for the evidence: see `claim`."""
-    if one == other:
-        return one
-    rank = {"indexed": 0, "needs-ocr": 1, "ocr-error": 1, "covered": 3, "pending": 4, "error": 5, "name-only": 6}
-    told = {row["id"]: row for row in db.execute("SELECT * FROM docs WHERE id IN (?,?)", (one, other))}
-    if len(told) < 2:
-        return one if one in told else other if other in told else None
-    if (told[one]["format"], told[one]["size"]) != (told[other]["format"], told[other]["size"]):
-        return None
-    if against(keys_of(db, one), keys_of(db, other)):
-        return None
-    keep, drop = sorted((one, other), key=lambda doc: (rank.get(told[doc]["state"], 9), blanks(db, doc)[0], doc))
-    # A page that only the other document has recognised is not lost with it.
-    theirs = {row["page"]: row["ztext"] for row in db.execute(
-        "SELECT page,ztext FROM pages WHERE doc=? AND needs_ocr=0 AND page IS NOT NULL", (drop,))}
-    if theirs and blanks(db, keep)[1] == blanks(db, drop)[1]:
-        for row in db.execute("SELECT id,page FROM pages WHERE doc=? AND needs_ocr=1", (keep,)).fetchall():
-            if row["page"] in theirs:
-                db.execute("UPDATE pages SET ztext=?,needs_ocr=0 WHERE id=?", (theirs[row["page"]], row["id"]))
-        if told[keep]["state"] in ("needs-ocr", "ocr-error") and blanks(db, keep)[0] == 0:
-            db.execute("UPDATE docs SET state='indexed',error=NULL WHERE id=?", (keep,))
-    if told[keep]["state"] == "ocr-error" and told[drop]["state"] == "needs-ocr":
-        # The other copy was waiting for an ordinary recognition: the document still is.
-        db.execute("UPDATE docs SET state='needs-ocr',error=NULL WHERE id=? AND state='ocr-error'", (keep,))
-    # The pages kept are those read from the files of the document kept: a file of the other
-    # is, from now on, a copy by the evidence that joined the two.
-    if blanks(db, keep)[1]:
-        db.execute("UPDATE files SET read=0 WHERE doc=?", (drop,))
-    db.execute("UPDATE files SET doc=? WHERE doc=?", (keep, drop))
-    db.execute("UPDATE doc_keys SET doc=? WHERE doc=?", (keep, drop))
-    db.execute("UPDATE records SET doc=? WHERE doc=?", (keep, drop))
-    db.execute("UPDATE docs SET gone=NULL,gone_from=NULL WHERE id=? AND EXISTS (SELECT 1 FROM files WHERE doc=?)",
-               (keep, keep))
-    db.execute("DELETE FROM pages WHERE doc=?", (drop,))
-    db.execute("DELETE FROM docs WHERE id=?", (drop,))
-    retitle(db, keep)
-    return keep
-
-
-def claim(db, doc, key, basis):
-    """Let the document `doc` be known by the checksum `key` of its bytes, measured
-    (`basis` "content") or said by a source ("source"), and return the document that carries it
-    afterwards. The key is kept under the format of the document, since the same bytes under
-    two formats are two documents, each read by its own reader.
-
-    A document that carries the key already is the same document, and the two are merged, with
-    two reservations. Two documents that were both read are joined by a measure only: on the
-    word of a source each stays what it is. And a document that was read from a file never
-    measured, and holds the key on the word of a source, does not vouch for its pages: a
-    measured document takes the key from it, and the two become one when that file is measured
-    in its turn."""
-    told = db.execute("SELECT format FROM docs WHERE id=?", (doc,)).fetchone()
-    if told is None:
-        return doc
-    name = f"{key.split('@')[0]}@{told['format']}"
-    owner = db.execute("SELECT doc,basis FROM doc_keys WHERE key=?", (name,)).fetchone()
-    if owner is None:
-        db.execute("INSERT INTO doc_keys(key,doc,basis) VALUES(?,?,?)", (name, doc, basis))
-        return doc
-    if owner["doc"] == doc:
-        if basis == "content" and owner["basis"] != "content":
-            db.execute("UPDATE doc_keys SET basis='content' WHERE key=?", (name,))
-        return doc
-    if basis == "content":
-        if owner["basis"] != "content" and has_pages(db, owner["doc"]):
-            if against([key], [other for other in keys_of(db, doc) if other != name]):
-                return doc
-            db.execute("UPDATE doc_keys SET doc=?,basis='content' WHERE key=?", (doc, name))
-            release(db, owner["doc"])           # the files that this word alone had brought there follow it
-            return db.execute("SELECT doc FROM doc_keys WHERE key=?", (name,)).fetchone()["doc"]
-    elif has_pages(db, doc) and has_pages(db, owner["doc"]):
-        return doc
-    kept = merge(db, owner["doc"], doc)
-    if kept is None:
-        return doc
-    if basis == "content":
-        db.execute("UPDATE doc_keys SET basis='content' WHERE key=?", (name,))
-    part_strangers(db, kept)
-    return kept
 
 
 def slow_mounts():
@@ -659,22 +868,17 @@ def at_hand(path, slow=None):
 def tend_orphans(db, root=None, now=None, drop=True):
     """Note the documents that have just lost their last file and, when `drop` allows, forget
     those that have nothing worth keeping or have waited long enough. A document that was read,
-    or that a source knows, is kept for a month after its last file has gone, for the day that
-    file is found again elsewhere."""
+    or that a source knows, is kept for a month after its last file has gone, for the day a
+    file that holds its bytes is found again elsewhere."""
     now = int(time.time()) if now is None else now
     db.execute("UPDATE docs SET gone=NULL,gone_from=NULL WHERE gone IS NOT NULL AND EXISTS "
                "(SELECT 1 FROM files f WHERE f.doc=docs.id)")
     db.execute("UPDATE docs SET gone=?,gone_from=? WHERE gone IS NULL AND NOT EXISTS "
                "(SELECT 1 FROM files f WHERE f.doc=docs.id)", (now, root))
     if drop:
-        # Worth keeping for a while: the text that was read, what a source said of the document,
-        # and the checksums by which its file can be recognised again.
+        # Worth keeping for a while: the text that was read, and what a source said of the bytes.
         bare = ("NOT EXISTS (SELECT 1 FROM pages p WHERE p.doc=docs.id) "
-                "AND NOT EXISTS (SELECT 1 FROM records r WHERE r.doc=docs.id) "
-                "AND NOT EXISTS (SELECT 1 FROM doc_keys k WHERE k.doc=docs.id)")
-        # What was said of a file that is gone is kept once for its document.
-        db.execute("DELETE FROM records WHERE file IS NULL AND id NOT IN "
-                   "(SELECT min(id) FROM records WHERE file IS NULL GROUP BY doc,source,ref)")
+                "AND NOT EXISTS (SELECT 1 FROM records r WHERE r.doc=docs.id)")
         db.execute(f"DELETE FROM docs WHERE gone IS NOT NULL AND (({bare}) OR gone<?)", (now - KEEP,))
 
 
@@ -691,21 +895,25 @@ def scan(db, root, directory):
                 fresh.append((rel, size, mtime, old))
         # The addresses that vanished go first: a file found again elsewhere then meets a
         # document without a file, and takes it back with its text.
-        db.executemany("DELETE FROM files WHERE id=?", [(r["id"],) for r in existing.values()])
-        tend_orphans(db, root["id"], drop=False)
+        for old in existing.values():
+            doc = leave(db, old["id"])
+            db.execute("DELETE FROM files WHERE id=?", (old["id"],))
+            tidy(db, doc, root["id"])
         for rel, size, mtime, old in fresh:
             # New at its address, or changed there: a document of its own, whatever its name,
             # its size and its date resemble. What it holds is compared afterwards.
             path = Path(rel)
             fmt = file_format(path)
-            doc = new_document(db, size, fmt)
             if old:
                 # What was measured of the file, and what was said of it, was of other bytes.
+                left = leave(db, old["id"])
+                doc = new_document(db, size, fmt)
                 db.execute("UPDATE files SET size=?,mtime=?,format=?,doc=?,read=0,sum=NULL,asked='' WHERE id=?",
                            (size, mtime, fmt, doc, old["id"]))
-                db.execute("UPDATE records SET file=NULL WHERE file=?", (old["id"],))
                 db.execute("UPDATE names SET title='',byline='' WHERE rowid=?", (old["id"],))
+                tidy(db, left, root["id"])
                 continue
+            doc = new_document(db, size, fmt)
             cur = db.execute("INSERT INTO files(root,rel,name,folded,format,size,mtime,doc) VALUES(?,?,?,?,?,?,?,?)",
                              (root["id"], rel, path.name, fuzzy.fold(path.name), fmt, size, mtime, doc))
             folder = str(Path(Path(root["path"]).name) / path.parent)

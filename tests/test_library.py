@@ -151,7 +151,7 @@ class Linked(Shelf):
         self.assertEqual([(hit["name"], hit["title"], hit["byline"], hit["year"]) for hit in found],
                          [("scan-0042.txt", "Linear and Nonlinear Waves", "G. B. Whitham", "1974")])
         keys = {row[0] for row in self.db.execute("SELECT key FROM doc_keys WHERE basis='source'")}
-        self.assertEqual(keys, {self.checksum + "@txt"})    # kept under the format of the document
+        self.assertEqual(keys, {f"{self.checksum}@txt#{len(BOOK)}"})    # kept under the format and the size it was said of
         self.assertEqual(self.build(), (0, 0))              # nothing more to ask, nothing to read
         code, out, _ = self.run_cli("status", "--json")
         self.assertEqual(json.loads(out)[0]["states"], {"covered": 1, "indexed": 1})
@@ -255,9 +255,11 @@ class Linked(Shelf):
         self.assertEqual(self.states()[target.name], "covered")
         self.assertEqual(search(self.db, "whitham")[0]["path"], str(target))
         self.assertIn(["hashsum", "twin:Room", ["Mechanics/" + target.name]], questions())
-        # The library was asked about the file with the checksum of that very file, and of no other.
+        # The library was asked about each file with the checksums of that very file, and of no other.
         self.assertEqual(self.asked()[target.name], [digest])
-        self.assertEqual(self.asked()["notes.txt"], [])
+        notes = next(self.root.rglob("notes.txt")).read_bytes()
+        self.assertEqual(self.asked()["notes.txt"], ["md5:" + hashlib.md5(notes).hexdigest(),
+                                                     "sha256:" + hashlib.sha256(notes).hexdigest()])
 
     def test_a_copy_added_beside_a_document_read_by_an_earlier_version_keeps_its_text(self):
         self.works[0].update(file="elsewhere.txt")          # the library does not know the shelf file by its name
@@ -288,14 +290,13 @@ class Linked(Shelf):
         self.assertEqual(self.states()["tome.txt"], "covered")          # measured, it is the book of the library
         said = lambda: sorted(row[0] for row in self.db.execute(
             "SELECT f.name FROM records r JOIN files f ON f.id=r.file WHERE r.source='library'"))
-        self.assertEqual(said(), ["scan-0042.txt"])
-        self.assertEqual(self.build(), (0, 0))
-        self.assertEqual(said(), ["scan-0042.txt"])         # not asked twice within the day
-        with self.db:
-            self.db.execute("UPDATE meta SET value='0' WHERE key='asked:library'")
-        self.assertEqual(self.build(), (0, 0))              # asked again, with its own checksums this time
+        # Once measured, the file was a new question: asked in the same run, with its own checksums.
         self.assertEqual(said(), ["scan-0042.txt", "tome.txt"])
         self.assertEqual(self.asked()["tome.txt"][-1], self.checksum)
+        log = self.folder / "asked.jsonl"
+        before = log.read_text()
+        self.assertEqual(self.build(), (0, 0))
+        self.assertEqual(log.read_text(), before)           # and nothing is asked twice
 
     def test_a_card_without_text_about_a_copy_does_not_cost_the_document_its_text(self):
         copy = self.root / "Desk" / "tome.txt"

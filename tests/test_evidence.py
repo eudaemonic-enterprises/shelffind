@@ -27,6 +27,7 @@ class Evidence(Reading):
         with self.db:
             self.db.execute("DELETE FROM doc_keys")
             self.db.execute("UPDATE files SET sum=NULL")
+            self.db.execute("UPDATE docs SET origin=NULL")
 
     def ids(self):
         return dict(self.db.execute("SELECT rel,id FROM files"))
@@ -147,7 +148,9 @@ class Likeness(Evidence):
         self.assertEqual(self.db.execute("SELECT state FROM docs").fetchone()[0], "error")
         self.write("second.txt", when=1_800_000_000)        # a copy under another date
         self.read.clear()
-        self.assertEqual(self.build(), (1, 0))              # the two are one document, which waits no longer
+        self.assertEqual(self.build(), (0, 0))              # the same bytes: the same document, which failed
+        self.assertEqual((self.read, self.documents()), ([], 1))
+        self.assertEqual(self.build(retry=True), (1, 0))    # read when it is asked for again, through either file
         self.assertEqual(len(self.read), 1)
         found = search(self.db, "northern harbours")
         self.assertEqual((len(found), len(found[0]["copies"]), self.documents()), (1, 1, 1))
@@ -261,7 +264,8 @@ class Ambiguity(Evidence):
                 self.db.executemany("INSERT INTO pages(doc,page,section,ztext,needs_ocr) VALUES(?,?,NULL,?,?)",
                                     [(doc, page, store.deflate(body), blank) for page, body, blank in pages])
                 self.db.execute("UPDATE docs SET state='needs-ocr' WHERE id=?", (doc,))
-            kept = store.merge(self.db, one, two)
+            store.hand_over(self.db, one, two)
+            kept = two
         rows = [(row[0], store.inflate(row[1]), row[2]) for row in self.db.execute(
             "SELECT page,ztext,needs_ocr FROM pages WHERE doc=? ORDER BY page", (kept,))]
         self.assertEqual(rows, [(1, "first page", 0), (2, "second page", 0)])
@@ -291,7 +295,8 @@ class Ambiguity(Evidence):
                 self.db.executemany("INSERT INTO pages(doc,page,section,ztext,needs_ocr) VALUES(?,?,NULL,?,?)",
                                     [(doc, page, store.deflate(body), blank) for page, body, blank in pages])
                 self.db.execute("UPDATE docs SET state=?,error='the recogniser stumbled' WHERE id=?", (state, doc))
-            kept = store.merge(self.db, failed, waiting)
+            store.hand_over(self.db, failed, waiting)
+            kept = waiting
         self.assertEqual(self.db.execute("SELECT state,error FROM docs WHERE id=?", (kept,)).fetchone()[:], ("needs-ocr", None))
         self.assertEqual(self.db.execute("SELECT count(*) FROM pages WHERE doc=? AND needs_ocr=0", (kept,)).fetchone()[0], 1)
 
@@ -319,7 +324,7 @@ class Words(Evidence):
         """A source says that the file at `rel` is the work `work`, with the checksum `key`."""
         record = {"id": work, "keys": [key] if key else [], "title": f"Work {work}", **more}
         with self.db:
-            return link.attach(self.db, self.ids()[rel], "library", record, set())
+            return link.say(self.db, self.ids()[rel], "library", record, set())
 
     def test_two_files_that_differ_by_one_word_are_two_documents_whatever_their_size(self):
         body = "Tide tables of the northern harbours. " * 300_000        # some eleven megabytes
@@ -405,7 +410,7 @@ class Words(Evidence):
         self.assertEqual((names(self.db, "northern harbours"), names(self.db, "southern capes")),
                          (["a/book.txt"], ["b/other.txt"]))
 
-    def test_a_file_brought_by_a_word_follows_the_checksum_to_the_document_that_is_measured(self):
+    def test_a_file_read_by_an_earlier_version_and_never_measured_is_placed_by_no_word(self):
         one = self.write("a/book.txt")
         self.write("b/book.txt", OTHER)
         other = self.write("c/other.txt", OTHER)
@@ -415,7 +420,7 @@ class Words(Evidence):
         self.assertTrue(self.say("a/book.txt", "W2", key))  # a source takes the first for another work,
         self.assertTrue(self.say("b/book.txt", "W2", key))  # and rightly says that the second is that work
         docs = self.docs()
-        self.assertEqual(docs["a/book.txt"], docs["b/book.txt"])
+        self.assertNotEqual(docs["a/book.txt"], docs["b/book.txt"])     # the pages of the first stay its own
         with self.db:                                       # the third file is measured: it is that work
             row = self.db.execute("SELECT size,mtime FROM files WHERE rel='c/other.txt'").fetchone()
             indexer.joined(self.db, self.ids()["c/other.txt"], indexer.whole_checksums(other, row))
@@ -466,7 +471,7 @@ class Words(Evidence):
         self.assertTrue(self.say("a/book.txt", "W1", key))
         self.assertTrue(self.say("b/book.txt", "W1", key))  # one source takes the second for the first,
         with self.db:                                       # another names it, without a checksum
-            link.attach(self.db, self.ids()["b/book.txt"], "catalogue", {"id": "C7", "title": "BravoCard"}, set())
+            link.say(self.db, self.ids()["b/book.txt"], "catalogue", {"id": "C7", "title": "BravoCard"}, set())
         self.assertEqual(self.documents(), 1)
         self.assertEqual(self.build(), (2, 0))              # measured, the two part, and each is read in this run
         self.assertEqual((names(self.db, "northern harbours"), names(self.db, "southern capes")),
@@ -487,7 +492,8 @@ class Words(Evidence):
         docs = self.docs()
         self.assertNotEqual(docs["a/book.txt"], docs["b/book.txt"])
         held = lambda rel: sorted(row["key"] for row in self.db.execute("SELECT key FROM doc_keys WHERE doc=?", (docs[rel],)))
-        self.assertEqual((held("a/book.txt"), held("b/book.txt")), ([key + "@txt"], [other + "@txt"]))
+        size = len(LARGE)                                   # a checksum that was only said is kept with the size it was said of
+        self.assertEqual((held("a/book.txt"), held("b/book.txt")), ([f"{key}@txt#{size}"], [f"{other}@txt#{size}"]))
         self.assertEqual(self.documents(), 2)
 
     def test_a_file_brought_by_a_word_leaves_when_the_word_is_withdrawn(self):
@@ -499,7 +505,7 @@ class Words(Evidence):
         self.assertTrue(self.say("b/book.txt", "W1", key))  # the source takes the second for the first
         self.assertEqual(self.documents(), 1)
         with self.db:
-            link.withdraw(self.db, self.ids()["b/book.txt"], "library")     # asked again, it says so no more
+            link.say(self.db, self.ids()["b/book.txt"], "library", None)     # asked again, it says so no more
         self.assertEqual(self.documents(), 2)
         self.assertEqual(self.build(), (2, 0))
         self.assertEqual((names(self.db, "northern harbours"), names(self.db, "southern capes")),
@@ -513,7 +519,7 @@ class Words(Evidence):
         key = self.sha(bravo)
         self.assertTrue(self.say("a/alpha.txt", "W2", key))     # the source takes alpha for bravo
         with self.db:
-            link.withdraw(self.db, self.ids()["a/alpha.txt"], "library")    # and then says so no more
+            link.say(self.db, self.ids()["a/alpha.txt"], "library", None)    # and then says so no more
         self.assertEqual(self.db.execute("SELECT count(*) FROM doc_keys").fetchone()[0], 0)
         self.write("b/bravo.txt", OTHER)                    # the true bravo arrives
         self.assertEqual(self.build(), (2, 0))
@@ -534,7 +540,7 @@ class Words(Evidence):
         self.assertEqual(sorted(row["key"] for row in self.db.execute("SELECT key FROM doc_keys")),
                          sorted(key + "@txt" for key in true))
 
-    def test_a_file_goes_to_the_document_that_comes_to_be_known_by_its_measure(self):
+    def test_a_file_said_to_have_the_checksum_measured_of_another_joins_it(self):
         self.write("a/book.txt")
         self.build()
         self.unmeasured()                                   # read by an earlier version, never measured
@@ -543,12 +549,12 @@ class Words(Evidence):
         key = "sha256:" + "aa" * 32
         self.assertTrue(self.say("a/book.txt", "W1", key))
         self.assertTrue(self.say("b/book.txt", "W1", key))  # a source takes the second for the first
-        self.assertEqual(self.documents(), 1)
+        self.assertEqual(self.documents(), 2)               # which keeps to itself until it is measured
         row = {"size": two.stat().st_size, "mtime": two.stat().st_mtime_ns}
         md5 = indexer.whole_checksums(two, row)[0]
-        with self.db:                                       # its storage tells the MD5 of the second file,
+        with self.db:                                       # its storage tells the MD5 of the second file
             indexer.joined(self.db, self.ids()["b/book.txt"], [md5], local=False)
-        self.assertEqual(self.documents(), 1)               # which contradicts nothing known, and is kept with the file
+        self.assertEqual(self.documents(), 2)
         self.write("c/other.txt", OTHER, when=1_800_000_000)
         self.build(names_only=True)
         self.assertTrue(self.say("c/other.txt", "W2", md5))     # a document comes to be known by that very MD5
@@ -590,7 +596,7 @@ class Words(Evidence):
         row = {"size": one.stat().st_size, "mtime": one.stat().st_mtime_ns}
         record = {"id": "C1", "keys": [indexer.whole_checksums(one, row)[0]], "title": "By Its MD5"}
         with self.db:                                       # another source gives the second the MD5 of the first
-            self.assertTrue(link.attach(self.db, self.ids()["b/book.txt"], "catalogue", record, set()))
+            self.assertTrue(link.say(self.db, self.ids()["b/book.txt"], "catalogue", record, set()))
         self.assertEqual(self.documents(), 2)               # their SHA-256 differ: they are two
 
     def test_a_file_leaves_when_the_file_its_document_was_read_from_is_measured_otherwise(self):
@@ -604,8 +610,14 @@ class Words(Evidence):
         row = {"size": two.stat().st_size, "mtime": two.stat().st_mtime_ns}
         with self.db:                                       # the storage tells the MD5 of the second, kept with it
             indexer.joined(self.db, self.ids()["b/book.txt"], [indexer.whole_checksums(two, row)[0]], local=False)
-        self.assertEqual(self.documents(), 1)
-        self.assertEqual(self.build(), (1, 0))              # the first is measured: the second is not that document
+        self.assertEqual(self.documents(), 2)
+        self.assertEqual(names(self.db, "work w1"), ["a/book.txt", "b/book.txt"])   # no measure refutes the word yet
+        self.assertEqual(self.build(names_only=True), (0, 0))
+        with self.db:                                       # the first is measured: the word about the second is refuted
+            row = self.db.execute("SELECT size,mtime FROM files WHERE rel='a/book.txt'").fetchone()
+            indexer.joined(self.db, self.ids()["a/book.txt"], indexer.whole_checksums(one, row))
+        self.assertEqual(names(self.db, "work w1"), ["a/book.txt"])
+        self.assertEqual(self.build(), (1, 0))              # and the second is read for itself
         self.assertEqual((names(self.db, "northern harbours"), names(self.db, "southern capes")),
                          (["a/book.txt"], ["b/book.txt"]))
 
@@ -614,18 +626,27 @@ class Words(Evidence):
         self.build(names_only=True)
         record = {"id": "W1", "keys": ["md5:" + "aa" * 16, "md5:" + "bb" * 16], "title": "Twice Told"}
         with self.db:
-            self.assertTrue(link.attach(self.db, self.ids()["a/book.txt"], "library", record, set()))
+            self.assertTrue(link.say(self.db, self.ids()["a/book.txt"], "library", record, set()))
         self.assertEqual(self.db.execute("SELECT count(*) FROM doc_keys").fetchone()[0], 0)
         self.assertEqual(names(self.db, "twice told"), ["a/book.txt"])     # the title is taken, the checksums are not
 
-    def test_a_second_source_that_says_otherwise_is_not_believed_before_a_measure(self):
+    def test_two_sources_that_contradict_one_another_place_no_file(self):
         one = self.write("a/book.txt")
+        self.write("b/book.txt")
         self.build(names_only=True)
-        self.assertTrue(self.say("a/book.txt", "W1", self.sha(one)))
+        key = self.sha(one)
+        self.assertTrue(self.say("a/book.txt", "W1", key))
+        self.assertTrue(self.say("b/book.txt", "W1", key))
+        self.assertEqual(self.documents(), 1)
         other = {"id": "Z9", "keys": ["sha256:" + "bb" * 32], "title": "Another Work"}
-        with self.db:
-            self.assertFalse(link.attach(self.db, self.ids()["a/book.txt"], "catalogue", other, set()))
-        self.assertEqual([row["source"] for row in self.db.execute("SELECT source FROM records")], ["library"])
+        with self.db:                                       # each word is kept, and neither places the file
+            self.assertTrue(link.say(self.db, self.ids()["a/book.txt"], "catalogue", other, set()))
+        self.assertEqual(sorted(row["source"] for row in self.db.execute("SELECT source FROM records")),
+                         ["catalogue", "library", "library"])
+        self.assertEqual(self.documents(), 2)
+        with self.db:                                       # the second source comes to agree: the word places again
+            self.assertTrue(link.say(self.db, self.ids()["a/book.txt"], "catalogue", {**other, "keys": [key]}, set()))
+        self.assertEqual(self.documents(), 1)
 
 
 class Reading2(Evidence):
@@ -661,12 +682,10 @@ class Reading2(Evidence):
         two = self.write("two/book.txt", OTHER)             # the same name, size and date, another text
         self.build(names_only=True)
         self.assertEqual(self.documents(), 2)
-        self.unmeasured()                                   # read by an earlier version: nothing measured yet
-        ids = self.ids()
-        record = {"id": "W1", "keys": ["sha256:" + "aa" * 32], "text": False}
-        with self.db:                                       # a source takes the two for one work
-            for rel in ("one/book.txt", "two/book.txt"):
-                link.attach(self.db, ids[rel], "library", record, set())
+        row = {"size": one.stat().st_size, "mtime": one.stat().st_mtime_ns}
+        record = {"id": "W1", "keys": [indexer.whole_checksums(one, row)[1]], "text": False}
+        with self.db:                                       # a source takes the second for the first, which was measured
+            self.assertTrue(link.say(self.db, self.ids()["two/book.txt"], "library", record, set()))
         self.assertEqual(self.documents(), 1)
         recognise = lambda source, fmt, work, page, lang: source.read_text()[:60]
         with patch("shelffind.extract.recognize", side_effect=recognise):
@@ -687,7 +706,7 @@ class Reading2(Evidence):
         with self.db:
             self.db.execute("UPDATE pages SET needs_ocr=1")
             self.db.execute("UPDATE docs SET state='needs-ocr'")
-        self.unmeasured()                                    # read by an earlier version: no fingerprint yet
+        self.unmeasured()                                    # read by an earlier version: nothing measured yet
         two = self.write("two/book.txt", OTHER)
         self.build(names_only=True)
         ids = self.ids()
@@ -695,14 +714,15 @@ class Reading2(Evidence):
         key = indexer.whole_checksums(two, row)[1]          # the checksum that the second file really has
         with self.db:                                       # a source takes the two for one work
             for rel in ("one/book.txt", "two/book.txt"):
-                link.attach(self.db, ids[rel], "library", {"id": "W1", "keys": [key]}, set())
-        self.assertEqual(self.documents(), 1)
-        one.unlink()                                        # the file that was read is gone, never measured
+                link.say(self.db, ids[rel], "library", {"id": "W1", "keys": [key]}, set())
+        self.assertEqual(self.documents(), 2)               # the pages of the first stay with it alone
+        one.unlink()                                        # the file that was read is gone, never measured:
         recognise = lambda source, fmt, work, page, lang: source.read_text()[:60]
         with patch("shelffind.extract.recognize", side_effect=recognise):
-            self.assertEqual(self.build(ocr=True), (1, 1))
-        self.assertEqual(self.db.execute("SELECT count(*) FROM pages WHERE needs_ocr=1").fetchone()[0], 1)
+            self.assertEqual(self.build(ocr=True), (0, 0))  # nothing tells whose pages they were, and they go with it
+        self.assertEqual(self.db.execute("SELECT count(*) FROM pages").fetchone()[0], 0)
         self.assertEqual(search(self.db, "southern capes"), [])
+        self.assertEqual(search(self.db, "northern harbours"), [])
 
     def test_an_inventory_opens_no_file(self):
         self.write("old.txt")
@@ -741,7 +761,7 @@ class Reading2(Evidence):
         record = {"id": "W1", "keys": ["sha256:" + "cd" * 32], "title": "Notes", "text": True}
         with self.db:
             for rel in ids:
-                link.attach(self.db, ids[rel], "library", record, set())
+                link.say(self.db, ids[rel], "library", record, set())
         docs = self.docs()
         self.assertEqual(docs["notes-a.md"], docs["notes-b.md"])           # the two of one format are one document
         self.assertNotEqual(docs["notes.txt"], docs["notes-a.md"])
@@ -751,7 +771,7 @@ class Reading2(Evidence):
         self.build(names_only=True)
         with self.db:                                       # a source described the work by its checksum
             row = self.db.execute("SELECT size,mtime FROM files").fetchone()
-            link.attach(self.db, self.ids()["old.txt"], "library",
+            link.say(self.db, self.ids()["old.txt"], "library",
                         {"id": "W1", "keys": [indexer.whole_checksums(old, row)[1]], "title": "Archived Work"}, set())
         target = self.root / "refiled.txt"
         shutil.copyfile(old, target)                        # the same bytes under a new name and date
@@ -937,7 +957,8 @@ class Twin(Evidence):
         path = self.write("book.txt")
         self.build()
         measured = lambda: self.db.execute("SELECT sum,asked FROM files").fetchone()
-        self.assertEqual(measured()["sum"], "md5:" + hashlib.md5(LARGE.encode()).hexdigest())
+        self.assertEqual(measured()["sum"].split(),         # the copy that was read gave both checksums
+                         ["md5:" + hashlib.md5(LARGE.encode()).hexdigest(), "sha256:" + hashlib.sha256(LARGE.encode()).hexdigest()])
         with self.db:
             self.db.execute("UPDATE files SET asked='library'")
         path.write_text(OTHER)                              # other bytes at the same address
@@ -1023,8 +1044,8 @@ class Lost(Evidence):
         (annex / "kept.txt").write_text("Kept in the annex.")
         path = self.write("book.txt")
         self.build()
-        with self.db:                                       # its only file turns out to be another document
-            store.set_apart(self.db, self.ids()["book.txt"])
+        with self.db:                                       # another file is found to stand at its address
+            store.afresh(self.db, self.ids()["book.txt"])
         self.assertEqual(self.db.execute("SELECT count(*) FROM docs WHERE gone IS NOT NULL AND gone_from IS NOT NULL")
                          .fetchone()[0], 1)
         self.run_cli("roots", "remove", "Reading Room")
@@ -1034,18 +1055,23 @@ class Lost(Evidence):
         self.assertEqual(self.read, ["again.txt"])          # read for itself: what was forgotten stays forgotten
         self.assertEqual(self.db.execute("SELECT count(*) FROM docs WHERE gone IS NOT NULL").fetchone()[0], 0)
 
-    def test_what_was_said_of_two_documents_is_said_of_the_one_they_become(self):
+    def test_what_was_said_of_two_files_is_said_of_the_document_they_become(self):
+        self.write("a/book.txt")
+        self.write("b/book.txt")
+        self.write("c/short.txt", "Another size.")
+        self.build(names_only=True)
+        ids = self.ids()
         with self.db:
-            one, two, other = (store.new_document(self.db, size, "txt") for size in (1, 1, 2))
-            self.db.execute("INSERT INTO records(doc,source,ref,title,text) VALUES(?,'library','W0','',0)", (one,))
-            self.db.execute("INSERT INTO records(doc,source,ref,title,text) VALUES(?,'library','W1','Tides',1)", (two,))
-            self.db.execute("UPDATE docs SET title='Tides' WHERE id=?", (two,))
-            kept = store.merge(self.db, one, two)
-            self.assertIsNone(store.merge(self.db, kept, other))            # another size: another document
+            link.say(self.db, ids["a/book.txt"], "catalogue", {"id": "W0"}, set())
+            link.say(self.db, ids["b/book.txt"], "library", {"id": "W1", "title": "Tides", "text": True}, set())
+        self.assertEqual(self.documents(), 3)
+        self.build()                                        # their checksums show one document
+        kept = self.docs()["a/book.txt"]
+        self.assertEqual(self.docs()["b/book.txt"], kept)
         self.assertEqual(sorted(row["ref"] for row in self.db.execute("SELECT ref FROM records WHERE doc=?", (kept,))),
                          ["W0", "W1"])                      # both are kept, and the one with a title names the document
         self.assertEqual(self.db.execute("SELECT title FROM docs WHERE id=?", (kept,)).fetchone()[0], "Tides")
-        self.assertEqual(self.documents(), 2)
+        self.assertEqual(self.documents(), 2)               # another size: another document
 
     def test_a_file_parted_from_a_titled_document_is_no_longer_found_by_that_title(self):
         self.write("a/book.txt")
@@ -1054,10 +1080,10 @@ class Lost(Evidence):
         ids = self.ids()
         with self.db:                                       # a source takes both for one work, then corrects itself
             for rel in ("a/book.txt", "b/book.txt"):
-                link.attach(self.db, ids[rel], "library",
+                link.say(self.db, ids[rel], "library",
                             {"id": "W1", "keys": ["sha256:" + "aa" * 32], "title": "AlmanacMeridian"}, set())
             self.assertEqual(len(search(self.db, "almanacmeridian")[0]["copies"]), 1)
-            link.attach(self.db, ids["b/book.txt"], "library", {"id": "W2", "keys": ["sha256:" + "bb" * 32]}, set())
+            link.say(self.db, ids["b/book.txt"], "library", {"id": "W2", "keys": ["sha256:" + "bb" * 32]}, set())
         self.assertEqual(names(self.db, "almanacmeridian"), ["a/book.txt"])
         self.assertEqual(search(self.db, "almanacmeridian")[0]["copies"], [])
 
