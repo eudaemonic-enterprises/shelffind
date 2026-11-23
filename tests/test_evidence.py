@@ -377,6 +377,22 @@ class Samples(Evidence):
         self.assertEqual({found[0]["path"], *found[0]["copies"]}, {str(two), str(three)})
         self.assertEqual(names(self.db, "ALPHA"), ["a/book.txt"])
 
+    def test_a_third_file_is_told_by_its_whole_also_while_the_storage_gives_no_answer(self):
+        self.twin()
+        one, two = self.twins()
+        self.build(names_only=True)
+        self.told(one, two)
+        self.assertEqual(self.build(), (2, 0))
+        three = self.write("c/book.txt", self.bravo, when=1_800_000_000)
+        four = self.write("d/book.txt", self.alpha, when=1_800_000_000)
+        self.read.clear()
+        with patch.dict(os.environ, {"SHELFFIND_TEST_TWIN_SILENT": "1"}):
+            self.assertEqual(self.build(), (0, 0))          # two documents bear their samples: each is read in full
+        self.assertEqual(self.read, [])
+        for word, pair in (("BRAVO", {str(two), str(three)}), ("ALPHA", {str(one), str(four)})):
+            found = search(self.db, word)
+            self.assertEqual({found[0]["path"], *found[0]["copies"]}, pair)
+
     def test_the_storage_of_the_folder_tells_them_apart_before_they_are_joined(self):
         self.twin()
         one = self.write("a/book.txt", self.alpha)
