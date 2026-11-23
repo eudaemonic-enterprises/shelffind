@@ -41,13 +41,17 @@ def marked(text, ranges, role, hot="match"):
     return out
 
 
-def results(hits, theme, links=True):
+def results(hits, theme, links=True, home=""):
     """Lines of `search --list` at a terminal: each address can be clicked where the terminal
-    follows links, and the words of the query are lit in the passage."""
+    follows links, and the words of the query are lit in the passage. An address under `home`
+    is written with ~, which a shell understands; its link keeps the full address."""
     for hit in hits:
         if hit["source"] == "files":
             label = theme.render([((hit.get("format") or "file").ljust(5), format_role(hit))])
-            address = theme.render([(safe(hit["path"]), "text")])
+            shown = safe(hit["path"])
+            if home and shown.startswith(home.rstrip("/") + "/"):
+                shown = "~" + shown[len(home.rstrip("/")):]
+            address = theme.render([(shown, "text")])
             if links:
                 address = LINK.format(Path(hit["path"]).as_uri()) + address + UNLINK
             yield f"{label} {address}"

@@ -154,7 +154,7 @@ def find(args, db, directory, settings):
     if args.json:
         print(json_text(hits))
     elif sys.stdout.isatty():
-        for line in report.results(hits, look(settings, sys.stdout)):
+        for line in report.results(hits, look(settings, sys.stdout), home=os.path.expanduser("~")):
             print(line)
     else:
         for line in listing(hits, False):

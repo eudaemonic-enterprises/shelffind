@@ -6,6 +6,24 @@ ShelfFind follows semantic versioning. Before version 1.0 a minor version may ch
 JSON keys and the exit codes that other programs rely on are kept from one version to the next and
 are covered by tests.
 
+## 0.2.1
+
+The second half of the panel's comfort. Ctrl-O lists the passages of the chosen document in the
+order of its pages; Enter opens the viewer at the chosen page, and Ctrl-O again shows the page
+itself in the panel, where the arrows scroll it and PgUp and PgDn turn the pages. Ctrl-X lists
+what can be done with a result. The nine best rows carry their rank, and Alt with that digit opens
+one at once.
+
+Filters can be typed among the words of a query, in the panel and on the command line alike:
+`ext:djvu`, `in:Books` (a registered folder by its name, or any part of a path), `src:NAME`, and
+`-word` to drop the files whose name or path contains the word. A quoted phrase is never a filter.
+
+At a terminal, `status` prints one row per folder with a bar for the text at hand, `index` follows
+the documents on one line rewritten in place, and `search --list` colours its results, lights the
+words of the query and makes each address a link. A pipe receives the same plain forms as before.
+The letters lit in a name written in CamelCase follow its words. The key binding at the prompt is
+written for bash; zsh and fish follow.
+
 ## 0.2.0
 
 The search no longer leaves the terminal. It opens as a band of lines under the prompt, on the

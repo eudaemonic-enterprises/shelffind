@@ -28,6 +28,7 @@ Find
   shelffind search --where name WORDS         names and folders only (--where text: passages only)
   shelffind search --format djvu --root Books WORDS
   shelffind search --exact '"exact phrase"'   whole words, no spelling help
+  shelffind search --list 'tide ext:djvu in:Books -draft'    filters typed in the query
   shelffind pick [WORDS]                      the panel; prints the chosen address (exit 1: none)
 
 Open
@@ -49,6 +50,7 @@ Settings and checks
 
 In the panel
   Enter open at the page  ·  Tab address  ·  Ctrl-R everything, names, passages  ·  F1 keys
+  Ctrl-O passages of the document, again to read the page  ·  Ctrl-X actions  ·  Alt-1..9 open
   Ctrl-P earlier search  ·  F2 open with  ·  F3 show in the file manager  ·  Ctrl-Y copy
   F4 folder  ·  F5 format  ·  F6 source  ·  Esc leave
 

@@ -27,13 +27,18 @@ The first pass lists every regular file. The second reads supported documents on
 | Enter | Open the document, at the page of the passage where the viewer accepts one |
 | Tab | Leave with the address of the document: printed, or put on the command line by the key binding |
 | Ctrl-R | Search everything, names only, or passages only |
+| Ctrl-O | List the passages of the chosen document in the order of its pages; again, read the page in the panel |
+| Ctrl-X | List what can be done with the chosen result |
 | Up, Down, PgUp, PgDn | Move in the list; the best match is next to the prompt |
+| Alt-1 to Alt-9 | Open one of the nine best results at once; each row shows its rank |
 | Ctrl-P, Ctrl-N | Earlier and later searches |
 | F2, F3, Ctrl-Y | Open with another application, show in the file manager, copy the address |
 | F4, F5, F6 | One folder, one format, one source, or all |
 | F1, Esc | The keys, leave |
 
 The query is edited as a line: the arrows, Home and End move the cursor, Ctrl-W removes a word, Ctrl-U what precedes the cursor, and pasted text is taken as typed. Fuzzy matching is built in. It handles prefixes, abbreviations, omitted letters, and adjacent transpositions. Exact name and path matches appear first, and a third of the list is kept for passages when names would fill it alone. Enclose a phrase in double quotes for an exact phrase.
+
+Filters can be typed among the words of a query: `ext:djvu` keeps one format, `in:Books` a registered folder by its name or any part of a path, `src:catalogue` one source, and `-draft` drops the files whose name or path contains the word. So `tide ext:pdf in:charts -draft` reads as it is written. While a page is read in the panel, the arrows scroll it, PgUp and PgDn turn the pages, and Enter opens the viewer at that page.
 
 A key at the prompt opens the panel from bash. Add `eval "$(shelffind init bash)"` to `~/.bashrc`; Ctrl-T then opens the panel, Enter opens the chosen document and Tab puts its quoted address on the command line. `shelffind init bash --key alt-f` chooses another key, and `shelffind completion bash` prints completion of the commands. In a script, `shelffind pick` prints the address of the chosen document and exits with 1 when nothing was chosen.
 
@@ -50,7 +55,7 @@ shelffind index --retry
 shelffind index --ocr --lang eng+fra
 ```
 
-With `--list` or `--json`, or when the output is not a terminal, no panel opens. Passage results include a snippet and the file page when available. Use `--exact` for whole words without spelling expansion. Piped output is plain text. `--json` adds machine-readable fields. Names and passages are untrusted text: control characters are removed from what a terminal shows and escaped in JSON. `shelffind cheatsheet` prints a one-screen reference, and the end of `shelffind --help` lists the exit codes and the keys of the JSON for programs that call ShelfFind.
+With `--list` or `--json`, or when the output is not a terminal, no panel opens. Passage results include a snippet and the file page when available. Use `--exact` for whole words without spelling expansion. The filters of the panel work here too; quote a query that contains `-word`, as in `shelffind search --list 'tide -draft'`. At a terminal `search --list` colours its results and makes each address a link, `status` prints one row per folder with a bar for the text at hand, and `index` follows the documents on a single line. Piped output is plain text. `--json` adds machine-readable fields. Names and passages are untrusted text: control characters are removed from what a terminal shows and escaped in JSON. `shelffind cheatsheet` prints a one-screen reference, and the end of `shelffind --help` lists the exit codes and the keys of the JSON for programs that call ShelfFind.
 
 ## Settings
 
