@@ -34,6 +34,8 @@ class Model:
     passages: list = field(default_factory=list)
     passage: int = 0
     reading: dict | None = None          # the page being read: part, page, section, text, parts
+    back: str = "passages"               # where leaving the page leads
+    offers: dict = field(default_factory=dict)      # source -> {action: label}, as the sources declare
     scroll: int = 0                      # first line of the page shown
     history: list = field(default_factory=list)     # earlier searches, newest first
     recalled: int = -1
@@ -176,12 +178,14 @@ def update(model, event, keymap):
     if model.mode == "reading":
         page = model.reading
         if action in ("quit", "passages"):
-            model.mode = "passages"
+            model.mode = model.back
         elif action in ("up", "down"):
             model.scroll = max(0, model.scroll + step)
-        elif action in ("page-up", "page-down"):
+        elif action in ("page-up", "page-down") and model.back == "passages":
             return [("read", model.document, page["part"] + (1 if action == "page-down" else -1))]
-        elif action == "open":
+        elif action in ("page-up", "page-down"):
+            model.scroll = max(0, model.scroll + step)
+        elif action == "open" and model.back == "passages":
             return [("open", {**model.document, "page": page["page"], "snippet": None, "marks": []})]
         elif action in ("address", "reveal", "copy"):
             return [(action, model.document)]
@@ -201,6 +205,11 @@ def update(model, event, keymap):
         model.actions = [("Open", ("open", hit)), ("Open with another program", ("apps", hit)),
                          ("Show in the file manager", ("reveal", hit)), ("Copy the address", ("copy", hit)),
                          ("Give the address", ("address", hit)), ("List its passages", ("passages", hit))]
+        # What the source that knows this document offers besides.
+        record = hit.get("record") or ({"source": hit["source"], "actions": hit.get("actions") or []}
+                                       if hit["source"] != "files" else {"source": None, "actions": []})
+        labels = model.offers.get(record["source"], {})
+        model.actions += [(labels[name], ("act", hit, name)) for name in record["actions"] if name in labels]
         model.mode, model.action = "actions", 0
         return []
     if action == "passages" and model.hit():

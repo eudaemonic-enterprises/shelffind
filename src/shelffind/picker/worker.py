@@ -9,6 +9,9 @@ from dataclasses import dataclass
 from .. import sources, store
 
 
+PAUSE = 0.12            # seconds without a new letter before the outside sources are asked
+
+
 @dataclass(frozen=True)
 class Reply:
     version: int
@@ -50,7 +53,8 @@ class Searches:
 
                 db.set_progress_handler(cancelled, 2000)
                 try:
-                    sources.find(db, self.directory, query, options, publish, cancelled)
+                    # In the panel a source is asked only once the typing has paused.
+                    sources.find(db, self.directory, query, {**options, "pause": PAUSE}, publish, cancelled)
                 except sources.Cancelled:
                     continue
                 except (sqlite3.Error, ValueError) as error:

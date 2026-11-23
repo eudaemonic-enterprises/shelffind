@@ -42,6 +42,7 @@ class Look:
     unicode: bool = True
     home: str = ""                       # written as ~ in addresses
     keys: tuple = ()                     # (action, keys) pairs, for the hints and the help
+    slow: tuple = ()                     # the places whose files come through a network
 
     def sign(self, name):
         return SIGNS[self.unicode][name]
@@ -152,9 +153,10 @@ def format_role(hit):
 
 
 def crumbs(hit, look):
-    """Where a result lives: its folders for a file, its byline for a record of a source."""
+    """Where a result lives: its folders for a file; for a record of a source, what its title
+    does not say already."""
     if hit["source"] != "files":
-        parts = [hit.get("byline"), hit.get("availability")]
+        parts = [hit.get("venue") if hit.get("title") else hit.get("byline"), hit.get("availability")]
         return look.sign("dot").join(safe(p) for p in parts if p)
     try:
         inner = Path(hit["path"]).relative_to(hit["root"]).parent.parts
@@ -164,11 +166,24 @@ def crumbs(hit, look):
 
 
 def title(hit):
+    """What names a result on its row: the work when a record tells it (authors, year, title),
+    else the name of the file without its extension."""
+    if hit.get("title"):
+        lead, year = clip(safe(hit.get("byline") or ""), 30), str(hit.get("year") or "")
+        if year and year not in lead:
+            lead = f"{lead} ({year})" if lead else f"({year})"
+        return (lead + " " if lead else "") + safe(hit["title"])
     name = safe(hit["name"])
     kind = hit.get("format") or ""
     if hit["source"] == "files" and kind and name.lower().endswith("." + kind):
         name = name[:-len(kind) - 1]
     return name
+
+
+def page_mark(item):
+    """The page of a passage as it is printed on the page when that is known, else as counted."""
+    shown = item.get("page_label") or item.get("page")
+    return f"p. {safe(str(shown))}" if shown else ""
 
 
 def label(hit):
@@ -182,7 +197,7 @@ def row(hit, chosen, model, look, width, label_room=4, rank=0):
     first = (look.sign("marker") + " ", "marker") if chosen else \
         (f"{rank} " if 0 < rank < 10 else "  ", "hint")
     lead = [first, (clip(label(hit), label_room, "").ljust(label_room + 2), format_role(hit))]
-    where = (f"p. {hit['page']}" if hit.get("page") else "").rjust(8)
+    where = clip(page_mark(hit), 8).rjust(8)
     room = width - width_of(lead) - cells(where)
     name = title(hit)
     try:
@@ -254,7 +269,7 @@ def listing(model, look, width, rows):
 def place(item):
     """Where a passage is: its page, else its section, else its rank in the document."""
     if item.get("page"):
-        return f"p. {item['page']}"
+        return page_mark(item)
     return safe(item["section"]) if item.get("section") else f"part {item['part']}"
 
 
@@ -396,13 +411,20 @@ def preview(model, look, width, rows):
             if hit.get("mtime"):
                 stamp = time.localtime(hit["mtime"] / 1e9)
                 facts.append(time.strftime("%Y-%m-%d", stamp))
+            if hit.get("copies"):
+                facts.append(f"{len(hit['copies']) + 1} copies")
+            if hit.get("fast") and any(hit["path"].startswith(slow) for slow in look.slow):
+                facts.append("a copy on this disk")
         else:
             address = look.sign("dot").join(safe(p) for p in (hit["source"], hit.get("byline"),
                                                                 hit.get("availability")) if p)
         facts.append(safe(hit.get("match") or ""))
+        if hit.get("notes"):
+            facts.append(f"{hit['notes']} note{'s' * (hit['notes'] != 1)}")
+        warnings = look.sign("dot").join(safe(flag) for flag in hit.get("flags") or [])
         passage_rows = max(0, rows - 2) if rows >= 3 else (1 if rows == 2 else 0)
         if hit.get("snippet") and passage_rows:
-            label = [(f"p. {hit['page']}  ", "page")] if hit.get("page") else []
+            label = [(page_mark(hit) + "  ", "page")] if hit.get("page") else []
             text = [(safe(piece), role)
                     for piece, role in marked(hit["snippet"], hit.get("marks") or [], "passage")]
             indent = width_of(label)
@@ -411,7 +433,8 @@ def preview(model, look, width, rows):
         if len(lines) < rows:
             lines.append([(clip_start(address, inner, look.sign("dots")), "path")])
         if len(lines) < rows:
-            lines.append([(clip(look.sign("dot").join(f for f in facts if f), inner, look.sign("dots")), "muted")])
+            told = clip(look.sign("dot").join(f for f in facts if f), inner, look.sign("dots"))
+            lines.append([(told, "muted")] + ([(look.sign("dot"), "muted"), (warnings, "warning")] if warnings else []))
     lines = lines[:rows] + [[]] * (rows - len(lines))
     return [(gutter + line, None) for line in lines]
 

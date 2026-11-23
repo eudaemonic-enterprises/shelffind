@@ -311,6 +311,51 @@ class Frames(unittest.TestCase):
         press(model, "esc")
         self.assertEqual(model.mode, "search")
 
+    def test_a_file_known_to_a_source_shows_the_work_and_what_the_source_says(self):
+        merged = {**hit("scan-0042.pdf", "Waves", page=380, match="passage", marks=[(4, 14)],
+                        snippet="the dispersion relation gives the group velocity"),
+                  "title": "Linear and Nonlinear Waves", "byline": "G. B. Whitham", "year": "1974",
+                  "page_label": "363", "copies": ["/lib/Desk/scan-0042.pdf"], "fast": "/var/library/9f2c.pdf",
+                  "flags": ["unverified"], "notes": 2,
+                  "record": {"source": "library", "id": "W1", "actions": ["cite", "notes", "unknown"]}}
+        only = {"path": None, "root": None, "name": "Waves in Fluids", "title": "Waves in Fluids", "format": "pdf",
+                "byline": "J. Lighthill", "year": 1978, "venue": "Cambridge University Press", "match": "bibliography",
+                "page": None, "section": None, "snippet": None, "marks": [], "size": None, "mtime": None,
+                "source": "library", "id": "W2", "actions": ["cite"], "availability": "published full text"}
+        model = self.model(results=[merged, only], query="whitham dispersion", caret=18)
+        model.offers = {"library": {"cite": "Copy the citation key", "notes": "Show the notes"}}
+        look = Look(preview=3, keys=tuple(KEYS.items()), home="/lib", slow=("/lib/",))
+        self.assertEqual(plain(frame(model, 100, 8, look)), [
+            "",
+            "ShelfFind  39 033 files · library                 enter open · tab address · ctrl-r scope · f1 keys",
+            "2 library  J. Lighthill (1978) Waves in Fluids               Cambridge University Press · …",
+            "▌ pdf      G. B. Whitham (1974) Linear and Nonlinear Waves   Books › Waves                   p. 363",
+            "[ ALL ] whitham dispersion                                                           1 of 2 · 18 ms",
+            "│ p. 363  the dispersion relation gives the group velocity",
+            "│ ~/Books/Waves/scan-0042.pdf",
+            "│ 1.2 MB · 2023-11-14 · 2 copies · a copy on this disk · passage · 2 notes · unverified",
+        ])
+        lines = frame(model, 100, 8, look)
+        self.assertIn(("Whitham", "match"), lines[3][0])            # the words typed are lit in the title too
+        self.assertIn(("unverified", "warning"), lines[7][0])
+        elsewhere = plain(frame(model, 100, 8, self.look))          # a shelf on a disk: nothing to remark
+        self.assertEqual(elsewhere[-1], "│ 1.2 MB · 2023-11-14 · 2 copies · passage · 2 notes · unverified")
+
+        press(model, "ctrl-x")
+        self.assertEqual([text for text, _ in model.actions][-2:], ["Copy the citation key", "Show the notes"])
+        self.assertEqual(press(model, *["down"] * 7, "enter"), [("act", merged, "notes")])
+        model.selected = 1
+        press(model, "ctrl-x")
+        self.assertEqual(model.actions[-1], ("Copy the citation key", ("act", only, "cite")))
+        press(model, "esc")
+        # A text shown by a source is read like a page, and leaving it returns to the list.
+        model.document, model.mode, model.back, model.scroll = merged, "reading", "search", 0
+        model.reading = {"part": 1, "page": None, "section": "Notes", "parts": 1, "text": "A note.\n" * 40}
+        self.assertEqual(press(model, "pgdn", "enter"), [])
+        self.assertGreater(model.scroll, 0)
+        press(model, "esc")
+        self.assertEqual(model.mode, "search")
+
     def test_the_nine_best_rows_carry_their_rank(self):
         lines = frame(self.model(), 80, 10, self.look)
         self.assertEqual(lines[4][0][0], ("2 ", "hint"))

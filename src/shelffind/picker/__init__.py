@@ -1,5 +1,6 @@
 # Copyright 2026 Eudaemonic Enterprises Inc.
 """The search panel: a band under the prompt, in the terminal's ordinary screen."""
+import json
 import locale
 import os
 import shlex
@@ -18,7 +19,7 @@ from ..tui.keys import Key
 from .legacy import picker                      # the earlier full-screen screen, kept as a fallback
 from .model import Model, update
 from .view import Look, frame
-from .worker import Searches
+from .worker import Reply, Searches
 
 __all__ = ["panel", "picker"]
 
@@ -51,6 +52,7 @@ def prepare(db, directory, query, options, settings):
     except (OSError, ValueError):
         pass            # the first answer of a search carries the fault of the configuration
     model.history = history.queries(directory)
+    model.offers = sources.offers(directory)
     return model
 
 
@@ -60,9 +62,10 @@ def panel(db, directory, query, options, settings, enter="open", quote=False, wi
     panel was left without a choice, 130 on Ctrl-C."""
     theme = style.theme(settings["panel.theme"], settings.tables["theme"], os.environ)
     keymap = settings.keymap()
+    slow = store.slow_mounts()
     look = Look(preview=settings["panel.preview"], help=settings["panel.help"],
                 unicode=unicode_signs(settings), home=os.path.expanduser("~"),
-                keys=tuple((action, settings[f"keys.{action}"]) for action in KEYS))
+                keys=tuple((action, settings[f"keys.{action}"]) for action in KEYS), slow=tuple(slow))
     model = prepare(db, directory, query, options, settings)
     terminal = Terminal(paste=not widget)
     app = App(terminal, settings.height(terminal.size()[1]), suspendable=not widget)
@@ -70,8 +73,21 @@ def panel(db, directory, query, options, settings, enter="open", quote=False, wi
     result = {"code": 1, "text": "", "trace": ""}
     viewers = settings.tables["open"]
 
+    def place(hit, fastest=False):
+        """Where a result is: its file, or the address of its record. To open a document, the
+        copy on a disk of this machine is preferred to one that comes through a network."""
+        path = hit.get("path")
+        if path and hit["source"] != "files" and not os.path.isfile(path):
+            path = None                             # the copy of the source has gone since the search
+        if path:
+            quick = hit.get("fast")
+            if fastest and quick and os.path.isfile(quick) and not store.at_hand(path, slow):
+                return {"path": quick}
+            return {"path": path}
+        return sources.resolve(directory, hit["source"], hit.get("id") or hit["path"])
+
     def address(hit):
-        target = sources.resolve(directory, hit["source"], hit.get("id") or hit["path"])
+        target = place(hit)
         return target.get("path") or target["uri"]
 
     def work(action, hit, application=None):
@@ -81,7 +97,12 @@ def panel(db, directory, query, options, settings, enter="open", quote=False, wi
                 text = address(hit)
                 app.post(Done(action, hit, text=text))
                 return
-            target = sources.resolve(directory, hit["source"], hit.get("id") or hit["path"])
+            if action == "act":
+                name, identifier = sources.record_of(hit)
+                told = sources.question(directory, name, "act", id=identifier, action=application)
+                app.post(Done(action, hit, text=json.dumps(told)))
+                return
+            target = place(hit, fastest=action in ("open", "launch"))
             path = target.get("path")
             if not path:
                 if action != "open":
@@ -122,6 +143,20 @@ def panel(db, directory, query, options, settings, enter="open", quote=False, wi
             used = desktop.copy(done.text, terminal.write)
             model.message = "Address copied" if used else "No clipboard could be reached"
             return False
+        if done.action == "act":
+            told = json.loads(done.text)
+            if told["result"] == "copy":
+                used = desktop.copy(told["text"], terminal.write)
+                model.message = f"Copied: {told['text']}" if used else "No clipboard could be reached"
+            elif told["result"] == "open":
+                desktop.open_uri(told["uri"])
+            elif told["result"] == "show":
+                model.document, model.back, model.scroll, model.mode = done.hit, "search", 0, "reading"
+                model.reading = {"part": 1, "page": None, "section": told.get("title"), "text": told["text"],
+                                 "parts": 1}
+            else:
+                model.message = told["text"]
+            return False
         if settings["history.record"]:
             history.record(directory, done.action, model.query, done.hit, done.hit.get("page"))
         if done.action == "address":
@@ -136,22 +171,39 @@ def panel(db, directory, query, options, settings, enter="open", quote=False, wi
         return False
 
     def list_passages(hit):
-        """Ctrl-O: the passages of the chosen document, the one of the result selected first."""
-        if hit["source"] != "files":
-            model.message = "Passages are listed for the files of the folders"
-            return
-        found = search.passages_of(db, hit, split(model.query).words, model.options.get("exact", False))
+        """Ctrl-O: the passages of the chosen document, the one of the result selected first.
+        The text read by ShelfFind is searched first, then the text its source holds."""
+        words, exact = split(model.query).words, model.options.get("exact", False)
+        found = []
+        if hit["source"] == "files":
+            found = search.passages_of(db, hit, words, exact) or search.passages_of(db, hit, "")
         if not found:
-            found = search.passages_of(db, hit, "")         # no match in the text: every page
+            try:
+                found = sources.passages(db, directory, hit, words, exact) or \
+                    sources.passages(db, directory, hit, "")
+            except (OSError, ValueError) as fault:
+                model.message = str(fault)
+                return
         if not found:
             model.message = "No text of this document has been read yet"
             return
-        model.document, model.passages, model.mode = hit, found, "passages"
+        model.document, model.passages, model.mode, model.back = hit, found, "passages", "passages"
         model.passage = next((i for i, item in enumerate(found) if item["page"] == hit.get("page")), 0)
+
+    def read_page(hit, part):
+        page = search.page_of(db, hit, part) if hit["source"] == "files" else None
+        if page is None:
+            try:
+                page = sources.page(directory, hit, part)
+            except (OSError, ValueError) as fault:
+                model.message = str(fault)
+        return page
 
     def handle(event):
         if isinstance(event, Done):
             return finished(event)
+        if isinstance(event, Reply):
+            model.offers = sources.offers(directory)    # a source just asked may have told its actions
         for effect in update(model, event, keymap):
             kind = effect[0]
             if kind == "quit":
@@ -165,11 +217,11 @@ def panel(db, directory, query, options, settings, enter="open", quote=False, wi
             elif kind == "passages":
                 list_passages(effect[1])
             elif kind == "read":
-                page = search.page_of(db, effect[1], effect[2])
+                page = read_page(effect[1], effect[2])
                 if page:
-                    model.reading, model.scroll, model.mode = page, 0, "reading"
-            elif kind == "launch":
-                start("launch", effect[1], effect[2])
+                    model.reading, model.scroll, model.mode, model.back = page, 0, "reading", "passages"
+            elif kind in ("launch", "act"):
+                start(kind, effect[1], effect[2])
             else:
                 start(kind, effect[1])
         return False

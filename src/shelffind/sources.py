@@ -374,3 +374,60 @@ def actions(directory, name):
         return {}
     return {action["name"]: (action["label"], action["result"])
             for action in abilities(directory, name, program)["actions"]}
+
+
+def offers(directory):
+    """The actions of every source as they are remembered, without asking anything: source ->
+    {name of the action: its label}."""
+    try:
+        known = json.loads((directory / REMEMBERED).read_text())
+        return {name: {action["name"]: action["label"] for action in entry["caps"]["actions"]}
+                for name, entry in known.items()}
+    except (OSError, ValueError, KeyError, TypeError, AttributeError):
+        return {}
+
+
+def record_of(hit):
+    """The source and the identifier under which a result is known to a source, or None."""
+    if hit.get("record"):
+        return hit["record"]["source"], hit["record"]["id"]
+    if hit["source"] != "files" and hit.get("id"):
+        return hit["source"], hit["id"]
+    return None
+
+
+def passages(db, directory, hit, query, exact=False, limit=200):
+    """The passages of one document as its source finds them, in the form `search.passages_of`
+    gives: with words, the passages that match; without, the beginning of its first pages."""
+    known = record_of(hit)
+    if known is None:
+        return []
+    name, identifier = known
+    program = registered(directory).get(name)
+    if not program or not abilities(directory, name, program)["text"]:
+        return []
+    parts = query_terms(query)
+    if parts:
+        terms = [{"text": t, "literal": literal, "alternatives": [] if literal or exact else fuzzy.spellings(db, t)}
+                 for t, literal in parts]
+        found = question(directory, name, "search", query=query, terms=terms, exact=exact, where="text",
+                         format=None, limit=limit, within=identifier, budget_ms=2000)["results"]
+        return [{"part": item.get("page") or index, "page": item.get("page"), "page_label": item.get("page_label"),
+                 "section": item.get("section"), "snippet": item.get("snippet") or "", "marks": item.get("marks") or []}
+                for index, item in enumerate(found, 1)]
+    told = question(directory, name, "pages", id=identifier, first=1, count=min(limit, 40))
+    return [{"part": page["page"], "page": page["page"], "page_label": page.get("label"), "section": None,
+             "snippet": " ".join(page["text"].split())[:240], "marks": []} for page in told["pages"]]
+
+
+def page(directory, hit, part):
+    """One page of a document as its source holds it, in the form `search.page_of` gives."""
+    known = record_of(hit)
+    if known is None or part < 1:
+        return None
+    told = question(directory, known[0], "pages", id=known[1], first=part, count=1)
+    if not told["pages"]:
+        return None
+    found = told["pages"][0]
+    return {"part": part, "page": found["page"], "page_label": found.get("label"), "section": None,
+            "text": found["text"], "parts": told.get("total") or part}
