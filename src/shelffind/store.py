@@ -313,6 +313,46 @@ def document_for(db, rel, name, size, mtime, fmt):
     return new_document(db, key, size, fmt)
 
 
+def merge(db, one, other):
+    """Two documents turned out to be the same: make them one and return it. The document that
+    was read is kept, and the files, the keys and the records of the other go to it. The caller
+    holds the transaction."""
+    if one == other:
+        return one
+    rank = {"indexed": 0, "needs-ocr": 1, "ocr-error": 2, "covered": 3, "error": 4, "pending": 5, "name-only": 6}
+    states = dict(db.execute("SELECT id,state FROM docs WHERE id IN (?,?)", (one, other)).fetchall())
+    keep, drop = sorted((one, other), key=lambda doc: (rank.get(states.get(doc), 9), doc))
+    db.execute("UPDATE files SET doc=? WHERE doc=?", (keep, drop))
+    db.execute("UPDATE OR IGNORE doc_keys SET doc=? WHERE doc=?", (keep, drop))
+    db.execute("UPDATE OR IGNORE records SET doc=? WHERE doc=?", (keep, drop))
+    db.execute("DELETE FROM pages WHERE doc=?", (drop,))
+    db.execute("DELETE FROM docs WHERE id=?", (drop,))
+    return keep
+
+
+def slow_mounts():
+    """The places of this machine whose files come through a network or a program, not from a
+    disk: a document there opens after a wait."""
+    found = []
+    try:
+        with open("/proc/self/mountinfo", encoding="utf-8", errors="replace") as table:
+            for line in table:
+                left, _, right = line.partition(" - ")
+                kind = (right.split() or [""])[0]
+                if kind == "fuse" or kind.startswith(("fuse.", "nfs", "cifs", "smb", "davfs", "sshfs", "9p", "ceph")):
+                    place = left.split()[4]
+                    found.append(re.sub(r"\\([0-7]{3})", lambda m: chr(int(m.group(1), 8)), place).rstrip("/") + "/")
+    except (OSError, IndexError):
+        pass
+    return found
+
+
+def at_hand(path, slow=None):
+    """True when `path` is on a disk of this machine."""
+    slow = slow_mounts() if slow is None else slow
+    return not any(str(path).startswith(place) for place in slow)
+
+
 def forget_orphans(db):
     """Drop the small documents that no file points at any more: their identity includes their
     address, so nothing can find them again. A larger document stays, with its text, for the

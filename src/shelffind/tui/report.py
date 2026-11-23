@@ -7,7 +7,7 @@ from ..text import safe
 from .width import cells, clip, clip_start
 
 LINK, UNLINK = "\x1b]8;;{}\x1b\\", "\x1b]8;;\x1b\\"
-STATES = {"read": ("indexed", "needs-ocr"), "waiting": ("pending",), "scans": ("needs-ocr",),
+STATES = {"read": ("indexed", "needs-ocr", "covered"), "waiting": ("pending",), "scans": ("needs-ocr",),
           "problems": ("error", "ocr-error")}
 
 

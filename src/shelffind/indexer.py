@@ -6,7 +6,7 @@ from pathlib import Path
 from xml.etree.ElementTree import ParseError
 from zipfile import BadZipFile
 
-from . import extract, fuzzy, store
+from . import extract, fuzzy, link, store
 
 READ_ERRORS = (OSError, ValueError, KeyError, RuntimeError, EOFError, subprocess.TimeoutExpired,
                BadZipFile, ParseError)
@@ -32,15 +32,6 @@ def fingerprint(path):
             source.seek(size - BLOCK)
             digest.update(source.read(BLOCK))
     return f"fp:{size}:{digest.hexdigest()[:32]}"
-
-
-def merge(db, keep, drop):
-    """Two documents turned out to be one: the files and the keys of `drop` go to `keep`."""
-    with db:
-        db.execute("UPDATE files SET doc=? WHERE doc=?", (keep, drop))
-        db.execute("UPDATE OR IGNORE doc_keys SET doc=? WHERE doc=?", (keep, drop))
-        db.execute("DELETE FROM pages WHERE doc=?", (drop,))
-        db.execute("DELETE FROM docs WHERE id=?", (drop,))
 
 
 def settle(db, root, progress):
@@ -81,7 +72,8 @@ def update_text(db, root, row, ocr, languages):
         key = fingerprint(path)
         other = db.execute("SELECT doc FROM doc_keys WHERE key=?", (key,)).fetchone()
         if other and other["doc"] != doc:
-            merge(db, other["doc"], doc)
+            with db:
+                store.merge(db, other["doc"], doc)
             return False
         with db:
             db.execute("INSERT OR IGNORE INTO doc_keys(key,doc,basis) VALUES(?,?,'content')", (key, doc))
@@ -115,9 +107,10 @@ def update_text(db, root, row, ocr, languages):
 
 
 def build(db, directory, selected, *, names_only=False, ocr=False, languages="eng",
-          retry=False, limit=None, progress=print, paths=(), on_document=None):
-    """Refresh the inventory, then read the waiting documents. `progress(text)` receives the
-    messages; `on_document(done, total, name)` is called before each document is read."""
+          retry=False, limit=None, progress=print, paths=(), on_document=None, relink=False):
+    """Refresh the inventory, ask the sources which files they know, then read the waiting
+    documents. `progress(text)` receives the messages; `on_document(done, total, name)` is
+    called before each document is read; `relink` asks the sources about every file again."""
     done = failures = 0
     ready = []
     with store.index_lock(directory):
@@ -131,6 +124,7 @@ def build(db, directory, selected, *, names_only=False, ocr=False, languages="en
                     db.execute("UPDATE roots SET problem=? WHERE id=?", (str(exc), root["id"]))
                 progress(str(exc))
                 failures += 1
+        link.link(db, directory, ready, progress, everything=relink)
         if names_only:
             return done, failures
         # A pass takes a snapshot of its queue so failures cannot retry in a tight loop.

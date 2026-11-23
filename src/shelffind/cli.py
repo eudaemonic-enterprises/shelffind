@@ -197,7 +197,8 @@ def find(args, db, directory, settings):
     if problem:
         print(safe(problem), file=sys.stderr)
     if args.json:
-        print(json_text(hits))
+        # The number of a document inside the index means nothing outside it.
+        print(json_text([{key: value for key, value in hit.items() if key != "doc"} for hit in hits]))
     elif sys.stdout.isatty():
         for line in report.results(hits, look(settings, sys.stdout), home=os.path.expanduser("~")):
             print(line)
