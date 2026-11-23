@@ -10,6 +10,18 @@ from shelffind import indexer, store
 from shelffind.cli import main
 
 
+def run_main(data, *argv):
+    """Run the command line in this process on the data folder `data`: exit code, standard
+    output, standard error."""
+    out, err = io.StringIO(), io.StringIO()
+    with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+        try:
+            code = main(["--data-dir", str(data), *argv])
+        except SystemExit as stop:
+            code = stop.code
+    return code, out.getvalue(), err.getvalue()
+
+
 class Shelf(unittest.TestCase):
     """One registered folder, `Reading Room`, with its own private index."""
 
@@ -29,13 +41,7 @@ class Shelf(unittest.TestCase):
 
     def run_cli(self, *argv):
         """Run the command line in this process: exit code, standard output, standard error."""
-        out, err = io.StringIO(), io.StringIO()
-        with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
-            try:
-                code = main(["--data-dir", str(self.data), *argv])
-            except SystemExit as stop:
-                code = stop.code
-        return code, out.getvalue(), err.getvalue()
+        return run_main(self.data, *argv)
 
     def fake_tool(self, name, script):
         """Put a shell script called `name` in a folder and return that folder, for PATH."""

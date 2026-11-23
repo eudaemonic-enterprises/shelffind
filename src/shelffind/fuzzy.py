@@ -3,10 +3,16 @@
 
 The known words come in two tiers. The words of names and folders are all kept. A word of the
 text is offered as a spelling only once two documents contain it, which leaves out the misprints
-of scans, by far the most numerous words of a large collection.
+of scans, by far the most numerous words of a large collection. Among the words offered, those
+of names and those that many documents contain are searched first, so that a slip of the hand
+is corrected into the usual word and not into a rare neighbour.
 """
 import re
 import unicodedata
+
+SMALL_VOCABULARY = 250_000      # below this many known words, every word may be a spelling
+COMMON = 16                     # a word of the text is common once this many documents hold it
+CANDIDATES = 200                # words compared with the misspelt one, per index
 
 
 def fold(text):
@@ -18,28 +24,66 @@ def words(text):
     return re.findall(r"[^\W_]+", fold(text))
 
 
-def grams(word):
+def pieces(word, n):
     padded = "0" + word + "0"
-    n = 2 if len(word) <= 5 else 3
-    keys = {padded[i:i + n] for i in range(len(padded) - n + 1)}
-    # Shared boundary bigrams also find neighbours across the 5/6-letter cutoff.
-    keys.update((padded[:2], padded[-2:]))
+    return {padded[i:i + n] for i in range(len(padded) - n + 1)}
+
+
+def grams(word):
+    """What the spelling index holds for a word: its pairs of letters when it is short, its
+    triples when it is long, and both for five and six letters, so that a word is found from
+    a misspelling one letter shorter or longer on either side of that limit."""
+    keys = set()
+    if len(word) <= 6:
+        keys |= pieces(word, 2)
+    if len(word) >= 5:
+        keys |= pieces(word, 3)
     return " ".join(sorted(keys))
 
 
-SMALL_VOCABULARY = 250_000      # below this many known words, every word may be a spelling
+def size(word):
+    return f"len{min(len(word), 49)}"
 
 
-def list_words(db):
-    """Enter into the spelling index the words that have just become eligible: the words of
-    names, the words that two documents contain, and every word while the collection is small
-    enough for the misprints of scans not to matter."""
+def remember(db, found, tier):
+    """Enter words among the known ones, then into the spelling indexes those that have become
+    eligible: the words of names, the words that two documents contain, and every word while the
+    collection is small enough for the misprints of scans not to matter. The cost follows the
+    number of words given, never the number of words known."""
+    if not found:
+        return
+    db.execute("CREATE TEMP TABLE IF NOT EXISTS arriving(term TEXT PRIMARY KEY) WITHOUT ROWID")
+    db.execute("DELETE FROM arriving")
+    db.executemany("INSERT INTO arriving VALUES(?)", ((word,) for word in sorted(found)))
+    change = "tier=0" if tier == 0 else "df=df+1"
+    db.execute("INSERT INTO words(term,tier,df) SELECT term,?,1 FROM arriving WHERE true "
+               f"ON CONFLICT(term) DO UPDATE SET {change}", (tier,))
+    mine = "term IN (SELECT term FROM arriving)"
+    ready = f"listed=0 AND {mine}"
+    if (db.execute("SELECT max(id) FROM words").fetchone()[0] or 0) >= SMALL_VOCABULARY:
+        ready += " AND (tier=0 OR df>=2)"
+    db.execute(f"INSERT INTO spelling(rowid,grams,size) SELECT id,word_grams(term),word_size(term) "
+               f"FROM words WHERE {ready}")
+    db.execute(f"UPDATE words SET listed=1 WHERE {ready}")
+    usual = f"listed=1 AND {mine} AND (tier=0 OR df>=?)"
+    db.execute(f"INSERT INTO common(rowid,grams,size) SELECT id,word_grams(term),word_size(term) "
+               f"FROM words WHERE {usual}", (COMMON,))
+    db.execute(f"UPDATE words SET listed=2 WHERE {usual}", (COMMON,))
+
+
+def relist(db):
+    """Build both spelling indexes again from the known words, by the same rules."""
+    ready = "(tier=0 OR df>=2)"
     if (db.execute("SELECT max(id) FROM words").fetchone()[0] or 0) < SMALL_VOCABULARY:
-        ready = db.execute("SELECT id,term FROM words WHERE listed=0").fetchall()
-    else:
-        ready = db.execute("SELECT id,term FROM words WHERE listed=0 AND (tier=0 OR df>=2)").fetchall()
-    db.executemany("INSERT INTO spelling(rowid,grams) VALUES(?,?)", ((row[0], grams(row[1])) for row in ready))
-    db.executemany("UPDATE words SET listed=1 WHERE id=?", ((row[0],) for row in ready))
+        ready = "true"
+    for index in ("spelling", "common"):
+        db.execute(f"INSERT INTO {index}({index}) VALUES('delete-all')")
+    db.execute(f"UPDATE words SET listed=CASE WHEN NOT {ready} THEN 0 WHEN tier=0 OR df>=? THEN 2 ELSE 1 END",
+               (COMMON,))
+    db.execute("INSERT INTO spelling(rowid,grams,size) SELECT id,word_grams(term),word_size(term) "
+               "FROM words WHERE listed>=1")
+    db.execute("INSERT INTO common(rowid,grams,size) SELECT id,word_grams(term),word_size(term) "
+               "FROM words WHERE listed=2")
 
 
 def remember_names(db, texts, known):
@@ -47,10 +91,7 @@ def remember_names(db, texts, known):
     pending = set()
     for text in texts:
         pending.update(w for w in words(text) if 3 <= len(w) <= 48 and w not in known)
-    db.executemany("INSERT INTO words(term,tier,df) VALUES(?,0,1) ON CONFLICT(term) DO UPDATE SET tier=0",
-                   ((w,) for w in sorted(pending)))
-    if pending:
-        list_words(db)
+    remember(db, pending, 0)
     if len(known) > 200_000:
         known.clear()
     known.update(pending)
@@ -62,10 +103,7 @@ def remember_text(db, texts):
     seen = set()
     for text in texts:
         seen.update(w for w in words(text) if 3 <= len(w) <= 24 and w.isalpha())
-    db.executemany("INSERT INTO words(term,tier,df) VALUES(?,1,1) ON CONFLICT(term) DO UPDATE SET df=df+1",
-                   ((w,) for w in sorted(seen)))
-    if seen:
-        list_words(db)
+    remember(db, seen, 1)
 
 
 def distance(a, b, bound):
@@ -88,18 +126,24 @@ def distance(a, b, bound):
 
 def spellings(db, term):
     """Up to five known words close to `term`: the closest first, then the words of names, then
-    the words that most documents contain."""
+    the words that most documents contain. The usual words are searched first, and the others
+    only when these give too little."""
     if not 3 <= len(term) <= 48 or term.isdigit():
         return []
     bound = 1 if len(term) < 7 else 2
-    match = " OR ".join(grams(term).split())
-    candidates = db.execute("SELECT w.term,w.tier,w.df FROM spelling JOIN words w ON w.id=spelling.rowid "
-                            "WHERE spelling MATCH ? ORDER BY rank LIMIT 64", (match,))
-    good = []
-    for word, tier, df in candidates:
-        if word == term:
-            continue
-        cost = distance(term, word, bound)
-        if cost <= bound:
-            good.append((cost, tier, -df, word))
-    return [entry[3] for entry in sorted(good)[:5]]
+    letters = " OR ".join(f'"{gram}"' for gram in sorted(pieces(term, 2 if len(term) <= 5 else 3)))
+    sizes = " OR ".join(f"len{n}" for n in range(max(1, len(term) - bound), min(49, len(term) + bound) + 1))
+    match = f"grams:({letters}) AND size:({sizes})"
+    good = {}
+    for index in ("common", "spelling"):
+        candidates = db.execute(
+            f"SELECT w.term,w.tier,w.df FROM {index} JOIN words w ON w.id={index}.rowid "
+            f"WHERE {index} MATCH ? ORDER BY bm25({index},1.0,0.0) LIMIT ?", (match, CANDIDATES))
+        for word, tier, df in candidates:
+            if word != term and word not in good:
+                cost = distance(term, word, bound)
+                if cost <= bound:
+                    good[word] = (cost, tier, -df, word)
+        if len(good) >= 5:
+            break
+    return [entry[3] for entry in sorted(good.values())[:5]]

@@ -4,7 +4,8 @@
 The new index is written beside the old one, in a file that takes its final name only when it
 is complete. The old index is read and never modified, except for one number at the very end
 that tells an earlier version of the program not to use it any more; it is deleted only on
-request. An interruption at any moment therefore leaves the old index as it was.
+request. An interruption at any moment therefore leaves the old index as it was, and the
+conversion is simply done again.
 """
 import fcntl
 import hashlib
@@ -17,6 +18,8 @@ from . import __version__, fuzzy, history, store
 from .config import portable
 
 RETIRED = 101           # the format number an old index receives once it has been converted
+# The better state wins when two copies of one document were read apart by the earlier version.
+BETTER = {"indexed": 0, "needs-ocr": 1, "ocr-error": 2, "error": 3, "pending": 4, "name-only": 5}
 
 
 def refuse_development(directory):
@@ -25,73 +28,101 @@ def refuse_development(directory):
                          "name another folder with --data-dir")
 
 
-def copy(old, new, directory, progress):
-    """Fill the new index from the old one, inside one transaction of the new index."""
-    names_taken, roots = set(), {}
-    for row in old.execute("SELECT * FROM roots ORDER BY id"):
-        name, number = Path(row["path"]).name or "root", 2
-        while name in names_taken:
-            name, number = f"{Path(row['path']).name}-{number}", number + 1
-        names_taken.add(name)
-        new.execute("INSERT INTO roots(id,name,path,mount,scanned,problem) VALUES(?,?,?,?,?,?)",
-                    (row["id"], name, portable(row["path"]), portable(row["mount"]), row["scanned"], row["problem"]))
-        roots[row["id"]] = Path(row["path"]).name
+def earlier(directory):
+    old = sqlite3.connect((directory / store.EARLIER).as_uri() + "?mode=ro", uri=True, timeout=60)
+    old.row_factory = sqlite3.Row
+    return old
 
+
+def copy(old, new, progress):
+    """Fill the new index from the old one, inside one transaction of the new index."""
+    folders = {}
+    for row in old.execute("SELECT * FROM roots ORDER BY id"):
+        new.execute("INSERT INTO roots(id,name,path,mount,scanned,problem) VALUES(?,?,?,?,?,?)",
+                    (row["id"], store.free_name(new, Path(row["path"]).name or "root"), portable(row["path"]),
+                     portable(row["mount"]), row["scanned"], row["problem"]))
+        folders[row["id"]] = Path(row["path"]).name
+
+    # The files: each joins the document that its size, date and format designate, exactly as
+    # the inventory would decide (`store.document_for`).
     total = old.execute("SELECT count(*) FROM files").fetchone()[0]
-    docs, doc_names, file_doc = {}, {}, {}
-    better = {"indexed": 0, "needs-ocr": 1, "ocr-error": 2, "error": 3, "pending": 4, "name-only": 5}
+    documents, names_of, document_of, donor = {}, {}, {}, {}
     known = set()
     for count, row in enumerate(old.execute("SELECT * FROM files ORDER BY id"), 1):
-        key = store.stamp_key(row["size"], row["mtime"], row["format"], row["rel"])
-        doc = docs.get(key)
-        if doc is not None and row["size"] >= store.SMALL and row["name"] not in doc_names[doc]:
+        key, basis = store.stamp_key(row["size"], row["mtime"], row["format"], row["rel"]), "stamp"
+        doc = documents.get(key)
+        if doc is not None and row["size"] >= store.SMALL and row["name"] not in names_of[doc]:
             key += ":" + hashlib.sha256(row["name"].encode("utf-8", "surrogateescape")).hexdigest()[:16]
-            doc = docs.get(key)
+            doc, basis = documents.get(key), "stamp and name"
         if doc is None:
             doc = new.execute("INSERT INTO docs(size,format,state,error) VALUES(?,?,?,?)",
                               (row["size"], row["format"], row["state"], row["error"])).lastrowid
-            new.execute("INSERT INTO doc_keys(key,doc,basis) VALUES(?,?,'stamp')", (key, doc))
-            docs[key], doc_names[doc] = doc, set()
-        else:
-            state = new.execute("SELECT state FROM docs WHERE id=?", (doc,)).fetchone()[0]
-            if better.get(row["state"], 9) < better.get(state, 9):
-                new.execute("UPDATE docs SET state=?,error=? WHERE id=?", (row["state"], row["error"], doc))
-        doc_names[doc].add(row["name"])
-        file_doc[row["id"]] = doc
+            new.execute("INSERT INTO doc_keys(key,doc,basis) VALUES(?,?,?)", (key, doc, basis))
+            documents[key], names_of[doc] = doc, set()
+            donor[doc] = (BETTER.get(row["state"], 9), row["id"])
+        elif BETTER.get(row["state"], 9) < donor[doc][0]:
+            new.execute("UPDATE docs SET state=?,error=? WHERE id=?", (row["state"], row["error"], doc))
+            donor[doc] = (BETTER.get(row["state"], 9), row["id"])
+        names_of[doc].add(row["name"])
+        document_of[row["id"]] = doc
         new.execute("INSERT INTO files(id,root,rel,name,folded,format,size,mtime,doc) VALUES(?,?,?,?,?,?,?,?,?)",
                     (row["id"], row["root"], row["rel"], row["name"], row["folded"], row["format"],
                      row["size"], row["mtime"], doc))
-        folder = str(Path(roots[row["root"]]) / Path(row["rel"]).parent)
+        folder = str(Path(folders[row["root"]]) / Path(row["rel"]).parent)
         terms = (store.terms_for_name(row["name"]), store.terms_for_name(folder))
         fuzzy.remember_names(new, terms, known)
         new.execute("INSERT INTO names(rowid,name,folder,title,byline) VALUES(?,?,?,'','')", (row["id"], *terms))
         if count % 5000 == 0:
             progress(f"Converting the index: {count:,} of {total:,} files")
 
-    filled, texts, current = set(), [], None
-    pages = old.execute("SELECT file,page,section,text,needs_ocr FROM pages ORDER BY file,id")
-    for count, row in enumerate(pages, 1):
-        doc = file_doc.get(row["file"])
-        if doc is None:
+    # The text: a document read through several copies keeps the pages of the copy whose
+    # reading went furthest.
+    texts, current, count = [], None, 0
+    for row in old.execute("SELECT file,page,section,text,needs_ocr FROM pages ORDER BY file,id"):
+        doc = document_of.get(row["file"])
+        if doc is None or donor[doc][1] != row["file"]:
             continue
         if row["file"] != current:
-            if texts:
-                fuzzy.remember_text(new, texts)
-            if current is not None:
-                filled.add(file_doc[current])
+            fuzzy.remember_text(new, texts)
             current, texts = row["file"], []
-        if doc in filled:               # another copy of the same document gave its text already
-            continue
         new.execute("INSERT INTO pages(doc,page,section,ztext,needs_ocr) VALUES(?,?,?,?,?)",
                     (doc, row["page"], row["section"], store.deflate(row["text"]), row["needs_ocr"]))
         texts.append(row["text"])
+        count += 1
         if count % 20000 == 0:
             progress(f"Converting the index: {count:,} pages of text")
-    if texts:
-        fuzzy.remember_text(new, texts)
+    fuzzy.remember_text(new, texts)
 
-    for row in old.execute("SELECT query,used FROM history ORDER BY used"):
-        history.record(directory, "search", row["query"], when=row["used"] // 1_000_000_000)
+
+def retire(directory):
+    """Mark the old index as converted, so that an earlier version of the program refuses it.
+    Returns False when it is busy; the mark is then put at a later start."""
+    try:
+        old = sqlite3.connect(directory / store.EARLIER, timeout=10)
+        try:
+            old.execute(f"PRAGMA user_version={RETIRED}")
+            old.commit()
+        finally:
+            old.close()
+        return True
+    except sqlite3.Error:
+        return False
+
+
+def finish(directory):
+    """What follows the appearance of the new index: the searches remembered by the old one
+    join the journal, and the old index is marked. Both may be repeated without harm."""
+    try:
+        old = earlier(directory)
+        try:
+            asked = [(row["used"] // 1_000_000_000, row["query"])
+                     for row in old.execute("SELECT query,used FROM history ORDER BY used")]
+        finally:
+            old.close()
+        history.absorb(directory, asked)
+    except sqlite3.Error:
+        pass
+    return retire(directory)
 
 
 def upgrade(directory, progress=lambda text: None, wait=20.0):
@@ -101,8 +132,10 @@ def upgrade(directory, progress=lambda text: None, wait=20.0):
     target = directory / store.INDEX
     with (directory / "migrate.lock").open("a") as lock:
         fcntl.flock(lock, fcntl.LOCK_EX)
-        if target.exists():
-            return target                       # another process did it in the meantime
+        if target.exists():                     # done already, perhaps by another process
+            if store.earlier_format(directory) == 1:
+                finish(directory)
+            return target
         if store.earlier_format(directory) != 1:
             return None
         refuse_development(directory)
@@ -120,36 +153,36 @@ def upgrade(directory, progress=lambda text: None, wait=20.0):
                     if time.monotonic() >= deadline:
                         progress("A reading of documents is under way: its latest documents will be read again")
                         break
-                    time.sleep(0.5)
+                    time.sleep(0.2)
             partial = directory / f"{store.INDEX}.partial.{os.getpid()}"
             os.close(os.open(partial, os.O_RDWR | os.O_CREAT | os.O_EXCL, 0o600))
-            old = sqlite3.connect((directory / store.EARLIER).as_uri() + "?mode=ro", uri=True, timeout=60)
-            old.row_factory = sqlite3.Row
-            new = store.open_index(partial)
+            old, new = earlier(directory), store.open_index(partial)
             try:
+                # The partial file is thrown away after any failure, so it needs no journal of
+                # its own; it is written to the disk in full before it takes its name.
+                new.execute("PRAGMA journal_mode=OFF")
+                new.execute("PRAGMA synchronous=OFF")
                 old.execute("BEGIN")            # one view of the old index for the whole copy
                 new.executescript("BEGIN;\n" + store.SCHEMA + "\nCOMMIT;")
                 new.execute("BEGIN")
-                copy(old, new, directory, progress)
+                copy(old, new, progress)
                 new.execute("COMMIT")
-                new.execute("INSERT INTO passages(passages) VALUES('optimize')")
-                new.commit()
                 new.close()
                 old.close()
                 with open(partial, "rb") as written:
                     os.fsync(written.fileno())
                 os.replace(partial, target)
+                folder = os.open(directory, os.O_RDONLY)
+                try:
+                    os.fsync(folder)
+                finally:
+                    os.close(folder)
             except BaseException:
                 new.close()
                 old.close()
                 partial.unlink(missing_ok=True)
                 raise
-        retire = sqlite3.connect(directory / store.EARLIER, timeout=60)
-        try:
-            retire.execute(f"PRAGMA user_version={RETIRED}")
-            retire.commit()
-        finally:
-            retire.close()
+        finish(directory)
         progress("The index is converted; the earlier one is kept until `shelffind upgrade --discard-old`")
         return target
 

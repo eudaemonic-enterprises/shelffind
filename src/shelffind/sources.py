@@ -120,7 +120,8 @@ def find(db, directory, query, options, publish, cancelled=lambda: False):
     if typed.fmt:
         opts["fmt"] = typed.fmt
     if typed.place:
-        named = [r["path"] for r in store.roots(db) if Path(r["path"]).name.lower() == typed.place.lower()]
+        wanted = typed.place.lower()
+        named = [r["path"] for r in store.roots(db) if wanted in (r["name"].lower(), Path(r["path"]).name.lower())]
         if len(named) == 1:
             opts["root"] = named[0]
         else:
@@ -128,7 +129,12 @@ def find(db, directory, query, options, publish, cancelled=lambda: False):
     opts["without"] = typed.without
     groups, errors = [], []
     if source in (None, "files"):
-        local = search(db, query, **opts)
+        def early(rows):
+            """The matches by name are shown while the passages are still being searched."""
+            for row in rows:
+                row["source"] = "files"
+            publish(rows, "")
+        local = search(db, query, **opts, interim=early)
         if not query.strip() and not (opts.get("root") or opts.get("fmt") or opts.get("folder") or typed.without):
             # Nothing is asked yet: the documents opened lately come first.
             lately = by_paths(db, history.documents(directory))

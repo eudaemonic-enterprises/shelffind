@@ -7,7 +7,7 @@ import unittest
 
 from shelffind import sources
 from shelffind.query import split
-from shelffind.search import document_id, page_of, passages_of, search, spans, unmark
+from shelffind.search import document_id, excerpt, page_of, passages_of, query_terms, search, spans, targets
 
 from support import Shelf
 
@@ -24,9 +24,33 @@ class Typed(unittest.TestCase):
         self.assertEqual(plain.without, ["5"])
         self.assertEqual(split("").words, "")
 
+    def wanted(self, query, close=None):
+        parts = query_terms(query)
+        return targets(parts, close or [[] for _ in parts], False)
+
+    def test_a_passage_is_cut_around_its_matches(self):
+        self.assertEqual(excerpt("the group velocity\n  of waves", self.wanted('group "of waves"')),
+                         ("the group velocity of waves", [[4, 9], [19, 27]]))
+        page = "Preface. " * 40 + "The dispersion relation of water waves is derived here. " + "Appendix. " * 40
+        line, marks = excerpt(page, self.wanted("dispersion water"), width=80)
+        self.assertTrue(line.startswith("… ") and line.endswith(" …"))
+        self.assertLessEqual(len(line), 120)
+        self.assertEqual([line[a:b] for a, b in marks], ["dispersion", "water"])
+        # Only the last word may be unfinished, and only from four letters.
+        self.assertEqual(excerpt("Tides and tide tables", self.wanted("tide"))[1], [[0, 5], [10, 14]])
+        self.assertEqual(excerpt("Tides and tide tables", self.wanted("tide tabl"))[1], [[10, 14], [15, 21]])
+        self.assertEqual(excerpt("Tides and tide tables", self.wanted("tid"))[1], [])
+        # A word found through its spelling is lit as well, and accents do not matter.
+        self.assertEqual(excerpt("An ultraviolet lamp", self.wanted("ultravoilet", [["ultraviolet"]])),
+                         ("An ultraviolet lamp", [[3, 14]]))
+        self.assertEqual(excerpt("Théorie des ondes", self.wanted("theorie onde"))[1], [[0, 7], [12, 17]])
+        self.assertEqual(excerpt("Théorie des ondes", self.wanted("theorie onde"))[1], [[0, 8], [13, 18]])
+        self.assertEqual(excerpt("Charts and soundings", self.wanted("glacier")), ("Charts and soundings", []))
+        self.assertEqual(excerpt("", self.wanted("glacier")), ("", []))
+        self.assertEqual(excerpt("Charts  and\tsoundings " * 30, [], width=24),
+                         ("Charts and soundings Charts …", []))       # a word is finished, never cut
+
     def test_matches_are_reported_as_ranges(self):
-        self.assertEqual(unmark("the \x02group\x03 velocity of \x02waves\x03"),
-                         ("the group velocity of waves", [[4, 9], [22, 27]]))
         self.assertEqual(spans("Lamb-Hydrodynamics-CUP-1932", "hydro lamb"), [[0, 4], [5, 10]])
         self.assertEqual(spans("Théorie des ondes", "theorie ond"), [[0, 7], [12, 15]])
         self.assertEqual(spans("OrchardCalendar", "orchadr"), [[0, 7]])           # the closest word

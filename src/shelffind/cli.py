@@ -273,19 +273,23 @@ def execute(args, db, directory, settings):
 SMALL_INDEX = 64 << 20          # an earlier index below this size is converted without being asked
 
 
+def say(text):
+    print(safe(text), file=sys.stderr, flush=True)
+
+
 def opened(args, directory):
     """The index for a command. An index of the earlier format is converted first by the commands
-    that work on it at length (the panel, `index`, `upgrade`) and whenever it is small; a large
-    one is otherwise left alone, and the command says what to do."""
-    def say(text):
-        print(safe(text), file=sys.stderr, flush=True)
-    interactive = args.command == "pick" or (args.command == "search" and not (args.json or args.list)
-                                             and sys.stdin.isatty() and sys.stdout.isatty())
+    that change it or work on it at length (the panel, `index`, `roots add`, `roots remove`), and
+    by any other command when it is small. `status` never converts: it reports from the old
+    index. A large old index is otherwise left alone, and the command says what to do."""
     try:
         return store.connect(directory, upgrade=False)
     except store.NeedsUpgrade:
-        old = directory / store.EARLIER
-        if not (interactive or args.command in ("index", "upgrade") or old.stat().st_size < SMALL_INDEX):
+        panel = args.command == "pick" or (args.command == "search" and not (args.json or args.list)
+                                           and sys.stdin.isatty() and sys.stdout.isatty())
+        changing = args.command == "index" or (args.command == "roots" and args.action != "list")
+        small = (directory / store.EARLIER).stat().st_size < SMALL_INDEX
+        if args.command == "status" or not (panel or changing or small):
             raise
         say("Converting the index to its new form; the earlier one is kept.")
         migrate.upgrade(directory, say)
@@ -374,10 +378,11 @@ def main(argv=None):
                 if args.discard_old:
                     freed = migrate.discard_old(directory)
                     print(f"The earlier index is deleted: {freed / 1e6:,.1f} MB freed.")
-                elif store.earlier_format(directory) == 1 and not (directory / store.INDEX).exists():
-                    migrate.upgrade(directory, lambda text: print(safe(text), file=sys.stderr, flush=True))
                 else:
-                    print("Nothing to convert: the index has its present form.")
+                    present = (directory / store.INDEX).exists()
+                    done = migrate.upgrade(directory, say)      # also completes one that was cut short
+                    if present or done is None:
+                        print("Nothing to convert.")
             else:
                 try:
                     db = opened(args, directory)

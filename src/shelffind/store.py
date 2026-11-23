@@ -71,8 +71,8 @@ CREATE TABLE words (
     id INTEGER PRIMARY KEY, term TEXT NOT NULL UNIQUE, tier INTEGER NOT NULL, df INTEGER NOT NULL,
     listed INTEGER NOT NULL DEFAULT 0
 );
-CREATE INDEX words_ready ON words(id) WHERE listed=0 AND (tier=0 OR df>=2);
-CREATE VIRTUAL TABLE spelling USING fts5(grams,content='');
+CREATE VIRTUAL TABLE spelling USING fts5(grams,size,content='');
+CREATE VIRTUAL TABLE common USING fts5(grams,size,content='');
 CREATE TABLE records (
     doc INTEGER NOT NULL REFERENCES docs ON DELETE CASCADE, source TEXT NOT NULL, ref TEXT NOT NULL,
     title TEXT, byline TEXT, year TEXT, flags TEXT, basis TEXT, text TEXT, local TEXT,
@@ -107,6 +107,7 @@ def open_index(filename):
     db = sqlite3.connect(filename, timeout=30)
     db.row_factory = sqlite3.Row
     db.create_function("word_grams", 1, fuzzy.grams, deterministic=True)
+    db.create_function("word_size", 1, fuzzy.size, deterministic=True)
     db.create_function("sf_inflate", 1, inflate, deterministic=True)
     db.execute("PRAGMA foreign_keys=ON")
     db.execute("PRAGMA trusted_schema=ON")      # the view and the triggers call sf_inflate

@@ -34,6 +34,34 @@ def record(directory, action, query, hit=None, page=None, when=None):
         pass
 
 
+def absorb(directory, asked):
+    """Put the searches of an earlier journal, a list of (time, query), in front of this one.
+    Those it holds already are left out, so the same list may be given twice."""
+    if not asked:
+        return
+    try:
+        directory.mkdir(mode=0o700, parents=True, exist_ok=True)
+        fd = os.open(directory / NAME, os.O_RDWR | os.O_CREAT, 0o600)
+        with os.fdopen(fd, "r+", encoding="utf-8") as out:
+            fcntl.flock(out, fcntl.LOCK_EX)
+            kept = out.readlines()
+            held = set()
+            for line in kept:
+                try:
+                    event = json.loads(line)
+                    held.add((event.get("t"), event.get("q")))
+                except (ValueError, AttributeError):
+                    continue
+            added = [json.dumps({"t": int(when), "act": "search", "q": query}, ensure_ascii=False) + "\n"
+                     for when, query in asked if (int(when), query) not in held]
+            if added:
+                out.seek(0)
+                out.truncate()
+                out.writelines(added + kept)
+    except OSError:
+        pass
+
+
 def events(directory, limit=400):
     """The latest events, newest first. Lines that cannot be read are skipped."""
     try:
