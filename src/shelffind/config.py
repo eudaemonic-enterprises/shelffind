@@ -48,6 +48,9 @@ SETTINGS = {
     "search.limit": (int, 50, "Results listed in the panel."),
     "search.scope": (("all", "name", "text"), "all", "What the panel searches when it opens."),
     "history.record": (bool, True, "Remember the searches made and the documents opened."),
+    "share.history": (bool, False, "Share that journal between your machines; off unless asked for."),
+    "share.folder": (str, "", "The shared place, as a folder that some tool keeps in step."),
+    "share.remote": (str, "", "The shared place, as an rclone remote such as cloud:ShelfFind."),
     **{f"keys.{action}": ("keys", default, f"Key or keys for the action {action}.")
        for action, default in KEYS.items()},
 }

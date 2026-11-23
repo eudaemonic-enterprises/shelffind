@@ -156,7 +156,7 @@ def panel(db, directory, query, options, settings, enter="open", quote=False, wi
             else:
                 model.message = told["text"]
             return False
-        if settings["history.record"]:
+        if settings["history.record"] and not model.query.startswith(" "):     # a leading blank: off the record
             history.record(directory, done.action, model.query, done.hit, done.hit.get("page"))
         if done.action == "address":
             result.update(code=0, text=shlex.quote(done.text) if quote else done.text)

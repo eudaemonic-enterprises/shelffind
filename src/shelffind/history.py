@@ -14,6 +14,7 @@ import time
 
 NAME = "history.jsonl"
 LIMIT = 1 << 20          # beyond this size the oldest half of the file is dropped
+PEER_MONTHS = 3          # journals of this many months are read from each other machine
 
 
 @contextlib.contextmanager
@@ -103,16 +104,10 @@ def absorb(directory, asked):
         return False
 
 
-def events(directory, limit=400):
-    """The latest events, newest first. Lines that cannot be read are skipped."""
-    if limit <= 0:
-        return []
-    try:
-        lines = lines_of(directory)[-limit:]
-    except OSError:
-        return []
+def read(lines):
+    """The events of some lines, in their order. Lines that cannot be read are skipped."""
     found = []
-    for line in reversed(lines):
+    for line in lines:
         try:
             event = json.loads(line)
         except ValueError:
@@ -120,6 +115,46 @@ def events(directory, limit=400):
         if isinstance(event, dict) and isinstance(event.get("q"), str):
             found.append(event)
     return found
+
+
+def elsewhere(directory, limit):
+    """The latest events of the other machines, as their journals were last taken from the
+    shared place. An address written from the home folder is expanded for this machine."""
+    found = []
+    try:
+        folders = [entry for entry in (directory / "peers").iterdir() if entry.is_dir()]
+    except OSError:
+        return found
+    home = (os.environ.get("HOME") or os.path.expanduser("~")).rstrip("/")
+    for folder in folders:
+        lines = []
+        for journal in sorted(folder.glob("*.jsonl"))[-PEER_MONTHS:]:
+            try:
+                with journal.open(encoding="utf-8", errors="replace") as source:
+                    lines.extend(source.readlines())
+            except OSError:
+                continue
+        for event in read(lines[-limit:]):
+            path = event.get("path")
+            if isinstance(path, str) and (path == "~" or path.startswith("~/")):
+                event["path"] = home + path[1:]
+            event.setdefault("m", folder.name)
+            found.append(event)
+    return found
+
+
+def events(directory, limit=400):
+    """The latest events, newest first: those of this machine, and those of the other machines
+    that share their journals with it."""
+    if limit <= 0:
+        return []
+    try:
+        mine = read(lines_of(directory)[-limit:])
+    except OSError:
+        mine = []
+    merged = mine + elsewhere(directory, limit)
+    merged.sort(key=lambda event: event.get("t") if isinstance(event.get("t"), (int, float)) else 0)
+    return merged[::-1][:limit]
 
 
 def queries(directory):

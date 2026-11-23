@@ -7,16 +7,18 @@ import sqlite3
 import subprocess
 import sys
 import termios
+import time
 from contextlib import closing
 from pathlib import Path
 
-from . import __version__, config, desktop, doctor, helptext, indexer, migrate, shell, sources, store
+from . import (__version__, config, desktop, doctor, helptext, indexer, machine, migrate, sharing, shell, sources,
+               store)
 from .picker import panel
 from .text import json_text, safe
 from .tui import report, style
 
 COMMANDS = ["search", "pick", "open", "apps", "reveal", "roots", "sources", "index", "status",
-            "config", "doctor", "upgrade", "cheatsheet", "init", "completion"]
+            "config", "doctor", "upgrade", "sync", "machine", "cheatsheet", "init", "completion"]
 
 
 def search_options(command):
@@ -86,6 +88,10 @@ def parser():
     dr.add_argument("--json", action="store_true")
     up = cmds.add_parser("upgrade", help="Convert an index of the earlier format; the old one is kept")
     up.add_argument("--discard-old", action="store_true", help="Delete the earlier index once converted")
+    sy = cmds.add_parser("sync", help="Exchange the journal of searches with your other machines")
+    sy.add_argument("--quiet", action="store_true", help="Say nothing unless something fails")
+    mc = cmds.add_parser("machine", help="The name of this machine among those that share")
+    mc.add_argument("--name", help="Give this machine a name, such as home or office")
     cmds.add_parser("cheatsheet", help="A one-screen reference")
     it = cmds.add_parser("init", help="Print a key binding for the shell: eval \"$(shelffind init bash)\"")
     it.add_argument("shell", choices=["bash"])
@@ -183,6 +189,7 @@ def find(args, db, directory, settings):
             code = code if code >= 128 else 0       # leaving the panel is not a failure
         if text:
             print(text)
+        exchange_later(args, directory, settings)
         return code
     opts = {"root": args.root, "fmt": args.fmt, "exact": args.exact, "limit": args.limit or 25,
             "source": args.source, "where": args.where or "all"}
@@ -203,6 +210,22 @@ def find(args, db, directory, settings):
         for line in listing(hits, False):
             print(line)
     return int(bool(problem) and not hits)
+
+
+EXCHANGE = 600          # seconds between two exchanges started by the panel
+
+
+def exchange_later(args, directory, settings):
+    """After the panel, when journals are shared and the last exchange is not recent: start
+    one in a process of its own, which outlives this one and delays nothing."""
+    if sharing.carrier(settings) is None or time.time() - sharing.last(directory).get("synced", 0) < EXCHANGE:
+        return
+    place = ["--data-dir", str(args.data_dir)] if args.data_dir else []
+    try:
+        subprocess.Popen([sys.executable, "-m", "shelffind", *place, "sync", "--quiet"], start_new_session=True,
+                         stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    except OSError:
+        pass
 
 
 def look(settings, stream):
@@ -381,6 +404,18 @@ def main(argv=None):
                     print("\n".join(desktop.applications(target["path"])))
                 else:
                     desktop.reveal(target["path"])
+            elif args.command == "machine":
+                told = machine.identity(directory, args.name)
+                print(f"{told['name']}  ({told['id']})")
+            elif args.command == "sync":
+                place = sharing.carrier(settings)
+                if place is None:
+                    raise ValueError("Nothing is shared: set share.history and share.folder or share.remote")
+                done = sharing.sync(directory, place)
+                if done["damaged"] or not args.quiet:
+                    others = ", ".join(done["machines"]) or "no other machine yet"
+                    print(f"{done['sent']} sent, {done['received']} received ({others})"
+                          + (f"; {done['damaged']} could not be taken and will be asked again" * bool(done["damaged"])))
             elif args.command == "upgrade":
                 if args.discard_old:
                     freed = migrate.discard_old(directory)
