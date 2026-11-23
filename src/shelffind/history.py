@@ -15,6 +15,7 @@ import time
 NAME = "history.jsonl"
 LIMIT = 1 << 20          # beyond this size the oldest half of the file is dropped
 PEER_MONTHS = 3          # journals of this many months are read from each other machine
+ARRIVING = ".history.jsonl.arriving-"   # the beginning of the name of a journal being written anew
 
 
 @contextlib.contextmanager
@@ -38,10 +39,11 @@ def lines_of(directory):
 
 def rewrite(directory, lines):
     """Put a new journal in the place of the present one, in one step. The caller is the one
-    writer, so a file left beside the journal by a writer that was killed can be removed."""
-    for left in directory.glob(NAME + ".*"):
+    writer, so a file of this module's own making, left beside the journal by a writer that was
+    killed, can be removed; no other file is touched."""
+    for left in directory.glob(ARRIVING + "*"):
         left.unlink(missing_ok=True)
-    with tempfile.NamedTemporaryFile(mode="w", encoding="utf-8", dir=directory, prefix=NAME + ".", delete=False) as out:
+    with tempfile.NamedTemporaryFile(mode="w", encoding="utf-8", dir=directory, prefix=ARRIVING, delete=False) as out:
         try:
             os.fchmod(out.fileno(), 0o600)
             out.writelines(line if line.endswith("\n") else line + "\n" for line in lines)
@@ -66,9 +68,15 @@ def record(directory, action, query, hit=None, page=None, when=None):
     line = json.dumps(event, ensure_ascii=False) + "\n"
     try:
         with writing(directory):
-            fd = os.open(directory / NAME, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
+            fd = os.open(directory / NAME, os.O_RDWR | os.O_CREAT | os.O_APPEND, 0o600)
             try:
-                os.write(fd, line.encode("utf-8"))
+                # A line cut short by an earlier failure must not swallow this one.
+                size = os.fstat(fd).st_size
+                data = line.encode("utf-8")
+                if size and os.pread(fd, 1, size - 1) != b"\n":
+                    data = b"\n" + data
+                while data:
+                    data = data[os.write(fd, data):]
                 large = os.fstat(fd).st_size > LIMIT
             finally:
                 os.close(fd)
@@ -93,7 +101,7 @@ def absorb(directory, asked):
                 try:
                     event = json.loads(line)
                     held.add((event.get("t"), event.get("q")))
-                except (ValueError, AttributeError):
+                except (ValueError, AttributeError, TypeError):     # a line that is not an event
                     continue
             added = [json.dumps({"t": int(when), "act": "search", "q": query}, ensure_ascii=False) + "\n"
                      for when, query in asked if (int(when), query) not in held]

@@ -388,7 +388,7 @@ class Journal(unittest.TestCase):
         with patch("shelffind.history.os.replace", side_effect=KeyboardInterrupt), self.assertRaises(KeyboardInterrupt):
             history.absorb(self.data, [(100, "winds")])
         self.assertEqual(history.queries(self.data), ["tides"])             # what was there is still there
-        self.assertEqual([p.name for p in self.data.iterdir() if p.name.startswith("history.jsonl.")], [])
+        self.assertEqual([p.name for p in self.data.iterdir() if "arriving" in p.name], [])
         self.assertTrue(history.absorb(self.data, [(100, "winds")]))
         self.assertTrue(history.absorb(self.data, [(100, "winds")]))
         self.assertEqual(history.queries(self.data), ["tides", "winds"])
@@ -406,6 +406,18 @@ class Journal(unittest.TestCase):
         self.assertEqual(history.documents(self.data, 1), ["/shelf/b.pdf"])
         self.assertEqual((history.events(self.data, 0), history.documents(self.data, 0)), ([], []))
         self.assertFalse(history.absorb(self.data / "history.jsonl" / "impossible", [(1, "x")]))
+
+    def test_a_line_cut_short_costs_only_itself_and_a_neighbouring_file_is_left_alone(self):
+        history.record(self.data, "search", "tides")
+        with (self.data / history.NAME).open("ab") as journal:
+            journal.write(b'{"t": 5, "q"')                                  # a write that failed half-way
+        (self.data / "history.jsonl.bak").write_text("a copy someone keeps\n")
+        history.record(self.data, "search", "winds")
+        with (self.data / history.NAME).open("a") as journal:
+            journal.write('{"t": [1], "q": "odd but readable"}\n')           # an event with a time that is no time
+        self.assertTrue(history.absorb(self.data, [(1, "capes")]))
+        self.assertEqual(sorted(history.queries(self.data)), ["capes", "odd but readable", "tides", "winds"])
+        self.assertEqual((self.data / "history.jsonl.bak").read_text(), "a copy someone keeps\n")
 
     def test_the_oldest_half_goes_when_the_journal_is_full(self):
         with patch.object(history, "LIMIT", 600):
