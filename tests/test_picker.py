@@ -129,9 +129,14 @@ class Keys(unittest.TestCase):
         later = [hits()[3], hits()[2]]
         update(model, Reply(7, later, "", 0.02), KEYMAP)
         self.assertEqual((model.selected, model.busy, model.seconds), (1, False, 0.02))
-        model.fresh = True                          # a new search: its first answer starts at the best
+        model.fresh = True                          # a new search: every answer starts at the best match
         update(model, Reply(7, hits(), "", 0.02), KEYMAP)
-        self.assertEqual((model.selected, model.fresh), (0, False))
+        update(model, Reply(7, hits()[::-1], "", 0.03), KEYMAP)     # a later answer that changes the order
+        self.assertEqual((model.selected, model.fresh), (0, True))
+        press(model, "up")                          # ... until the selection is moved: then it follows its document
+        chosen = model.hit()
+        update(model, Reply(7, hits(), "", 0.04), KEYMAP)
+        self.assertEqual((model.hit(), model.fresh), (chosen, False))
         model.query = "nothing"
         update(model, Reply(7, [], "", 0.01), KEYMAP)
         self.assertEqual(model.message, "No matches")

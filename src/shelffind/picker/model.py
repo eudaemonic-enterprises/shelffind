@@ -24,7 +24,7 @@ class Model:
     busy: bool = False
     seconds: float | None = None
     version: int = 0                     # number of the search whose answers are awaited
-    fresh: bool = True                   # no answer to that search has come yet
+    fresh: bool = True                   # the selection has not been moved since the search began
     mode: str = "search"                 # search, apps, help, actions, passages or reading
     apps: list = field(default_factory=list)        # the applications offered for the result, as identifiers
     app_names: list = field(default_factory=list)   # the same, as the names people know them by
@@ -117,6 +117,7 @@ def move(model, step):
     if model.results:
         towards_worse = -step if model.bottom else step
         model.selected = max(0, min(len(model.results) - 1, model.selected + towards_worse))
+        model.fresh = False
 
 
 def update(model, event, keymap):
@@ -124,10 +125,10 @@ def update(model, event, keymap):
     search, open, address, reveal, copy, apps, launch, quit."""
     if isinstance(event, Reply):
         if event.version == model.version:
-            # The first answer to a new search selects the best match; later answers to the
-            # same search (those of outside sources) leave the selection on its document.
+            # The answers to one search come in turn (names, passages, each source), and each
+            # may change the order: the selection stays on the best match until the user moves
+            # it, and from then on stays on the document chosen.
             current = None if model.fresh else model.hit()
-            model.fresh = False
             model.results, model.busy, model.seconds = event.rows, False, event.seconds
             model.message = event.message or ("" if event.rows or not model.query.strip() else "No matches")
             model.selected = 0
