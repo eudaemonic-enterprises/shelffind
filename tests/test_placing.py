@@ -646,6 +646,25 @@ class Changed(Placing):
         self.sound()
 
 
+class Folders(Placing):
+    def test_what_a_reading_teaches_in_one_folder_sends_back_to_a_folder_gone_through_before(self):
+        annex = self.base / "Annex"
+        annex.mkdir()
+        self.run_cli("roots", "add", str(annex))
+        (annex / "read.txt").write_text(LARGE)
+        self.build()
+        self.unmeasured()                                   # read by an earlier version, in the second folder
+        self.write("copy.txt")                              # the same bytes in the first folder, never measured
+        self.read.clear()
+        # Nothing is known by a checksum when the first folder is gone through. The reading in
+        # full of the file of the second folder then gives its document one, and the file of
+        # the first folder, of the same size, is compared in the same run.
+        self.assertEqual(self.build(limit=0), (0, 0))
+        self.assertEqual((self.documents(), self.db.execute("SELECT count(*) FROM files WHERE coalesce(sum,'')=''").fetchone()[0]), (1, 0))
+        self.assertEqual((self.read, len(search(self.db, "northern harbours")[0]["copies"])), ([], 1))
+        self.sound()
+
+
 class Results(Placing):
     def test_a_result_names_the_document_of_its_checksums_whatever_their_order(self):
         one, two = self.write("copy.txt"), self.write("copy.md")       # the same bytes, two readers
