@@ -139,10 +139,18 @@ class Collection(Shelf):
                     desktop.launch(doc,"unknown.desktop")
             desktop.open_uri("https://example.org/record")
             self.assertEqual(run.call_args.args[0], ["gio","open","https://example.org/record"])
-        with patch("shelffind.desktop.subprocess.Popen") as popen:
+        with patch("shelffind.desktop.subprocess.Popen") as popen, \
+                patch("shelffind.desktop.shutil.which", return_value=None):
             popen.return_value.wait.return_value = 0
             desktop.reveal(doc)
             self.assertEqual(popen.call_args.args[0], ["nautilus","--select",doc.as_uri()])
+        with patch("shelffind.desktop.subprocess.run") as run, patch("shelffind.desktop.subprocess.Popen") as popen, \
+                patch("shelffind.desktop.shutil.which", return_value="/usr/bin/gdbus"):
+            run.return_value.returncode = 0
+            desktop.reveal(doc)
+            self.assertIn("org.freedesktop.FileManager1.ShowItems", run.call_args.args[0])
+            self.assertIn(f"['{doc.as_uri()}']", run.call_args.args[0])
+            popen.assert_not_called()
 
     def test_viewer_output_stays_out_of_terminal_and_launcher_errors_are_reported(self):
         doc = self.root / "article.pdf"

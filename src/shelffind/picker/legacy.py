@@ -1,5 +1,5 @@
 # Copyright 2026 Eudaemonic Enterprises Inc.
-"""Type to search, then open or reveal the selected document."""
+"""The earlier full-screen search screen, kept as a fallback (`SHELFFIND_UI=curses`)."""
 import curses
 import queue
 import sqlite3
@@ -7,7 +7,7 @@ import subprocess
 import threading
 import time
 
-from . import desktop, sources, store
+from .. import desktop, sources, store
 
 
 def line(screen, y, text, attr=0):

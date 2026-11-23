@@ -2,21 +2,37 @@
 """Command-line interface to ShelfFind."""
 import argparse
 import curses
+import os
 import sqlite3
 import subprocess
 import sys
+import termios
 from contextlib import closing
 from pathlib import Path
 
-from . import __version__, desktop, indexer, sources, store
-from .picker import picker
+from . import __version__, config, desktop, doctor, helptext, indexer, shell, sources, store
+from .picker import panel, picker
 from .text import json_text, safe
+
+COMMANDS = ["search", "pick", "open", "apps", "reveal", "roots", "sources", "index", "status",
+            "config", "doctor", "cheatsheet", "init", "completion"]
+
+
+def search_options(command):
+    command.add_argument("query", nargs="*")
+    command.add_argument("--exact", action="store_true", help="Whole words and phrases without fuzzy expansion")
+    command.add_argument("--where", choices=["all","name","text"], help="Search names, passages, or both")
+    command.add_argument("--source", help="Search only files or one external source")
+    command.add_argument("--root", help="Filter by registered folder")
+    command.add_argument("--format", dest="fmt", help="Filter by extension, e.g. djvu")
+    command.add_argument("--limit", type=int, help="Number of results (25 in lists, the setting in the panel)")
 
 
 def parser():
-    p = argparse.ArgumentParser(prog="shelffind", description="Find documents by name, folder, or passage.")
+    p = argparse.ArgumentParser(prog="shelffind", description="Find documents by name, folder, or passage.",
+                                epilog=helptext.EPILOG, formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("--version", action="version", version=f"ShelfFind {__version__}")
-    p.add_argument("--data-dir", type=Path, default=store.state_directory(), help="Private index directory")
+    p.add_argument("--data-dir", type=Path, help="Private index directory; only its own config.toml is then read")
     cmds = p.add_subparsers(dest="command")
     rs = cmds.add_parser("roots", help="Choose document folders").add_subparsers(dest="action", required=True)
     rs.add_parser("add").add_argument("folders", nargs="+", type=Path)
@@ -40,23 +56,34 @@ def parser():
     st = cmds.add_parser("status", help="Index coverage and pending work")
     st.add_argument("--json", action="store_true")
     st.add_argument("--errors", action="store_true", help="List failed files and reasons")
-    se = cmds.add_parser("search", help="Interactive fuzzy search or machine-readable results")
-    se.add_argument("query", nargs="*")
+    se = cmds.add_parser("search", help="The search panel, or results as text or JSON")
+    search_options(se)
     se.add_argument("--json", action="store_true")
-    se.add_argument("--list", action="store_true", help="Print matches without opening the picker")
-    se.add_argument("--exact", action="store_true", help="Whole words and phrases without fuzzy expansion")
-    se.add_argument("--where", choices=["all","name","text"], default="all", help="Search names, passages, or both")
-    se.add_argument("--source", help="Search only files or one external source")
-    se.add_argument("--root", help="Filter by registered folder")
-    se.add_argument("--format", dest="fmt", help="Filter by extension, e.g. djvu")
-    se.add_argument("--limit", default=25, type=int)
+    se.add_argument("--list", action="store_true", help="Print matches without opening the panel")
+    pk = cmds.add_parser("pick", help="The search panel; print the address of the chosen document")
+    search_options(pk)
+    pk.add_argument("--enter", choices=["print", "open"], default="print",
+                    help="What Enter does: print the address (default) or open the document")
+    pk.add_argument("--quote", action="store_true", help="Quote the address for a shell")
+    pk.add_argument("--widget", action="store_true", help="Run from a key binding of the shell")
     op = cmds.add_parser("open", help="Open with the default or a registered application")
     op.add_argument("--with", dest="app", metavar="DESKTOP-ID")
+    op.add_argument("--page", type=int, help="Open at this page where the viewer can")
     apps = cmds.add_parser("apps", help="List applications for a file")
-    reveal = cmds.add_parser("reveal", help="Select a file in Nautilus")
+    reveal = cmds.add_parser("reveal", help="Show a file in the file manager")
     for action in (op, apps, reveal):
         action.add_argument("path", help="File path, or a result ID with --source")
         action.add_argument("--source", help="Resolve a result ID from this source")
+    cf = cmds.add_parser("config", help="The settings and where each value comes from")
+    cf.add_argument("action", choices=["show", "path", "check"], nargs="?", default="show")
+    cf.add_argument("--json", action="store_true")
+    dr = cmds.add_parser("doctor", help="Check the installation; nothing is changed")
+    dr.add_argument("--json", action="store_true")
+    cmds.add_parser("cheatsheet", help="A one-screen reference")
+    it = cmds.add_parser("init", help="Print a key binding for the shell: eval \"$(shelffind init bash)\"")
+    it.add_argument("shell", choices=["bash"])
+    it.add_argument("--key", default="ctrl-t", help="The key that opens the panel (default ctrl-t)")
+    cmds.add_parser("completion", help="Print completion for the shell").add_argument("shell", choices=["bash"])
     return p
 
 
@@ -89,7 +116,48 @@ def coverage(db, errors):
     return result
 
 
-def execute(args, db, directory):
+def find(args, db, directory, settings):
+    """`search` and `pick`: the panel at a terminal, a list or JSON otherwise."""
+    query = " ".join(args.query)
+    picking = args.command == "pick"
+    wanted = picking or not (args.json or args.list)
+    if wanted and (picking or (sys.stdin.isatty() and sys.stdout.isatty())):
+        opts = {"root": args.root, "fmt": args.fmt, "exact": args.exact, "source": args.source,
+                "limit": args.limit or settings["search.limit"],
+                "where": args.where or settings["search.scope"]}
+        if not picking and os.environ.get("SHELFFIND_UI") == "curses":
+            try:
+                curses.wrapper(picker, db, directory, query, opts)
+            except KeyboardInterrupt:
+                return 130
+            return 0
+        if picking:
+            code, text, _ = panel(db, directory, query, opts, settings, enter=args.enter,
+                                  quote=args.quote, widget=args.widget)
+        else:
+            code, text, _ = panel(db, directory, query, opts, settings)
+            code = code if code >= 128 else 0       # leaving the panel is not a failure
+        if text:
+            print(text)
+        return code
+    opts = {"root": args.root, "fmt": args.fmt, "exact": args.exact, "limit": args.limit or 25,
+            "source": args.source, "where": args.where or "all"}
+    hits, problem = [], ""
+    def collect(rows, message):
+        nonlocal hits, problem
+        hits, problem = rows, message
+    sources.find(db, directory, query, opts, collect)
+    if problem:
+        print(safe(problem), file=sys.stderr)
+    if args.json:
+        print(json_text(hits))
+    else:
+        for line in listing(hits, sys.stdout.isatty()):
+            print(line)
+    return int(bool(problem) and not hits)
+
+
+def execute(args, db, directory, settings):
     if args.command == "roots":
         if args.action == "add":
             with store.index_lock(directory):
@@ -104,8 +172,8 @@ def execute(args, db, directory):
     elif args.command == "sources":
         if args.action == "list":
             print("files")
-            for name, program in sources.registered(directory).items():
-                print(f"{name}  {program}")
+            for name, command in sources.registered(directory).items():
+                print(f"{name}  {' '.join(command)}")
         else:
             sources.configure(directory, args.name, args.program if args.action == "add" else None)
     elif args.command == "index":
@@ -135,28 +203,38 @@ def execute(args, db, directory):
                 print("  " + safe(row["problem"] or "Folder unavailable"))
             for e in row.get("errors", []):
                 print("  " + safe(f"{e['rel']}: {e['error']}"))
-    elif args.command == "search":
-        opts = {"root": args.root, "fmt": args.fmt, "exact": args.exact, "limit": args.limit, "source": args.source, "where": args.where}
-        query = " ".join(args.query)
-        if not args.json and not args.list and sys.stdin.isatty() and sys.stdout.isatty():
-            try:
-                curses.wrapper(picker, db, directory, query, opts)
-            except KeyboardInterrupt:
-                return 130
-        else:
-            hits, problem = [], ""
-            def collect(rows, message):
-                nonlocal hits, problem
-                hits, problem = rows, message
-            sources.find(db, directory, query, opts, collect)
-            if problem:
-                print(safe(problem), file=sys.stderr)
-            if args.json:
-                print(json_text(hits))
-            else:
-                for line in listing(hits, sys.stdout.isatty()):
-                    print(line)
-            return int(bool(problem) and not hits)
+    elif args.command in ("search", "pick"):
+        return find(args, db, directory, settings)
+    return 0
+
+
+def configuration(args, directory, explicit):
+    """`config show`, `config path`, `config check`."""
+    if args.action == "path":
+        path = (directory if explicit else config.config_home()) / "config.toml"
+        print(path)
+        return 0
+    settings = config.load(directory, explicit)
+    sources.declare(settings.tables["sources"])
+    settings.keymap()
+    if args.action == "check":
+        for warning in settings.warnings:
+            print(safe(warning), file=sys.stderr)
+        print("The settings have faults." if settings.warnings else "The settings are sound.")
+        return int(bool(settings.warnings))
+    if args.json:
+        rows = {key: {"value": settings.values[key], "origin": settings.origins[key]}
+                for key in config.SETTINGS}
+        for name in config.TABLES:
+            for inner, content in settings.tables[name].items():
+                rows[f"{name}.{inner}"] = {"value": content,
+                                           "origin": settings.table_origins[f"{name}.{inner}"]}
+        print(json_text(rows))
+    else:
+        for line in config.report(settings):
+            print(safe(line))
+        for warning in settings.warnings:
+            print(safe(warning), file=sys.stderr)
     return 0
 
 
@@ -164,29 +242,52 @@ def main(argv=None):
     p = parser()
     args = p.parse_args(argv)
     if args.command is None:
-        args = p.parse_args(["--data-dir", str(args.data_dir), "search"])
+        args = p.parse_args([*(["--data-dir", str(args.data_dir)] if args.data_dir else []), "search"])
     try:
-        directory = args.data_dir.expanduser().resolve()
-        if args.command in {"open", "apps", "reveal"}:
-            target = sources.resolve(directory, args.source, args.path)
-            if "uri" in target:
-                if args.command != "open" or args.app:
-                    raise ValueError("This result has a citation link. Use open to view it.")
-                desktop.open_uri(target["uri"])
-            elif args.command == "open":
-                desktop.launch(target["path"], args.app)
-            elif args.command == "apps":
-                print("\n".join(desktop.applications(target["path"])))
-            else:
-                desktop.reveal(target["path"])
+        explicit = args.data_dir is not None
+        directory = (args.data_dir or store.state_directory()).expanduser().resolve()
+        if args.command == "cheatsheet":
+            print(helptext.CHEATSHEET, end="")
+        elif args.command == "init":
+            print(shell.init(args.shell, args.key), end="")
+        elif args.command == "completion":
+            print(shell.completion(args.shell, COMMANDS), end="")
+        elif args.command == "config":
+            return configuration(args, directory, explicit)
+        elif args.command == "doctor":
+            return doctor.run(directory, explicit, args.json)
         else:
-            with closing(store.connect(directory)) as db:
-                return execute(args, db, directory)
+            try:
+                settings = config.load(directory, explicit)
+                sources.declare(settings.tables["sources"])
+            except ValueError as fault:
+                if args.command in ("search", "pick"):
+                    raise
+                print(f"shelffind: {safe(fault)}; the defaults are used", file=sys.stderr)
+                settings = config.defaults()
+            if args.command in {"open", "apps", "reveal"}:
+                target = sources.resolve(directory, args.source, args.path)
+                if "uri" in target:
+                    if args.command != "open" or args.app:
+                        raise ValueError("This result has a citation link. Use open to view it.")
+                    desktop.open_uri(target["uri"])
+                elif args.command == "open":
+                    custom = settings.tables["open"].get(Path(target["path"]).suffix.lstrip(".").lower())
+                    desktop.launch(target["path"], args.app, page=args.page,
+                                   custom=custom if isinstance(custom, list) else None)
+                elif args.command == "apps":
+                    print("\n".join(desktop.applications(target["path"])))
+                else:
+                    desktop.reveal(target["path"])
+            else:
+                with closing(store.connect(directory)) as db:
+                    return execute(args, db, directory, settings)
         return 0
     except KeyboardInterrupt:
         print("Interrupted. Completed documents and OCR pages have been saved.", file=sys.stderr)
         return 130
-    except (OSError, ValueError, sqlite3.Error, subprocess.SubprocessError, curses.error) as exc:
+    except (OSError, ValueError, sqlite3.Error, subprocess.SubprocessError, curses.error,
+            termios.error) as exc:
         print(f"shelffind: {safe(exc)}", file=sys.stderr)
         return 1
 

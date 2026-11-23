@@ -15,7 +15,15 @@ from . import fuzzy
 from .search import query_terms, search
 
 
-def registered(directory):
+# Sources declared in the settings file, as name -> command with its arguments. The command
+# line fills this once the settings are read; a declared source replaces a registered one of
+# the same name.
+declared = {}
+NAME = "[a-z][a-z0-9_-]{0,39}"
+
+
+def stored(directory):
+    """The sources registered with `sources add`: name -> path of the program."""
     config = directory / "sources.json"
     data = json.loads(config.read_text()) if config.exists() else {}
     if not isinstance(data, dict) or not all(isinstance(k, str) and isinstance(v, str)
@@ -24,12 +32,31 @@ def registered(directory):
     return data
 
 
+def declare(tables):
+    """Take the [sources.NAME] tables of the settings: each needs `command`, a list of words."""
+    declared.clear()
+    for name, table in tables.items():
+        command = table.get("command") if isinstance(table, dict) else None
+        if isinstance(command, str):
+            command = [command]
+        if not re.fullmatch(NAME, name) or name == "files" or not isinstance(command, list) \
+                or not command or not all(isinstance(word, str) and word for word in command):
+            raise ValueError(f"[sources.{name}] needs a short name and command = [\"program\", ...]")
+        if table.get("enabled", True) is not False:
+            declared[name] = [os.path.expanduser(command[0]), *command[1:]]
+
+
+def registered(directory):
+    """Every source in force: name -> command with its arguments."""
+    return {**{name: [path] for name, path in stored(directory).items()}, **declared}
+
+
 def configure(directory, name, program):
-    if not re.fullmatch("[a-z][a-z0-9_-]{0,39}", name) or name == "files":
+    if not re.fullmatch(NAME, name) or name == "files":
         raise ValueError("Use a short source name, beginning with a letter; files is reserved")
     with (directory / "sources.lock").open("a") as lock:
         fcntl.flock(lock, fcntl.LOCK_EX)
-        sources = registered(directory)
+        sources = stored(directory)
         if program is None:
             if name not in sources:
                 raise ValueError(f"Unknown source: {name}")
@@ -53,7 +80,8 @@ class Cancelled(Exception):
 def call(program, request, cancelled=lambda: False):
     deadline = time.monotonic() + (180 if request["op"] == "resolve" else 45)
     payload = json.dumps({"version":1, **request}).encode()
-    with subprocess.Popen([program], stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+    argv = [program] if isinstance(program, str) else list(program)
+    with subprocess.Popen(argv, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                           start_new_session=True) as child:
         try:
             while time.monotonic() < deadline:
@@ -124,7 +152,8 @@ def find(db, directory, query, options, publish, cancelled=lambda: False):
                 rows.append({"source": name, "id": record["id"], "name": record["name"], "path": None, "root": None,
                                  "format": record.get("format"), "match": record.get("match") or "catalogue",
                                  "page": record.get("page"), "section": record.get("section"),
-                                 "snippet": record.get("snippet"), "byline": record.get("byline"), "availability": record.get("availability")})
+                                 "snippet": record.get("snippet"), "marks": [], "size": None, "mtime": None,
+                                 "byline": record.get("byline"), "availability": record.get("availability")})
             groups.append(rows)
         except (OSError, TypeError, ValueError) as exc:
             errors.append(f"{name}: {exc}")

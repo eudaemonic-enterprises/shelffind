@@ -1,0 +1,182 @@
+# Copyright 2026 Eudaemonic Enterprises Inc.
+"""The state of the panel and what each key does to it.
+
+`update` changes the state and returns the things to be done outside it (a search to run, a
+document to open); it reads no file and starts no program, so it can be tested alone.
+"""
+from dataclasses import dataclass, field
+
+from ..tui.keys import Key, Paste
+from .worker import Reply
+
+SCOPES = ["all", "name", "text"]
+
+
+@dataclass
+class Model:
+    query: str = ""
+    caret: int = 0                       # position of the cursor inside the query
+    options: dict = field(default_factory=lambda: {"root": None, "fmt": None, "source": None,
+                                                    "exact": False, "limit": 50, "where": "all"})
+    results: list = field(default_factory=list)
+    selected: int = 0                    # 0 is the best match
+    message: str = ""
+    busy: bool = False
+    seconds: float | None = None
+    version: int = 0                     # number of the search whose answers are awaited
+    mode: str = "search"                 # search, apps or help
+    apps: list = field(default_factory=list)
+    app: int = 0
+    history: list = field(default_factory=list)     # earlier searches, newest first
+    recalled: int = -1
+    draft: str = ""                      # what was typed before recalling an earlier search
+    roots: list = field(default_factory=lambda: [None])
+    formats: list = field(default_factory=lambda: [None])
+    channels: list = field(default_factory=lambda: [None, "files"])
+    files: int = 0
+    bottom: bool = True                  # the prompt is under the list, best match next to it
+    page: int = 10                       # rows of the list, for PgUp and PgDn
+
+    def hit(self):
+        return self.results[self.selected] if self.results else None
+
+    def edit(self, query, caret=None):
+        self.query = query
+        self.caret = len(query) if caret is None else max(0, min(caret, len(query)))
+
+
+def word_start(text, position):
+    """Where the word that ends at `position` begins."""
+    while position > 0 and text[position - 1].isspace():
+        position -= 1
+    while position > 0 and not text[position - 1].isspace():
+        position -= 1
+    return position
+
+
+def word_end(text, position):
+    while position < len(text) and text[position].isspace():
+        position += 1
+    while position < len(text) and not text[position].isspace():
+        position += 1
+    return position
+
+
+def typing(model, event):
+    """Line editing of the query. Returns True when the query changed, None when the event is
+    not an editing key."""
+    query, caret = model.query, model.caret
+    if isinstance(event, Paste):
+        text = " ".join(event.text.split())
+        model.edit(query[:caret] + text + query[caret:], caret + len(text))
+        return bool(text)
+    name = event.name
+    if name == "char":
+        model.edit(query[:caret] + event.text + query[caret:], caret + len(event.text))
+        return True
+    if name == "backspace":
+        if caret:
+            model.edit(query[:caret - 1] + query[caret:], caret - 1)
+        return bool(caret)
+    if name == "delete":
+        model.edit(query[:caret] + query[caret + 1:], caret)
+        return caret < len(query)
+    if name in ("ctrl-w", "alt-backspace"):
+        start = word_start(query, caret)
+        model.edit(query[:start] + query[caret:], start)
+        return start != caret
+    if name == "ctrl-u":
+        model.edit(query[caret:], 0)
+        return bool(caret)
+    moves = {"left": caret - 1, "right": caret + 1, "home": 0, "ctrl-a": 0, "end": len(query),
+             "ctrl-e": len(query), "ctrl-left": word_start(query, caret), "alt-b": word_start(query, caret),
+             "ctrl-right": word_end(query, caret), "alt-f": word_end(query, caret)}
+    if name in moves:
+        model.edit(query, moves[name])
+        return False
+    return None
+
+
+def cycle(values, current):
+    return values[(values.index(current) + 1) % len(values)] if current in values else values[0]
+
+
+def move(model, step):
+    """Move the selection by `step` rows on screen (negative is upwards)."""
+    if model.results:
+        towards_worse = -step if model.bottom else step
+        model.selected = max(0, min(len(model.results) - 1, model.selected + towards_worse))
+
+
+def update(model, event, keymap):
+    """Apply one event; return the list of things to do, each a tuple whose first item is one of
+    search, open, address, reveal, copy, apps, launch, quit."""
+    if isinstance(event, Reply):
+        if event.version == model.version:
+            current = model.hit()
+            model.results, model.busy, model.seconds = event.rows, False, event.seconds
+            model.message = event.message or ("" if event.rows or not model.query.strip() else "No matches")
+            model.selected = 0
+            if current:
+                same = lambda hit: (hit["source"], hit.get("id"), hit["path"]) == \
+                    (current["source"], current.get("id"), current["path"])
+                model.selected = next((i for i, hit in enumerate(event.rows) if same(hit)), 0)
+        return []
+    if not isinstance(event, (Key, Paste)):
+        return []
+    action = keymap.get(event.name) if isinstance(event, Key) else None
+
+    if model.mode == "help":
+        model.mode = "search"
+        return []
+    if model.mode == "apps":
+        if action == "quit":
+            model.mode = "search"
+        elif action in ("up", "down") and model.apps:
+            model.app = max(0, min(len(model.apps) - 1, model.app + (1 if action == "down" else -1)))
+        elif action == "open" and model.apps:
+            model.mode = "search"
+            return [("launch", model.hit(), model.apps[model.app])]
+        return []
+
+    if action == "quit":
+        return [("quit",)]
+    if action == "help":
+        model.mode = "help"
+        return []
+    if action in ("up", "down"):
+        move(model, -1 if action == "up" else 1)
+        return []
+    if action in ("page-up", "page-down"):
+        move(model, -model.page if action == "page-up" else model.page)
+        return []
+    if action in ("open", "address", "reveal", "copy") and model.hit():
+        return [(action, model.hit())]
+    if action == "open-with" and model.hit():
+        return [("apps", model.hit())]
+    if action == "scope":
+        model.options["where"] = cycle(SCOPES, model.options.get("where", "all"))
+        return [("search",)]
+    if action in ("folder", "format", "source"):
+        name, values = {"folder": ("root", model.roots), "format": ("fmt", model.formats),
+                        "source": ("source", model.channels)}[action]
+        model.options[name] = cycle(values, model.options.get(name))
+        if name == "root" and model.options[name]:
+            model.options["source"] = "files"       # a folder belongs to the local files
+        if name == "source" and model.options[name] != "files":
+            model.options["root"] = None
+        return [("search",)]
+    if action in ("earlier-search", "later-search") and model.history:
+        if model.recalled < 0:
+            model.draft = model.query
+        step = 1 if action == "earlier-search" else -1
+        model.recalled = max(-1, min(len(model.history) - 1, model.recalled + step))
+        model.edit(model.draft if model.recalled < 0 else model.history[model.recalled])
+        return [("search",)]
+    if action:
+        return []
+    changed = typing(model, event)
+    if changed:
+        model.recalled = -1
+        return [("search",)]
+    return []
