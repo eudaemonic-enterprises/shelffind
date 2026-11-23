@@ -23,8 +23,8 @@ def document(db, name, row):
     if known:
         return known[0]
     for key in row.get("keys") or ():
-        known = db.execute("SELECT doc FROM doc_keys WHERE key=?", (key,)).fetchone()
-        if known:
+        # The same bytes may be kept under several formats: the checksum then bears the format.
+        for known in db.execute("SELECT doc FROM doc_keys WHERE key=? OR (key>? AND key<?)", (key, key + "@", key + "A")):
             return known[0]
     return None
 

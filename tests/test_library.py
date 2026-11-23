@@ -248,6 +248,17 @@ class Linked(Shelf):
         self.assertEqual(self.states()[target.name], "covered")
         self.assertEqual(search(self.db, "whitham")[0]["path"], str(target))
 
+    def test_asking_about_everything_again_withdraws_what_the_library_no_longer_holds(self):
+        self.build()
+        self.assertEqual(self.states()["scan-0042.txt"], "covered")
+        self.works[:] = [work for work in self.works if work["id"] != "W1"]        # the library lost the work
+        self.catalogue()
+        self.assertEqual(self.build(), (0, 0))              # an ordinary run still trusts what it was told
+        self.assertEqual(self.states()["scan-0042.txt"], "covered")
+        self.read.clear()
+        self.assertEqual(self.build(relink=True), (1, 0))   # asked again, the document is read at home
+        self.assertEqual((self.read, self.states()["scan-0042.txt"]), (["scan-0042.txt"], "indexed"))
+
     def test_the_lists_for_keeping_the_folders_in_order(self):
         second = self.root / "Desk" / "scan-0042.txt"
         second.parent.mkdir()

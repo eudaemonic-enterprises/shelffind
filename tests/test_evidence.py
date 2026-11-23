@@ -102,7 +102,7 @@ class Likeness(Reading):
             return real(path, fmt)
 
         with patch("shelffind.indexer.fingerprint", side_effect=racing):
-            self.assertEqual(self.build(), (0, 0))          # nothing is concluded from such a reading
+            self.assertEqual(self.build(), (0, 1))          # nothing is concluded from such a reading, and it is said
         self.assertEqual(names(self.db, "northern harbours"), ["a/book.txt"])
         self.assertEqual(self.db.execute("SELECT count(*) FROM doc_keys WHERE key LIKE 'fp:%'").fetchone()[0], 1)
         self.assertEqual(self.build(), (0, 0))              # the next inventory sees the file as it is now,
@@ -263,6 +263,93 @@ class Ambiguity(Reading):
         done = indexer.build(self.db, self.data, store.roots(self.db), progress=said.append)
         self.assertEqual(done, (0, 1))
         self.assertTrue(any("Could not fingerprint old.txt" in line for line in said))
+
+
+class Reading2(Reading):
+    """What a reading must not take on trust."""
+
+    def test_a_file_swapped_at_the_instant_it_is_read_is_noticed(self):
+        path = self.write("book.txt")
+        stamp = path.stat().st_mtime_ns
+        original = indexer.extract.passages
+
+        def swapping(source, fmt, work):
+            other = path.with_name("other")                 # another file takes the name: same size, same date
+            other.write_text(OTHER)
+            os.utime(other, ns=(stamp, stamp))
+            os.replace(other, path)
+            return original(source, fmt, work)
+
+        with patch("shelffind.extract.passages", side_effect=swapping):
+            self.assertEqual(self.build(), (1, 1))
+        self.assertEqual(self.db.execute("SELECT count(*) FROM pages").fetchone()[0], 0)
+        self.assertEqual(self.db.execute("SELECT count(*) FROM doc_keys WHERE key LIKE 'fp:%'").fetchone()[0], 0)
+
+    def test_a_document_is_never_completed_through_a_file_that_is_not_its_copy(self):
+        one = self.write("one/book.txt")
+        self.build()
+        with self.db:                                       # as a scan leaves it: a page still to recognise
+            self.db.execute("UPDATE pages SET needs_ocr=1")
+            self.db.execute("UPDATE docs SET state='needs-ocr'")
+        two = self.write("two/book.txt", OTHER)             # the same name, size and date: taken for a copy
+        self.build()
+        self.assertEqual(self.documents(), 1)
+        with patch("shelffind.extract.recognize", side_effect=lambda source, fmt, work, page, lang: source.read_text()[:60]):
+            done = indexer.build(self.db, self.data, store.roots(self.db), ocr=True, paths=[two], progress=lambda _: None)
+        self.assertEqual(done, (0, 0))                      # the second file is not the document: nothing is written
+        self.assertEqual(self.documents(), 2)
+        self.assertEqual(self.db.execute("SELECT count(*) FROM pages WHERE needs_ocr=1").fetchone()[0], 1)
+        with patch("shelffind.extract.recognize", side_effect=lambda source, fmt, work, page, lang: source.read_text()[:60]):
+            self.assertEqual(self.build(ocr=True), (1, 0))  # through the file it was read from
+        self.assertEqual(names(self.db, "northern harbours"), ["one/book.txt"])
+        self.assertEqual(self.build(), (1, 0))
+        self.assertEqual(names(self.db, "southern capes"), ["two/book.txt"])
+        self.assertEqual(one.read_text()[:4], "Tide")
+
+    def test_an_inventory_opens_no_file(self):
+        self.write("old.txt")
+        self.build()
+        self.db.execute("DELETE FROM doc_keys WHERE key LIKE 'fp:%'")
+        self.db.commit()
+        self.write("moved.txt", when=1_800_000_000)
+        with patch("shelffind.indexer.fingerprint", side_effect=AssertionError("a file was opened")), \
+                patch("shelffind.indexer.whole_checksums", side_effect=AssertionError("a file was opened")):
+            self.assertEqual(self.build(names_only=True), (0, 0))
+        self.read.clear()
+        self.assertEqual(self.build(), (1, 0))              # a reading run compares it, and reads nothing twice
+        self.assertEqual(self.read, [])
+        self.assertEqual(len(search(self.db, "northern harbours")[0]["copies"]), 1)
+
+    def test_one_folder_out_of_reach_does_not_stop_the_reading_of_another(self):
+        annex = self.base / "Annex"
+        annex.mkdir()
+        self.run_cli("roots", "add", str(annex))
+        self.write("first.txt")
+        (annex / "second.txt").write_text(OTHER)
+        self.build(names_only=True)
+        reach, state, said = store.available, {"reading": False}, []
+        gone = lambda root: reach(root) and not (state["reading"] and root["name"] == "Reading Room")
+        with patch("shelffind.indexer.store.available", side_effect=gone):      # it goes away once the reading begins
+            done = indexer.build(self.db, self.data, store.roots(self.db), progress=said.append,
+                                 on_document=lambda *told: state.update(reading=True))
+        self.assertEqual(done, (1, 1))
+        self.assertEqual(names(self.db, "southern capes"), ["Annex/second.txt"])
+        self.assertEqual(sum("Disconnected" in line for line in said), 1)
+
+    def test_the_same_bytes_under_two_formats_each_keep_their_checksum(self):
+        from shelffind import link
+        for name in ("notes.txt", "notes-a.md", "notes-b.md"):
+            self.write(name, when=1_700_000_000 + len(name))
+        ids = dict(self.db.execute("SELECT rel,id FROM files")) or None
+        self.build(names_only=True)
+        ids = dict(self.db.execute("SELECT rel,id FROM files"))
+        record = {"id": "W1", "keys": ["sha256:" + "cd" * 32], "title": "Notes", "text": True}
+        with self.db:
+            for rel in ids:
+                link.attach(self.db, ids[rel], "library", record, True, set())
+        docs = dict(self.db.execute("SELECT rel,doc FROM files"))
+        self.assertEqual(docs["notes-a.md"], docs["notes-b.md"])           # the two of one format are one document
+        self.assertNotEqual(docs["notes.txt"], docs["notes-a.md"])
 
 
 class Robustness(Reading):

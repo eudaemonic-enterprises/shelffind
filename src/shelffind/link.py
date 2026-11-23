@@ -36,7 +36,7 @@ def attach(db, file, name, record, trusted, known):
         return
     doc = row["doc"]
     keys = list(record.get("keys") or ())
-    carried = {r["key"] for r in db.execute("SELECT key FROM doc_keys WHERE doc=?", (doc,))}
+    carried = {r["key"].split("@")[0] for r in db.execute("SELECT key FROM doc_keys WHERE doc=?", (doc,))}
     contradicted = any(key not in carried and any(other.startswith(key.split(":", 1)[0] + ":") for other in carried)
                        for key in keys)
     read_elsewhere = not row["read"] and (any(key.startswith("fp:") for key in carried) or db.execute(
@@ -50,11 +50,7 @@ def attach(db, file, name, record, trusted, known):
         store.tend_orphans(db, drop=False)
         doc = apart
     for key in keys:
-        owner = db.execute("SELECT doc FROM doc_keys WHERE key=?", (key,)).fetchone()
-        if owner is None:
-            db.execute("INSERT INTO doc_keys(key,doc,basis) VALUES(?,?,'source')", (key, doc))
-        elif owner["doc"] != doc:
-            doc = store.merge(db, owner["doc"], doc) or doc         # the same content under two dates
+        doc = store.claim(db, doc, key, "source")           # the same content under two dates is one document
     title, byline = record.get("title") or "", record.get("byline") or ""
     year = "" if record.get("year") is None else str(record["year"])
     db.execute("INSERT OR REPLACE INTO records(doc,source,ref,title,byline,year,flags,basis,text,local) "
@@ -107,14 +103,16 @@ def link(db, directory, selected, progress=lambda text: None, everything=False):
                 db.execute("INSERT OR REPLACE INTO meta(key,value) VALUES(?,?)", (f"asked:{name}", str(time.time())))
         for root in selected:
             # A file whose document is still in question is left for the day it is settled.
+            # Asked about every file again, the source may also have lost a work it knew.
+            unasked = "" if everything else " AND NOT EXISTS (SELECT 1 FROM records r WHERE r.doc=f.doc AND r.source=?)"
             waiting = db.execute(
-                "SELECT f.id,f.doc,f.rel,f.size,f.mtime FROM files f WHERE f.root=? AND f.maybe IS NULL AND NOT EXISTS "
-                "(SELECT 1 FROM records r WHERE r.doc=f.doc AND r.source=?) ORDER BY f.id", (root["id"], name)).fetchall()
+                "SELECT f.id,f.doc,f.rel,f.size,f.mtime FROM files f WHERE f.root=? AND f.maybe IS NULL" + unasked
+                + " ORDER BY f.id", (root["id"], name) if unasked else (root["id"],)).fetchall()
             for start in range(0, len(waiting), BATCH):
                 batch = waiting[start:start + BATCH]
                 files = []
                 for number, row in enumerate(batch):
-                    sums = [r["key"] for r in db.execute(
+                    sums = [r["key"].split("@")[0] for r in db.execute(
                         "SELECT key FROM doc_keys WHERE doc=? AND (key LIKE 'sha256:%' OR key LIKE 'md5:%')",
                         (row["doc"],))]
                     files.append({"n": number, "path": str(Path(root["path"]) / row["rel"]), "size": row["size"],
@@ -130,11 +128,25 @@ def link(db, directory, selected, progress=lambda text: None, everything=False):
                         if 0 <= record["n"] < len(batch) and record["n"] not in answered:
                             answered.add(record["n"])
                             attach(db, batch[record["n"]]["id"], name, record, relied, known)
-                    # The files the source does not know are remembered as asked.
+                    # The files the source does not know are remembered as asked. When every
+                    # file was asked about again, this also withdraws what the source no longer
+                    # says of a document, unless another file of that document was recognised.
+                    silent = [(name, row["id"]) for number, row in enumerate(batch) if number not in answered]
                     db.executemany("INSERT OR IGNORE INTO records(doc,source,ref,text) "
-                                   "SELECT doc,?,'',0 FROM files WHERE id=?",
-                                   [(name, row["id"]) for number, row in enumerate(batch) if number not in answered])
+                                   "SELECT doc,?,'',0 FROM files WHERE id=?", silent)
+                    if everything:
+                        told = {db.execute("SELECT doc FROM files WHERE id=?", (batch[n]["id"],)).fetchone()[0]
+                                for n in answered}
+                        for _, file in silent:
+                            doc = db.execute("SELECT doc FROM files WHERE id=?", (file,)).fetchone()
+                            if doc and doc[0] not in told:
+                                db.execute("UPDATE records SET ref='',title=NULL,byline=NULL,year=NULL,flags=NULL,"
+                                           "basis=NULL,text=0,local=NULL WHERE doc=? AND source=?", (doc[0], name))
                 recognised += len(answered)
         if recognised:
             progress(f"{name}: {recognised:,} files recognised")
+    with db:                    # a document whose source has just withdrawn is the reader's again
+        db.execute(f"UPDATE docs SET state={RESTORED} WHERE state='covered' AND NOT EXISTS (SELECT 1 FROM records r "
+                   f"WHERE r.doc=docs.id AND r.text=1 AND r.source IN ({','.join('?' * len(relied_upon))}))",
+                   relied_upon)
     return recognised

@@ -257,6 +257,16 @@ class Conversion(Earlier):
                 migrate.discard_old(self.data)
             self.assertTrue((self.data / store.EARLIER).exists())
 
+    def test_an_old_index_of_the_same_shape_and_other_words_is_not_discarded(self):
+        self.converted()
+        late = sqlite3.connect(self.data / store.EARLIER)   # the same counts and lengths, another text
+        late.execute("UPDATE pages SET text='Short notes on the wing.' WHERE text='Short notes on the wind.'")
+        late.commit()
+        late.close()
+        with self.assertRaises(ValueError):
+            migrate.discard_old(self.data)
+        self.assertTrue((self.data / store.EARLIER).exists())
+
     def test_an_old_index_that_gained_something_since_is_not_discarded(self):
         self.converted()
         late = sqlite3.connect(self.data / store.EARLIER)   # an earlier version, still running, writes on

@@ -10,12 +10,22 @@ from . import extract, fuzzy, link, store
 BLOCK = 64 * 1024
 WHOLE = 4 << 20         # up to this size the whole file is its fingerprint; beyond, samples of it
 SAMPLES = 8
+CHANGED = "File changed during indexing; run index again"
 
 
-def check_stamp(path, row):
+class AnotherDocument(Exception):
+    """The file through which a document was to be read turned out to hold other content."""
+
+
+def check_stamp(path, row, same=None):
+    """Raise when the file is no longer what the inventory saw. Returns what tells the file
+    itself apart from another put in its place, to be given back as `same` at a later check."""
     stat = path.stat()
-    if path.is_symlink() or (stat.st_size, stat.st_mtime_ns) != (row["size"], row["mtime"]):
-        raise ValueError("File changed during indexing; run index again")
+    itself = (stat.st_dev, stat.st_ino)
+    if path.is_symlink() or (stat.st_size, stat.st_mtime_ns) != (row["size"], row["mtime"]) \
+            or (same is not None and same != itself):
+        raise ValueError(CHANGED)
+    return itself
 
 
 def fingerprint(path, fmt):
@@ -37,11 +47,12 @@ def fingerprint(path, fmt):
     return f"fp:{size}:{digest.hexdigest()[:32]}:{fmt}"
 
 
-def proven(path, row):
-    """The fingerprint of a file that stayed as the inventory saw it while it was read."""
-    check_stamp(path, row)
+def proven(path, row, same=None):
+    """The fingerprint of a file that stayed as the inventory saw it, and itself, while it was
+    read."""
+    same = check_stamp(path, row, same)
     key = fingerprint(path, row["format"])
-    check_stamp(path, row)
+    check_stamp(path, row, same)
     return key
 
 
@@ -59,46 +70,45 @@ def stored_checksum(remote, rel):
 
 def whole_checksums(path, row):
     """The MD5 and the SHA-256 of a file read in full, which stayed as the inventory saw it."""
-    check_stamp(path, row)
+    same = check_stamp(path, row)
     sums = hashlib.md5(), hashlib.sha256()
     with path.open("rb") as source:
         while block := source.read(1 << 20):
             for one in sums:
                 one.update(block)
-    check_stamp(path, row)
+    check_stamp(path, row, same)
     return [f"md5:{sums[0].hexdigest()}", f"sha256:{sums[1].hexdigest()}"]
 
 
 def joined(db, file, keys):
-    """Give the document of `file` the checksums `keys` of its own bytes. A document that
-    carries one of them already is the same document: the two are merged. Returns True then."""
+    """Give the document of `file` the checksums `keys` of its own bytes. Returns True when a
+    document that carried one of them already turned out to be the same, and was merged."""
     merged = False
     for key in keys:
         own = db.execute("SELECT doc FROM files WHERE id=?", (file,)).fetchone()
-        owner = db.execute("SELECT doc FROM doc_keys WHERE key=?", (key,)).fetchone()
         if own is None:
             break
-        if owner is None:
-            db.execute("INSERT INTO doc_keys(key,doc,basis) VALUES(?,?,'content')", (key, own["doc"]))
-        elif owner["doc"] != own["doc"] and store.merge(db, owner["doc"], own["doc"]) is not None:
-            merged = True
+        merged = store.claim(db, own["doc"], key, "content") != own["doc"] or merged
     return merged
 
 
-def settle(db, root, progress):
-    """Answer by reading what the inventory left open in one folder. A file that resembles a
-    known document is fingerprinted, and joins the document that has this fingerprint, if there
-    is one; otherwise it stays the new document it was given. A document read before
-    fingerprints existed gets its own through the very file it was read from. Returns the
-    number of files that could not be read."""
+def settle(db, root, progress, reads=True, only=None):
+    """Answer what the inventory left open in one folder. A file that resembles a known
+    document is compared with it: by the checksum its storage gives, when the folder has an
+    rclone twin, which costs no reading; otherwise, and only when `reads` allows, by its
+    fingerprint, and by a full reading for its checksums when a source described a document of
+    that size. It joins the document that has the same content, if there is one. A document
+    read before fingerprints existed gets its own through the very file it was read from.
+    `only` limits the work to some addresses. Returns the number of files that could not be
+    compared."""
     failures = 0
+    sums = "SELECT 1 FROM docs d JOIN doc_keys k ON k.doc=d.id WHERE d.size=? AND d.format=? AND k.key LIKE ? LIMIT 1"
     asked = db.execute("SELECT id,rel,size,mtime,format FROM files WHERE root=? AND maybe IS NOT NULL",
                        (root["id"],)).fetchall()
-    sums = "SELECT 1 FROM docs d JOIN doc_keys k ON k.doc=d.id WHERE d.size=? AND d.format=? AND k.key LIKE ? LIMIT 1"
     for row in asked:
+        if only is not None and row["rel"] not in only:
+            continue
         path = Path(root["path"]) / row["rel"]
-        # The storage may tell the checksum of the file without its being read: a document that
-        # a source described by that checksum is then recognised at no cost.
         if root.get("remote") and db.execute(sums, (row["size"], row["format"], "md5:%")).fetchone():
             given = stored_checksum(root["remote"], row["rel"])
             if given:
@@ -106,9 +116,13 @@ def settle(db, root, progress):
                     if joined(db, row["id"], [given]):
                         db.execute("UPDATE files SET maybe=NULL WHERE id=?", (row["id"],))
                         continue
+        if not reads:
+            continue
         try:
             found = proven(path, row)
-        except ValueError:                  # changed since the inventory, which will see it again
+        except ValueError:
+            progress(f"Changed while it was compared: {row['rel']}; run index again")
+            failures += 1
             continue
         except OSError as fault:
             progress(f"Could not compare {row['rel']}: {fault}")
@@ -132,6 +146,8 @@ def settle(db, root, progress):
                 continue
             with db:
                 joined(db, row["id"], given)
+    if not reads:
+        return failures
     # The file a document was read from, unchanged since, is the one proof of what its pages
     # hold: no other file may lend the document a fingerprint.
     bare = db.execute(
@@ -139,6 +155,8 @@ def settle(db, root, progress):
         "AND EXISTS (SELECT 1 FROM pages p WHERE p.doc=f.doc) AND NOT EXISTS "
         "(SELECT 1 FROM doc_keys k WHERE k.doc=f.doc AND k.key LIKE 'fp:%') ORDER BY f.id", (root["id"],)).fetchall()
     for row in bare:
+        if only is not None and row["rel"] not in only:
+            continue
         if db.execute("SELECT 1 FROM doc_keys WHERE doc=? AND key LIKE 'fp:%'", (row["doc"],)).fetchone():
             continue                        # another of its files gave it a moment ago
         try:
@@ -158,18 +176,37 @@ def settle(db, root, progress):
     return failures
 
 
+def set_apart(db, root, row):
+    """A file taken for a copy of a document turned out to hold other content: give it a
+    document of its own, to be read for itself."""
+    with db:
+        file = db.execute("SELECT id,name FROM files WHERE root=? AND rel=?", (root["id"], row["rel"])).fetchone()
+        if file is None:
+            return
+        apart = db.execute("INSERT INTO docs(size,format,state) VALUES(?,?,'pending')",
+                           (row["size"], row["format"])).lastrowid
+        db.execute("INSERT INTO doc_keys(key,doc,basis) VALUES(?,?,'apart by content')",
+                   (f"apart:{apart}:{store.digest(file['name'])}", apart))
+        db.execute("UPDATE files SET doc=?,maybe=NULL,read=0 WHERE id=?", (apart, file["id"]))
+        store.describe(db, apart)
+
+
 def update_text(db, root, row, ocr, languages):
     """Read one document through one of its files. Returns False when its content turned out
     to be that of a document already read, in which case nothing was extracted."""
     path = Path(root["path"]) / row["rel"]
     doc = row["doc"]
-    key = None
-    if ocr:
-        check_stamp(path, row)
-    else:
-        key = proven(path, row)
-        with db:
-            db.execute("UPDATE files SET print=? WHERE root=? AND rel=?", (key, root["id"], row["rel"]))
+    same = check_stamp(path, row)
+    key = proven(path, row, same)
+    with db:
+        db.execute("UPDATE files SET print=? WHERE root=? AND rel=?", (key, root["id"], row["rel"]))
+    carried = [r["key"] for r in db.execute("SELECT key FROM doc_keys WHERE doc=? AND key LIKE 'fp:%'", (doc,))]
+    if carried and key not in carried:
+        # The document has a fingerprint and this file has another: the inventory took the file
+        # for a copy on the strength of its name, size and date, and it is not one.
+        set_apart(db, root, row)
+        raise AnotherDocument(row["rel"])
+    if not ocr:
         owner = db.execute("SELECT doc FROM doc_keys WHERE key=?", (key,)).fetchone()
         if owner and owner["doc"] != doc:
             with db:
@@ -182,19 +219,20 @@ def update_text(db, root, row, ocr, languages):
                                 "ORDER BY page", (doc,)).fetchall()
             for page in blanks:
                 text = extract.recognize(source, fmt, work, page["page"], languages)
-                check_stamp(path, row)
+                check_stamp(path, row, same)
                 with db:
                     db.execute("UPDATE pages SET ztext=?,needs_ocr=0 WHERE id=?", (store.deflate(text), page["id"]))
                     fuzzy.remember_more(db, (text,))
             with db:
                 db.execute("UPDATE docs SET state='indexed',error=NULL WHERE id=?", (doc,))
+                db.execute("INSERT OR IGNORE INTO doc_keys(key,doc,basis) VALUES(?,?,'content')", (key, doc))
                 db.execute("UPDATE files SET read=1 WHERE root=? AND rel=?", (root["id"], row["rel"]))
             return True
         pages = list(extract.passages(source, fmt, work))
         if not pages:
             raise ValueError("No readable pages or EPUB chapters found")
         state = "needs-ocr" if any(p.needs_ocr for p in pages) else "indexed"
-        check_stamp(path, row)
+        check_stamp(path, row, same)
         with db:
             db.execute("DELETE FROM pages WHERE doc=?", (doc,))
             fuzzy.remember_text(db, (p.text for p in pages))
@@ -204,6 +242,14 @@ def update_text(db, root, row, ocr, languages):
             # The fingerprint is kept once the reading has succeeded, and not before.
             db.execute("INSERT OR IGNORE INTO doc_keys(key,doc,basis) VALUES(?,?,'content')", (key, doc))
             db.execute("UPDATE files SET read=1 WHERE root=? AND rel=?", (root["id"], row["rel"]))
+    if root.get("remote"):
+        # The checksum of its storage, kept with the document, will recognise the file after a
+        # move without its being read again.
+        given = stored_checksum(root["remote"], row["rel"])
+        file = db.execute("SELECT id FROM files WHERE root=? AND rel=?", (root["id"], row["rel"])).fetchone()
+        if given and file:
+            with db:
+                joined(db, file["id"], [given])
     return True
 
 
@@ -212,7 +258,8 @@ def build(db, directory, selected, *, names_only=False, ocr=False, languages="en
     """Refresh the inventory, settle what it left open, ask the sources which files they know,
     then read the waiting documents. `progress(text)` receives the messages;
     `on_document(done, total, name)` is called before each document is read; `relink` asks the
-    sources about every file again."""
+    sources about every file again. With `names_only` no file is opened: what the inventory
+    left open is settled only as far as the storage of a folder tells checksums."""
     done = failures = 0
     ready = []
     with store.index_lock(directory):
@@ -230,8 +277,11 @@ def build(db, directory, selected, *, names_only=False, ocr=False, languages="en
                     db.execute("UPDATE roots SET problem=? WHERE id=?", (str(exc), root["id"]))
                 progress(str(exc))
                 failures += 1
+        chosen = {}
         for root in ready:
-            failures += settle(db, root, progress)
+            chosen[root["id"]] = {str(p.relative_to(root["path"])) for p in paths if p.is_relative_to(root["path"])} \
+                if paths else None
+            failures += settle(db, root, progress, reads=not names_only, only=chosen[root["id"]])
         link.link(db, directory, ready, progress, everything=relink)
         if names_only:
             return done, failures
@@ -239,52 +289,63 @@ def build(db, directory, selected, *, names_only=False, ocr=False, languages="en
         states = ["needs-ocr"] if ocr else ["pending"]
         if retry:
             states.append("ocr-error" if ocr else "error")
-        # One document may be read through any of its files: the others are tried when one fails.
+        # One document may be read through any of its files, the one it was read from first:
+        # the others are tried when one fails.
         candidates = {}
         for root in ready:
             query = ("SELECT f.doc,f.rel,f.size,f.mtime,f.format FROM files f JOIN docs d ON d.id=f.doc "
                      "WHERE f.root=? AND f.maybe IS NULL AND d.state IN (" + ",".join("?" * len(states)) + ")")
             params = [root["id"], *states]
             if paths:
-                rels = [str(p.relative_to(root["path"])) for p in paths if p.is_relative_to(root["path"])]
+                rels = sorted(chosen[root["id"]])
                 if not rels:
                     continue
                 query += " AND f.rel IN (" + ",".join("?" * len(rels)) + ")"
                 params += rels
-            for row in db.execute(query + " ORDER BY f.id", params).fetchall():
+            for row in db.execute(query + " ORDER BY f.read DESC,f.id", params).fetchall():
                 candidates.setdefault(row["doc"], []).append((root, row))
         total = len(candidates) if limit is None else min(len(candidates), limit)
+        offline = set()
         for doc, copies in candidates.items():
             if limit is not None and done >= limit:
                 return done, failures
             if on_document:
                 on_document(done, total, copies[0][1]["rel"])
-            fault = None
+            fault, tried = None, False
             for root, row in copies:
-                if not store.available(root):
+                if root["id"] in offline:
+                    continue
+                if not store.available(root):       # the other folders go on being read
                     progress(f"Disconnected: {root['path']}; saved completed work")
-                    return done, failures + 1
+                    offline.add(root["id"])
+                    failures += 1
+                    continue
                 still = db.execute("SELECT doc FROM files WHERE root=? AND rel=?", (root["id"], row["rel"])).fetchone()
                 if still is None or still["doc"] != doc:
                     continue                    # this file went to another document meanwhile
                 try:
                     update_text(db, root, row, ocr, languages)
-                    fault = None
+                    fault, tried = None, True
                     break
                 except sqlite3.Error:
                     raise
+                except AnotherDocument:
+                    continue                    # not a copy after all: the next file is tried
                 except Exception as exc:        # one unreadable file must not stop the others
                     if not store.available(root):
                         progress(f"Disconnected: {root['path']}; saved completed work")
-                        return done, failures + 1
-                    fault = (row["rel"], exc)
+                        offline.add(root["id"])
+                        failures += 1
+                        continue
+                    fault, tried = (row["rel"], exc), True
             if fault:
                 with db:
                     db.execute("UPDATE docs SET state=?,error=? WHERE id=?",
                                ("ocr-error" if ocr else "error", str(fault[1])[:1200], doc))
                 progress(f"Could not read {fault[0]}: {fault[1]}")
                 failures += 1
-            done += 1
-            if done % 100 == 0:
-                progress(f"{done:,} documents processed")
+            if tried:
+                done += 1
+                if done % 100 == 0:
+                    progress(f"{done:,} documents processed")
     return done, failures

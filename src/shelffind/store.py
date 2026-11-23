@@ -483,6 +483,27 @@ def merge(db, one, other):
     return keep
 
 
+def claim(db, doc, key, basis):
+    """Give the document `doc` the checksum `key` of its bytes, and return the document that
+    carries it afterwards. A document of the same format that carries the key already is the
+    same document: the two are merged. The same bytes under another format are another
+    document, read by another reader: the key is then kept under that format."""
+    told = db.execute("SELECT format FROM docs WHERE id=?", (doc,)).fetchone()
+    if told is None:
+        return doc
+    for name in (key, f"{key}@{told['format']}"):
+        owner = db.execute("SELECT doc FROM doc_keys WHERE key=?", (name,)).fetchone()
+        if owner is None:
+            db.execute("INSERT INTO doc_keys(key,doc,basis) VALUES(?,?,?)", (name, doc, basis))
+            return doc
+        if owner["doc"] == doc:
+            return doc
+        kept = merge(db, owner["doc"], doc)
+        if kept is not None:
+            return kept
+    return doc
+
+
 def slow_mounts():
     """The places of this machine whose files come through a network or a program, not from a
     disk: a document there opens after a wait."""

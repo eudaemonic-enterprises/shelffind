@@ -39,18 +39,16 @@ def refuse_development(directory):
 
 
 def print_of(old):
-    """A print of what an old index holds: its folders, the number and the sum of its files,
-    of its pages and of its remembered searches. It is the same as long as nothing is added to
-    the old index or taken from it."""
+    """A print of everything an old index holds: its folders, its files, the text of its pages
+    and the searches it remembers. It is the same as long as nothing is added to the old index,
+    taken from it or changed in it."""
     told = hashlib.sha256()
-    for row in old.execute("SELECT id,path FROM roots ORDER BY id"):
-        told.update(repr(tuple(row)).encode())
-    for question in ("SELECT count(*),coalesce(max(id),0),coalesce(sum(size),0),coalesce(sum(mtime/1000000000),0) "
-                     "FROM files",
-                     "SELECT count(*),coalesce(max(id),0),coalesce(sum(length(text)),0),coalesce(sum(needs_ocr),0) "
-                     "FROM pages",
-                     "SELECT count(*),coalesce(max(used),0) FROM history"):
-        told.update(repr(tuple(old.execute(question).fetchone())).encode())
+    for question in ("SELECT id,path FROM roots ORDER BY id",
+                     "SELECT id,root,rel,size,mtime,state,error FROM files ORDER BY id",
+                     "SELECT id,file,page,needs_ocr,text FROM pages ORDER BY id",
+                     "SELECT query,used FROM history ORDER BY query"):
+        for row in old.execute(question):
+            told.update(repr(tuple(row)).encode("utf-8", "surrogatepass"))
     return told.hexdigest()
 
 
