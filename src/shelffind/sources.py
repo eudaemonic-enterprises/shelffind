@@ -367,6 +367,60 @@ def resolve(directory, source, identifier):
     raise ValueError("Provider returned no available file or citation URI")
 
 
+def check(directory, name, query):
+    """Put to the source `name` the questions it says it answers and yield, for each, a status
+    (ok, warn or fail), the question, and what came back. Nothing is changed, and no action of
+    the source is carried out."""
+    program = registered(directory).get(name)
+    if not program:
+        yield "fail", "source", f"{name} is not registered"
+        return
+    try:
+        caps = abilities(directory, name, program, fresh=True)
+    except (OSError, ValueError) as fault:
+        yield "fail", "hello", str(fault)
+        return
+    if caps["version"] < 2:
+        yield "ok", "hello", "version 1 (the program does not answer hello): search and resolve"
+    else:
+        told = [", ".join(caps["ops"]), "holds text" if caps["text"] else "no text",
+                "needs the network" if caps["network"] else "works offline"]
+        yield "ok", "hello", f"version 2 · {' · '.join(told)}"
+        for action in caps["actions"]:
+            yield "ok", "action", f"{action['name']}: {action['label']} ({action['result']})"
+    terms = [{"text": t, "literal": literal, "alternatives": []} for t, literal in query_terms(query)]
+    request = {"op": "search", "query": query, "terms": terms, "exact": False, "limit": 5, "format": None,
+               "where": "all"}
+    started = time.monotonic()
+    try:
+        rows = answers(directory, name, program, request, 5, [], lambda: False)
+    except (OSError, TypeError, ValueError) as fault:
+        yield "fail", "search", str(fault)
+        return
+    spent = time.monotonic() - started
+    yield ("ok" if spent < 1 else "warn"), "search", f"{len(rows)} results for \"{query}\" in {spent:.2f} s" + \
+        ("" if rows else "; try words the source surely knows")
+    for found in rows[:1]:
+        yield "ok", "result", " · ".join(str(part) for part in (found["name"], found.get("byline"), found.get("year"),
+                                                                  found["match"]) if part)
+        try:
+            place = resolve(directory, name, found["id"])
+            yield "ok", "resolve", place.get("path") or place["uri"]
+        except (OSError, ValueError) as fault:
+            yield "fail", "resolve", str(fault)
+    try:
+        if "identify" in caps["ops"]:
+            unknown = {"n": 0, "path": "/nonexistent/shelffind-check.pdf", "size": 1, "mtime": 0, "keys": []}
+            records = question(directory, name, "identify", files=[unknown])["records"]
+            yield ("ok" if not records else "warn"), "identify", \
+                "a file that does not exist is not recognised" if not records else "a made-up file was recognised"
+        if "pages" in caps["ops"] and rows:
+            told = question(directory, name, "pages", id=rows[0]["id"], first=rows[0].get("page") or 1, count=1)
+            yield "ok", "pages", f"{len(told['pages'])} page of {told.get('total', '?')}"
+    except (OSError, ValueError) as fault:
+        yield "fail", "questions", str(fault)
+
+
 def actions(directory, name):
     """The actions the source `name` declares, as name -> (label, kind of result)."""
     program = registered(directory).get(name)

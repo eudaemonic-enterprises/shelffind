@@ -46,6 +46,9 @@ def parser():
     provider.add_argument("program", type=Path)
     external.add_parser("remove").add_argument("name")
     external.add_parser("list")
+    trial = external.add_parser("check", help="Ask a source every question and report what it answers")
+    trial.add_argument("name")
+    trial.add_argument("query", nargs="*", help="Words the source surely knows (default: the)")
     ix = cmds.add_parser("index", help="Refresh names and continue reading document text")
     mode = ix.add_mutually_exclusive_group()
     mode.add_argument("--names-only", action="store_true", help="Only update the file inventory")
@@ -55,6 +58,7 @@ def parser():
     ix.add_argument("--limit", type=int, help="Maximum number of documents to read this pass")
     ix.add_argument("--root", help="Index one registered folder")
     ix.add_argument("--file", type=Path, action="append", default=[], help="Read text from selected files only (repeatable)")
+    ix.add_argument("--relink", action="store_true", help="Ask the sources about every file again")
     st = cmds.add_parser("status", help="Index coverage and pending work")
     st.add_argument("--json", action="store_true")
     st.add_argument("--errors", action="store_true", help="List failed files and reasons")
@@ -235,6 +239,12 @@ def execute(args, db, directory, settings):
             print("files")
             for name, command in sources.registered(directory).items():
                 print(f"{name}  {' '.join(command)}")
+        elif args.action == "check":
+            faults = 0
+            for verdict, what, detail in sources.check(directory, args.name, " ".join(args.query) or "the"):
+                print(safe(f"[{verdict:^4}] {what:<9} {detail}"))
+                faults += verdict == "fail"
+            return int(bool(faults))
         else:
             sources.configure(directory, args.name, args.program if args.action == "add" else None)
     elif args.command == "index":
@@ -256,7 +266,7 @@ def execute(args, db, directory, settings):
         try:
             count, failures = indexer.build(
                 db, directory, roots, names_only=args.names_only, ocr=args.ocr, languages=args.lang,
-                retry=args.retry, limit=args.limit, paths=files,
+                retry=args.retry, limit=args.limit, paths=files, relink=args.relink,
                 progress=live.message if live else lambda s: print(safe(s), file=sys.stderr, flush=True),
                 on_document=live.document if live else None)
         finally:

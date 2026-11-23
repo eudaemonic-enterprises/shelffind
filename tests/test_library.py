@@ -212,6 +212,30 @@ class Linked(Shelf):
         rows, _ = self.find("lighthill src:library")
         self.assertEqual(len(rows), 1)
 
+    def test_a_source_is_checked_question_by_question(self):
+        code, out, _ = self.run_cli("sources", "check", "library", "group", "velocity")
+        self.assertEqual(code, 0, out)
+        lines = out.splitlines()
+        self.assertTrue(lines[0].startswith("[ ok ] hello     version 2 · search, resolve, identify, pages, act"))
+        self.assertIn("holds text · works offline", lines[0])
+        self.assertIn("[ ok ] action    cite: Copy the citation key (copy)", lines)
+        self.assertTrue(any(line.startswith('[ ok ] search    2 results for "group velocity"') for line in lines))
+        self.assertTrue(any(line.startswith("[ ok ] resolve") for line in lines))
+        self.assertIn("[ ok ] identify  a file that does not exist is not recognised", lines)
+        self.assertIn("[ ok ] pages     1 page of 2", lines)
+        self.catalogue(closed="refuse")
+        code, out, _ = self.run_cli("sources", "check", "library", "group")
+        self.assertEqual(code, 1)
+        self.assertIn("[fail] search    The library index is being rebuilt", out.splitlines())
+        old = self.base / "old-source"
+        old.write_text("#!/bin/sh\ncat > /dev/null\necho '[{\"id\": \"a\", \"name\": \"A record\"}]'\n")
+        old.chmod(0o700)
+        sources.configure(self.data, "old", old)
+        code, out, _ = self.run_cli("sources", "check", "old")
+        self.assertIn("version 1", out.splitlines()[0])
+        self.assertIn('1 results for "the"', out)
+        self.assertEqual(self.run_cli("sources", "check", "nobody")[0], 1)
+
     def test_the_copy_of_the_library_on_this_machine_is_offered_for_opening(self):
         kept = self.folder / "9f2c.txt"
         kept.write_text(BOOK)
