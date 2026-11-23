@@ -138,6 +138,27 @@ class Commands(Shelf):
             settings.write_text(text)
             self.assertEqual(self.run_cli("config", "check")[0], 1, text)
 
+    def test_an_old_list_of_files_is_refreshed_beside_the_panel(self):
+        from argparse import Namespace
+        from shelffind import cli
+        settings, args = config.defaults(), Namespace(data_dir=self.data)
+        (self.root / "lantern.txt").write_text("Copper lantern.")
+        with patch("shelffind.cli.apart") as started:
+            cli.refresh_later(args, self.db, settings)              # never listed yet
+            self.assertEqual(started.call_args.args[1:], ("index", "--names-only"))
+            self.build()
+            started.reset_mock()
+            cli.refresh_later(args, self.db, settings)              # listed a moment ago
+            started.assert_not_called()
+            self.db.execute("UPDATE roots SET scanned='2020-01-01 00:00:00'")
+            cli.refresh_later(args, self.db, settings)
+            self.assertEqual(started.call_count, 1)
+            settings.set("index.refresh", 0, "test")
+            cli.refresh_later(args, self.db, settings)
+            self.assertEqual(started.call_count, 1)                 # the setting 0 leaves the list alone
+        settings = config.load(self.data, True, environ={"SHELFFIND_INDEX_REFRESH": "5"})
+        self.assertEqual(settings["index.refresh"], 5)
+
     def test_check_reports_faults_and_other_commands_go_on_with_the_defaults(self):
         self.assertEqual(self.run_cli("config", "check")[0], 0)
         (self.data / "config.toml").write_text("[panel]\nhieght = 3\n")

@@ -47,6 +47,7 @@ SETTINGS = {
     "panel.after_open": (("close", "stay"), "close", "What the panel does once a document is opened."),
     "search.limit": (int, 50, "Results listed in the panel."),
     "search.scope": (("all", "name", "text"), "all", "What the panel searches when it opens."),
+    "index.refresh": (int, 60, "Minutes after which opening the panel refreshes the list of files; 0 never."),
     "history.record": (bool, True, "Remember the searches made and the documents opened."),
     "share.history": (bool, False, "Share that journal between your machines; off unless asked for."),
     "share.folder": (str, "", "The shared place, as a folder that some tool keeps in step."),

@@ -181,6 +181,7 @@ def find(args, db, directory, settings):
         opts = {"root": args.root, "fmt": args.fmt, "exact": args.exact, "source": args.source,
                 "limit": args.limit or settings["search.limit"],
                 "where": args.where or settings["search.scope"]}
+        refresh_later(args, db, settings)
         if picking:
             code, text, _ = panel(db, directory, query, opts, settings, enter=args.enter,
                                   quote=args.quote, widget=args.widget)
@@ -215,17 +216,34 @@ def find(args, db, directory, settings):
 EXCHANGE = 600          # seconds between two exchanges started by the panel
 
 
+def apart(args, *command):
+    """Start a ShelfFind command in a process of its own, which outlives this one, says nothing
+    and delays nothing."""
+    place = ["--data-dir", str(args.data_dir)] if args.data_dir else []
+    try:
+        subprocess.Popen([sys.executable, "-m", "shelffind", *place, *command], start_new_session=True,
+                         stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    except OSError:
+        pass
+
+
+def refresh_later(args, db, settings):
+    """When the panel opens and the list of files is older than the settings allow: refresh it
+    beside the panel. Files added, moved or renamed since are then found without a command."""
+    minutes = settings["index.refresh"]
+    if minutes <= 0:
+        return
+    oldest = db.execute("SELECT min(coalesce(strftime('%s',scanned),0)),count(*) FROM roots").fetchone()
+    if oldest[1] and time.time() - int(oldest[0]) > 60 * minutes:
+        apart(args, "index", "--names-only")
+
+
 def exchange_later(args, directory, settings):
     """After the panel, when journals are shared and the last exchange is not recent: start
     one in a process of its own, which outlives this one and delays nothing."""
     if sharing.carrier(settings) is None or time.time() - sharing.last(directory).get("synced", 0) < EXCHANGE:
         return
-    place = ["--data-dir", str(args.data_dir)] if args.data_dir else []
-    try:
-        subprocess.Popen([sys.executable, "-m", "shelffind", *place, "sync", "--quiet"], start_new_session=True,
-                         stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-    except OSError:
-        pass
+    apart(args, "sync", "--quiet")
 
 
 def look(settings, stream):
