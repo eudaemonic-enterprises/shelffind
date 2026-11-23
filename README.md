@@ -2,7 +2,7 @@
 
 # ShelfFind
 
-Find a document by its name, a few remembered letters, its folder, or a passage. Search works while the index is building. Press Enter to open the selected file, F2 to choose a registered application, or F3 to select it in Nautilus.
+Find a document by its name, a few remembered letters, its folder, or a passage. Search works while the index is building. Use `shelffind search --list` with a query to print matches and page snippets in the terminal. In the interactive picker, Enter opens the selected file in the default application and closes the picker. F2 lets you choose an application and F3 selects the file in Nautilus.
 
 ## Install and search
 
@@ -20,7 +20,7 @@ The first pass lists every regular file. The second reads supported documents on
 shelffind search --list orchadr
 shelffind search --json --format pdf '"brass compass"'
 shelffind search --root Documents --list garden
-shelffind search --where text --list "brass compass"
+shelffind search --where text --list '"brass compass"'
 shelffind status --errors
 shelffind index --limit 100
 shelffind index --retry

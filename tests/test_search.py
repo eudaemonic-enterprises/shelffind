@@ -2,8 +2,10 @@
 import contextlib
 import io
 import json
+import os
 import shutil
 import subprocess
+import sys
 import tempfile
 import unittest
 from pathlib import Path
@@ -141,6 +143,7 @@ class Collection(unittest.TestCase):
         doc = self.root / "a 'quote' & a $ sign.pdf"
         doc.touch()
         with patch("shelffind.desktop.subprocess.run") as run:
+            run.return_value.returncode = 0
             desktop.launch(doc)
             self.assertEqual(run.call_args.args[0], ["gio","open",doc.as_uri()])
             with patch("shelffind.desktop.applications", return_value=["reader.desktop"]):
@@ -148,10 +151,38 @@ class Collection(unittest.TestCase):
                 self.assertEqual(run.call_args.args[0], ["gtk-launch","reader.desktop",doc.as_uri()])
                 with self.assertRaises(ValueError):
                     desktop.launch(doc,"unknown.desktop")
+            desktop.open_uri("https://example.org/record")
+            self.assertEqual(run.call_args.args[0], ["gio","open","https://example.org/record"])
         with patch("shelffind.desktop.subprocess.Popen") as popen:
             popen.return_value.wait.return_value = 0
             desktop.reveal(doc)
             self.assertEqual(popen.call_args.args[0], ["nautilus","--select",doc.as_uri()])
+
+    def test_viewer_output_stays_out_of_terminal_and_launcher_errors_are_reported(self):
+        doc = self.root / "article.pdf"
+        doc.touch()
+        launcher = self.base / "gio"
+        launcher.write_text(
+            "#!/bin/sh\n"
+            'if [ "$TEST_LAUNCH_FAILURE" = 1 ]; then\n'
+            "    echo 'No application accepted this file' >&2\n"
+            "    exit 7\n"
+            "fi\n"
+            "echo 'Opening in existing session'\n"
+            "(sleep 0.1; echo 'late viewer diagnostic' >&2) &\n"
+        )
+        launcher.chmod(0o700)
+        env = {**os.environ, "PATH": str(self.base) + os.pathsep + os.environ["PATH"],
+               "TEST_LAUNCH_FAILURE": "0"}
+        argv = [sys.executable, "-m", "shelffind.cli", "--data-dir", str(self.data), "open", str(doc)]
+        opened = subprocess.run(argv, env=env, check=False, capture_output=True, text=True, timeout=5)
+        self.assertEqual((opened.returncode, opened.stdout, opened.stderr), (0, "", ""))
+
+        env["TEST_LAUNCH_FAILURE"] = "1"
+        failed = subprocess.run(argv, env=env, check=False, capture_output=True, text=True, timeout=5)
+        self.assertEqual(failed.returncode, 1)
+        self.assertIn("No application accepted this file", failed.stderr)
+        self.assertIn("status 7", failed.stderr)
 
     def test_version_without_index_and_invalid_optional_configuration(self):
         fresh = self.base / "unopened"

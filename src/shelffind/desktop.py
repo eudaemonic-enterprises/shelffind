@@ -2,6 +2,7 @@
 """Desktop integration. Pass URIs as separate arguments to the desktop programs."""
 import os
 import subprocess
+import tempfile
 from pathlib import Path
 
 
@@ -31,6 +32,18 @@ def applications(path):
                               if line.startswith((" ", "\t")) and line.strip().endswith(".desktop")))
 
 
+def _run_launcher(argv):
+    # A viewer can keep the launcher's streams open after the launcher exits.
+    # A regular file lets us report startup errors without waiting for pipe EOF.
+    with tempfile.TemporaryFile() as errors:
+        result = subprocess.run(argv, check=False, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                                stderr=errors, start_new_session=True, timeout=20)
+        if result.returncode:
+            detail = os.pread(errors.fileno(), 2048, 0).decode(errors="replace").strip()
+            message = f"{argv[0]} exited with status {result.returncode}"
+            raise ValueError(f"{message}: {detail}" if detail else message)
+
+
 def launch(path, app=None):
     target = uri(path)
     if app:
@@ -39,7 +52,7 @@ def launch(path, app=None):
         argv = ["gtk-launch", app, target]
     else:
         argv = ["gio", "open", target]
-    subprocess.run(argv, check=True, timeout=20)
+    _run_launcher(argv)
 
 
 def reveal(path):
@@ -54,4 +67,4 @@ def reveal(path):
 
 
 def open_uri(target):
-    subprocess.run(["gio", "open", target], check=True, timeout=20)
+    _run_launcher(["gio", "open", target])
