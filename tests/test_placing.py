@@ -447,15 +447,20 @@ class Reading3(Placing):
         self.build(names_only=True)
         for number in range(3):
             self.measure(f"copies/{number}.txt")
-        tried = []
+        tried, copied, real = [], [], indexer.private_copy
 
         def failing(source, fmt, work):
             tried.append(source.name)
             raise RuntimeError("the reader stumbled")
 
-        with patch("shelffind.extract.passages", side_effect=failing):
-            self.assertEqual((self.build(), len(tried)), ((1, 1), 1))
-            self.assertEqual((self.build(retry=True), len(tried)), ((1, 1), 2))    # once more when asked, and once only
+        def copying(path, row, hold, known=None):
+            copied.append(path.name)
+            return real(path, row, hold, known)
+
+        with patch("shelffind.extract.passages", side_effect=failing), patch("shelffind.indexer.private_copy", side_effect=copying):
+            self.assertEqual((self.build(), len(tried), len(copied)), ((1, 1), 1, 1))
+            # Once more when asked, and once only: its other files are not even copied.
+            self.assertEqual((self.build(retry=True), len(tried), len(copied)), ((1, 1), 2, 2))
         self.assertEqual(self.build(retry=True), (1, 0))
         self.sound()
 
@@ -523,6 +528,44 @@ class Reading3(Placing):
         with patch("shelffind.indexer.private_copy", side_effect=counting):
             self.assertEqual(self.build(), (1, 0))
         self.assertEqual(len(taken), 1)
+
+
+class Behind(Placing):
+    """A folder whose storage has received nothing yet: its files are measured only when they
+    are copied to be read, so a file may turn out, at that moment, to be another document."""
+
+    def setUp(self):
+        super().setUp()
+        behind = self.base / "behind"
+        behind.mkdir()
+        self.twin(behind)
+
+    def test_a_failed_reading_is_charged_to_the_document_that_the_copy_shows_the_file_to_be(self):
+        self.write("b/book.txt")                            # this one is taken up first, as a document of its own
+        self.build(names_only=True)
+        self.write("a/book.txt")
+        self.build(names_only=True)
+        self.measure("a/book.txt")                          # the other is known by its checksums, and waits
+        self.assertEqual(self.documents(), 2)
+        with patch("shelffind.extract.passages", side_effect=RuntimeError("the reader stumbled")):
+            self.assertEqual(self.build(), (1, 1))          # copied, the first is that document, whose reading fails
+        self.assertEqual((self.documents(), self.state("a/book.txt"), self.state("b/book.txt")), (1, "error", "error"))
+        self.assertEqual(self.build(retry=True), (1, 0))
+        self.sound()
+
+    def test_a_run_allowed_one_reading_stops_though_the_files_of_its_document_turn_out_to_differ(self):
+        one = self.write("a/book.txt")
+        self.write("b/book.txt", OTHER)
+        self.write("c/book.txt", THIRD)
+        self.build(names_only=True)
+        key = self.sums(one)[1]
+        for rel in ("a/book.txt", "b/book.txt", "c/book.txt"):  # a source takes the three for one work
+            self.assertTrue(self.say(rel, "W1", [key]))
+        self.assertEqual(self.documents(), 1)
+        self.assertEqual((self.build(limit=1), len(self.read)), ((1, 0), 1))
+        self.assertEqual((self.build(limit=1), len(self.read)), ((1, 0), 2))
+        self.assertEqual((self.build(), len(self.read), self.documents()), ((1, 0), 3, 3))
+        self.sound()
 
 
 class Storage2(Placing):

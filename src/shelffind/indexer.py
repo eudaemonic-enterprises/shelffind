@@ -306,13 +306,15 @@ def settle(db, roots, chosen, progress, reads=True, failed=None, asked=None, tho
             return failures
 
 
-def update_text(db, root, row, ocr, languages):
+def update_text(db, root, row, ocr, languages, wanted=None):
     """Read one document through one of its files, and return True when pages were written.
 
     The file is first copied to this machine, and its checksums are those of the copy: the
     file then belongs to the document known by them, which may be another than the one it was
     taken for, and may need no reading, in which case nothing is extracted and False is
-    returned. The pages are read from the copy, so they are those of the bytes that the
+    returned: `wanted(document, state)` tells whether the run reads a document in that state,
+    which by default it does when the document waits for its text, or for its recognition
+    with `ocr`. The pages are read from the copy, so they are those of the bytes that the
     checksums describe. A file that cannot be copied as the inventory saw it raises
     Unreadable; any other failure is that of what the file holds."""
     path = Path(root["path"]) / row["rel"]
@@ -335,7 +337,9 @@ def update_text(db, root, row, ocr, languages):
             joined(db, file["id"], measured)
         told = db.execute("SELECT d.id,d.state FROM files f JOIN docs d ON d.id=f.doc WHERE f.id=?", (file["id"],)).fetchone()
         doc = told["id"]
-        if told["state"] not in (("needs-ocr", "ocr-error") if ocr else ("pending", "error")):
+        if wanted is None:
+            wanted = lambda doc, state: state == ("needs-ocr" if ocr else "pending")
+        if not wanted(doc, told["state"]):
             return False
         with extract.document(copy, row["format"]) as (source, fmt, work):
             if ocr:
@@ -445,6 +449,7 @@ def build(db, directory, selected, *, names_only=False, ocr=False, languages="en
                     candidates.setdefault(row["doc"], []).append((root, row))
         total = len(candidates)
         taken, charged = False, set()
+        wanted = lambda doc, state: state in states and doc not in charged
         for seen, (doc, copies) in enumerate(candidates.items()):
             if limit is not None and done >= limit:
                 break
@@ -466,7 +471,7 @@ def build(db, directory, selected, *, names_only=False, ocr=False, languages="en
                     continue
                 try:
                     taken = True
-                    done += update_text(db, root, row, ocr, languages)
+                    done += update_text(db, root, row, ocr, languages, wanted)
                 except sqlite3.Error:
                     raise
                 except Exception as exc:        # one unreadable file must not stop the others
