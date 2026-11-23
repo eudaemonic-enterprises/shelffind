@@ -364,12 +364,17 @@ def remove_root(db, selector):
         db.execute("CREATE TEMP TABLE leaving AS SELECT DISTINCT doc FROM files WHERE root=? "
                    "UNION SELECT id FROM docs WHERE gone IS NOT NULL AND (gone_from=? OR gone_from IS NULL)",
                    (root["id"], root["id"]))
+        for file in db.execute("SELECT id FROM files WHERE root=?", (root["id"],)).fetchall():
+            leave(db, file["id"])
         db.execute("DELETE FROM files WHERE root=?", (root["id"],))
         db.execute("DELETE FROM roots WHERE id=?", (root["id"],))
         db.execute("DELETE FROM pages WHERE doc IN (SELECT doc FROM leaving) AND NOT EXISTS "
                    "(SELECT 1 FROM files f WHERE f.doc=pages.doc)")
         db.execute("DELETE FROM docs WHERE id IN (SELECT doc FROM leaving) AND NOT EXISTS "
                    "(SELECT 1 FROM files f WHERE f.doc=docs.id)")
+        # The documents that another folder still holds are put in order without the files that left.
+        for kept in db.execute("SELECT l.doc FROM leaving l JOIN docs d ON d.id=l.doc").fetchall():
+            tidy(db, kept["doc"])
         db.execute("DROP TABLE leaving")
         if not db.execute("SELECT 1 FROM roots LIMIT 1").fetchone():
             db.execute("DELETE FROM pages")         # no folder is left: nothing is kept for later
@@ -830,10 +835,10 @@ def leave(db, file):
     known of bytes that are no longer there. What a source said of it stays with its document
     when the document is known by the checksums of the file, measured, or by those the source
     gave: it is then said of those bytes, wherever a file that holds them is found again.
-    Anything else that was said of the file is dropped, and so are the pages read from it when
-    no measure ties them to its bytes.
-    Returns the document the file was in, to be put in order once the file is out of it."""
-    row = db.execute("SELECT doc,sum,read FROM files WHERE id=?", (file,)).fetchone()
+    Anything else that was said of the file is dropped. Returns the document the file was in,
+    to be put in order once the file is out of it (`tidy`), which also drops the pages read
+    from the file when no measure ties them to its bytes."""
+    row = db.execute("SELECT doc,sum FROM files WHERE id=?", (file,)).fetchone()
     doc = row["doc"]
     carried = set(keys_of(db, doc))
     measured = bool(set((row["sum"] or "").split()) & carried)
@@ -843,9 +848,6 @@ def leave(db, file):
         else:
             db.execute("DELETE FROM records WHERE id=?", (record["id"],))
     cards(db, doc, doc)
-    if row["read"] and db.execute("SELECT origin FROM docs WHERE id=?", (doc,)).fetchone()["origin"] is None:
-        db.execute("DELETE FROM pages WHERE doc=?", (doc,))
-        unread(db, doc)
     return doc
 
 

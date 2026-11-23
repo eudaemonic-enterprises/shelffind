@@ -282,6 +282,51 @@ class Statements(Placing):
         self.sound()
 
 
+class Words2(Placing):
+    """Files that only the words of sources hold together."""
+
+    def test_a_file_said_to_be_a_work_whose_files_are_gone_starts_that_work_anew(self):
+        one = self.write("a/book.txt")
+        self.build(names_only=True)
+        md5, sha = self.sums(one)
+        self.assertTrue(self.say("a/book.txt", "W1", [sha, md5], title="Library Card", text=True))
+        one.unlink()
+        self.write("b/book.txt", OTHER)                     # another file of that size, which is not that work
+        self.build(names_only=True)
+        self.assertEqual(self.db.execute("SELECT count(*) FROM records WHERE file IS NULL").fetchone()[0], 1)
+        self.assertTrue(self.say("b/book.txt", "W1", [md5], source="catalogue", title="Catalogue Card"))
+        self.assertEqual((names(self.db, "catalogue card"), names(self.db, "library card")), (["b/book.txt"], []))
+        self.assertEqual([row["key"] for row in self.db.execute("SELECT key FROM doc_keys")], [f"{md5}@txt#{len(LARGE)}"])
+        self.sound()
+
+    def test_what_was_said_of_a_file_without_naming_its_bytes_is_forgotten_with_it(self):
+        one, two = self.write("a/book.txt"), self.write("b/book.txt")
+        self.build(names_only=True)
+        self.measure("a/book.txt")
+        self.assertTrue(self.say("b/book.txt", "W1", self.sums(one)))       # the second is said to be the first,
+        self.assertTrue(self.say("b/book.txt", "C1", [], source="catalogue", title="Loose Card"))   # and bears a card
+        self.assertEqual(self.shown("loose card"), ["a/book.txt", "b/book.txt"])
+        two.unlink()
+        self.build(names_only=True)
+        self.assertEqual(sorted(row["source"] for row in self.db.execute("SELECT source FROM records")), ["library"])
+        self.assertEqual(names(self.db, "loose card"), [])
+        self.sound()
+
+    def test_files_held_together_through_one_file_part_when_it_says_less(self):
+        for folder in "abc":
+            self.write(f"{folder}/book.txt")
+        self.build(names_only=True)
+        first, second = "md5:" + "aa" * 16, "sha256:" + "bb" * 32
+        self.assertTrue(self.say("a/book.txt", "W1", [first]))
+        self.assertTrue(self.say("b/book.txt", "W1", [first, second]))
+        self.assertTrue(self.say("c/book.txt", "W1", [second]))
+        self.assertEqual(self.documents(), 1)               # the second holds the three together
+        self.assertTrue(self.say("b/book.txt", "W1", [first]))
+        docs = self.docs()
+        self.assertEqual((docs["a/book.txt"] == docs["b/book.txt"], docs["b/book.txt"] == docs["c/book.txt"]), (True, False))
+        self.sound()
+
+
 class Collisions(Placing):
     def test_a_file_that_shares_one_checksum_with_a_document_and_differs_by_the_other_stays_apart(self):
         self.write("a/book.txt")
@@ -495,6 +540,62 @@ class Clocks(Placing):
             del asked[:]
             run("Reading Room", "Annex")
             self.assertEqual(asked, [])
+
+
+class Practical(Placing):
+    def test_a_folder_that_is_forgotten_leaves_the_documents_of_the_others_in_order(self):
+        annex = self.base / "Annex"
+        annex.mkdir()
+        self.run_cli("roots", "add", str(annex))
+        one = self.write("said.txt")
+        self.write("measured.txt", OTHER)
+        (annex / "said.txt").write_text(LARGE)
+        (annex / "measured.txt").write_text(OTHER)
+        self.build(names_only=True)
+        ids = {(row["name"], row["rel"]): row["id"] for row in self.db.execute(
+            "SELECT r.name,f.rel,f.id FROM files f JOIN roots r ON r.id=f.root")}
+        key = self.sums(one)
+        with self.db:                                       # two files held together by a word, two by a measure
+            for room in ("Reading Room", "Annex"):
+                link.say(self.db, ids[(room, "said.txt")], "library", {"id": "W1", "keys": key, "title": "Said Work"}, set())
+                indexer.joined(self.db, ids[(room, "measured.txt")], self.sums(self.root / "measured.txt"))
+                link.say(self.db, ids[(room, "measured.txt")], "library", {"id": "W2", "title": f"Card of {room}"}, set())
+        self.assertEqual(self.documents(), 2)
+        self.sound()
+        self.run_cli("roots", "remove", "Annex")
+        self.sound()
+        self.assertEqual(self.documents(), 2)
+        self.assertEqual(self.db.execute("SELECT count(*) FROM records WHERE file IS NULL").fetchone()[0], 1)   # with the measured bytes
+        self.assertEqual(names(self.db, "said work"), ["Reading Room/said.txt"])
+
+    def test_the_copy_of_a_document_is_made_on_a_disk_unless_another_folder_is_named(self):
+        with patch.dict(os.environ, {"TMPDIR": str(self.base)}):
+            self.assertIsNone(indexer.scratch())
+        with patch.dict(os.environ):
+            os.environ.pop("TMPDIR", None)
+            self.assertIn(indexer.scratch(), ("/var/tmp", None))
+
+    def test_a_copy_left_by_a_run_that_was_cut_short_is_removed_a_day_later(self):
+        old, recent = self.base / "shelffind-copy-old", self.base / "shelffind-copy-recent"
+        for left in (old, recent):
+            left.mkdir()
+            (left / "book.pdf").write_text("left behind")
+        os.utime(old, (1_700_000_000, 1_700_000_000))
+        with patch.dict(os.environ, {"TMPDIR": str(self.base)}), patch("tempfile.gettempdir", return_value=str(self.base)):
+            indexer.sweep()
+        self.assertEqual((old.exists(), recent.exists()), (False, True))
+
+    def test_a_djvu_document_kept_in_several_files_is_refused_with_its_remedy(self):
+        from shelffind import extract
+        bundled = self.base / "bundled.djvu"
+        bundled.write_bytes(b"AT&TFORM\x00\x00\x10\x00DJVMDIRM\x00\x00\x00\x20\x81" + b"\x00" * 40)
+        indirect = self.base / "indirect.djvu"
+        indirect.write_bytes(b"AT&TFORM\x00\x00\x10\x00DJVMDIRM\x00\x00\x00\x20\x01" + b"\x00" * 40)
+        self.assertEqual((extract.in_several_files(bundled), extract.in_several_files(indirect)), (False, True))
+        with self.assertRaises(ValueError) as refusal:
+            with extract.document(indirect, "djvu"):
+                pass
+        self.assertIn("djvmcvt", str(refusal.exception))
 
 
 class Conversion2(Earlier):

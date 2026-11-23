@@ -106,8 +106,18 @@ def epub_pages(path):
             yield Passage(None, name, "".join(parser.parts))
 
 
+def in_several_files(path):
+    """True for a DjVu document whose pages are kept in other files beside the one named."""
+    with path.open("rb") as source:
+        head = source.read(25)
+    return head[:8] == b"AT&TFORM" and head[12:20] == b"DJVMDIRM" and len(head) == 25 and not head[24] & 0x80
+
+
 @contextmanager
 def document(path, fmt):
+    if fmt == "djvu" and in_several_files(path):
+        # Its text is read from a copy of the one file, which the others would not follow.
+        raise ValueError("A DjVu document kept in several files is not read: make one file of it with `djvmcvt -b`")
     with tempfile.TemporaryDirectory(prefix="shelffind-read-") as tmp:
         work = Path(tmp)
         if fmt in {"ps", "ps.gz"}:

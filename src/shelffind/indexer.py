@@ -16,9 +16,11 @@ import hashlib
 import json
 import math
 import os
+import shutil
 import sqlite3
 import subprocess
 import tempfile
+import time
 from pathlib import Path
 
 from . import extract, fuzzy, link, store
@@ -30,6 +32,29 @@ FILE = "f.id,f.rel,f.size,f.mtime,f.format"
 
 class Unreadable(Exception):
     """A file could not be taken as the inventory saw it: nothing was learnt of what it holds."""
+
+
+def scratch():
+    """Where the copy of a document is made: the folder that TMPDIR names; otherwise /var/tmp,
+    which is kept on a disk where /tmp is often kept in memory; otherwise the folder of
+    temporary files of the system (None)."""
+    if os.environ.get("TMPDIR"):
+        return None
+    return "/var/tmp" if os.path.isdir("/var/tmp") and os.access("/var/tmp", os.W_OK | os.X_OK) else None
+
+
+def sweep(now=None):
+    """Remove the copies that a run of this user left behind when it was cut short, a day ago
+    or more."""
+    folder = Path(scratch() or tempfile.gettempdir())
+    now = time.time() if now is None else now
+    try:
+        for left in folder.glob("shelffind-copy-*"):
+            info = left.lstat()
+            if info.st_uid == os.getuid() and now - info.st_mtime > 86400:
+                shutil.rmtree(left, ignore_errors=True)
+    except OSError:
+        pass
 
 
 def check_stamp(path, row, same=None):
@@ -293,7 +318,7 @@ def update_text(db, root, row, ocr, languages):
     file = db.execute("SELECT id,sum FROM files WHERE id=? AND root=? AND rel=?", (row["id"], root["id"], row["rel"])).fetchone()
     if file is None:
         return False
-    with tempfile.TemporaryDirectory(prefix="shelffind-copy-") as hold:
+    with tempfile.TemporaryDirectory(prefix="shelffind-copy-", dir=scratch()) as hold:
         try:
             copy, measured, same = private_copy(path, row, Path(hold), store.sums(file["sum"]).get("md5"))
         except (OSError, ValueError) as fault:
@@ -393,6 +418,7 @@ def build(db, directory, selected, *, names_only=False, ocr=False, languages="en
         if names_only:
             return done, failures
         # A pass takes a snapshot of its queue so failures cannot retry in a tight loop.
+        sweep()
         states = ["needs-ocr"] if ocr else ["pending"]
         if retry:
             states.append("ocr-error" if ocr else "error")
