@@ -472,12 +472,13 @@ def blanks(db, doc):
     return (waiting if pages else 1 << 30, pages)
 
 
-def set_apart(db, file):
+def set_apart(db, file, follow=False):
     """Give a file a document of its own, when the document it was in turned out not to describe
     it. What was measured of the file stays with it, and what the sources said of that very
     file goes with it; the document it leaves keeps its text and what was said of its other
     files. A checksum that was said of this file alone goes with it too; one that the document
-    it leaves still holds for its other files stays there, and never draws the file back; one
+    it leaves still holds for its other files stays there, and never draws the file back. With
+    `follow`, for a file that leaves because the word that had brought it is gone, a checksum
     that a third document holds lets the file join that document, as the word of a source may.
     Returns the document of the file afterwards, or None when the file is not there."""
     row = db.execute("SELECT root,size,format,doc FROM files WHERE id=?", (file,)).fetchone()
@@ -491,7 +492,7 @@ def set_apart(db, file):
     retitle(db, row["doc"])
     for key in said:
         owner = db.execute("SELECT doc FROM doc_keys WHERE key=?", (f"{key}@{row['format']}",)).fetchone()
-        if owner is None or owner["doc"] != row["doc"]:
+        if owner is None or (follow and owner["doc"] != row["doc"]):
             apart = claim(db, apart, key, "source")
     retitle(db, apart)
     tend_orphans(db, row["root"], drop=False)
@@ -512,7 +513,7 @@ def release(db, doc):
         said = {key for record in db.execute("SELECT keys FROM records WHERE file=?", (row["id"],))
                 for key in record["keys"].split()}
         if not row["read"] and not carried & (said | set((row["sum"] or "").split())):
-            set_apart(db, row["id"])
+            set_apart(db, row["id"], follow=True)
 
 
 def part(db, doc, file, keys):
