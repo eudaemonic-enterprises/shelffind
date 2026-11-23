@@ -1,0 +1,23 @@
+# Copyright 2026 Eudaemonic Enterprises Inc.
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "shelffind"
+version = "0.1.0"
+description = "Find and open local documents by filename, folder, or passage"
+requires-python = ">=3.11"
+license = {file = "LICENSE"}
+readme = "README.md"
+authors = [{name = "Eudaemonic Enterprises Inc."}]
+dependencies = []
+
+[project.scripts]
+shelffind = "shelffind.cli:main"
+
+[project.urls]
+Source = "https://github.com/eudaemonic-enterprises/shelffind"
+
+[tool.setuptools.packages.find]
+where = ["src"]

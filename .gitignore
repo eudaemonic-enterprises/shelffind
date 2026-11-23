@@ -1,0 +1,6 @@
+# Copyright 2026 Eudaemonic Enterprises Inc.
+__pycache__/
+*.egg-info/
+.venv/
+build/
+dist/
