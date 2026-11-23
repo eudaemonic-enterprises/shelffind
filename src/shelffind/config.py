@@ -176,6 +176,12 @@ class Settings:
                 if not isinstance(value, dict):
                     raise ConfigError(f"{origin}: [{name}] must be a table")
                 for inner, content in value.items():
+                    words = isinstance(content, list) and content and all(isinstance(w, str) for w in content)
+                    sound = {"theme": isinstance(content, dict) and all(isinstance(v, str) for v in content.values()),
+                             "open": content == "default" or words,
+                             "sources": isinstance(content, dict)}[name]
+                    if not sound:
+                        raise ConfigError(f"{origin}: [{name}] {inner} = {content!r} is not valid")
                     self.tables[name][inner] = content
                     self.table_origins[f"{name}.{inner}"] = origin
             elif isinstance(value, dict):

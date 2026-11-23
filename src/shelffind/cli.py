@@ -13,6 +13,7 @@ from pathlib import Path
 from . import __version__, config, desktop, doctor, helptext, indexer, shell, sources, store
 from .picker import panel, picker
 from .text import json_text, safe
+from .tui import style
 
 COMMANDS = ["search", "pick", "open", "apps", "reveal", "roots", "sources", "index", "status",
             "config", "doctor", "cheatsheet", "init", "completion"]
@@ -217,6 +218,13 @@ def configuration(args, directory, explicit):
     settings = config.load(directory, explicit)
     sources.declare(settings.tables["sources"])
     settings.keymap()
+    for name, roles in settings.tables["theme"].items():
+        for role, spec in roles.items():
+            try:
+                style.parse(spec)
+            except ValueError as fault:
+                settings.warnings.append(f"[theme.{name}] {role}: {fault}")
+    style.theme(settings["panel.theme"], settings.tables["theme"], {})
     if args.action == "check":
         for warning in settings.warnings:
             print(safe(warning), file=sys.stderr)

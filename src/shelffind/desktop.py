@@ -7,6 +7,7 @@ import shlex
 import shutil
 import subprocess
 import tempfile
+import threading
 from pathlib import Path
 
 # How the known viewers are told to open at a page, by a part of their desktop name.
@@ -138,6 +139,8 @@ def _start_viewer(argv):
         try:
             code = viewer.wait(timeout=0.6)
         except subprocess.TimeoutExpired:
+            # The viewer stays open: it is collected when it ends, however late that is.
+            threading.Thread(target=viewer.wait, daemon=True).start()
             return
         if code:
             detail = os.pread(errors.fileno(), 2048, 0).decode(errors="replace").strip()
