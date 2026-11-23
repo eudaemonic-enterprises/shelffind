@@ -23,12 +23,33 @@ RESTORED = ("CASE WHEN EXISTS (SELECT 1 FROM pages p WHERE p.doc=docs.id AND p.n
 
 def attach(db, file, name, record, trusted, known):
     """Keep what the source `name` says of the document of the file `file`. A checksum that
-    another document of the same format carries already shows that the two are one."""
-    row = db.execute("SELECT doc FROM files WHERE id=?", (file,)).fetchone()
+    another document of the same size and format carries already shows that the two are one.
+
+    A checksum speaks of the bytes of this file. It goes to the document when the document was
+    read from this very file, or was never read. When the document was read from another file,
+    of which this one is only presumed to be a copy, the file gets a document of its own, which
+    carries the checksum, and is marked for comparison: equal fingerprints will join the two
+    again, and a checksum that contradicts the one the document carries keeps them apart."""
+    row = db.execute("SELECT f.doc,f.name,f.read,d.size,d.format,d.state FROM files f JOIN docs d ON d.id=f.doc "
+                     "WHERE f.id=?", (file,)).fetchone()
     if row is None:
         return
     doc = row["doc"]
-    for key in record.get("keys") or ():
+    keys = list(record.get("keys") or ())
+    carried = {r["key"] for r in db.execute("SELECT key FROM doc_keys WHERE doc=?", (doc,))}
+    contradicted = any(key not in carried and any(other.startswith(key.split(":", 1)[0] + ":") for other in carried)
+                       for key in keys)
+    read_elsewhere = not row["read"] and (any(key.startswith("fp:") for key in carried) or db.execute(
+        "SELECT 1 FROM pages WHERE doc=? LIMIT 1", (doc,)).fetchone() is not None)
+    if contradicted or (read_elsewhere and any(key not in carried for key in keys)):
+        apart = db.execute("INSERT INTO docs(size,format,state) VALUES(?,?,?)",
+                           (row["size"], row["format"], "name-only" if row["state"] == "name-only" else "pending")).lastrowid
+        db.execute("INSERT INTO doc_keys(key,doc,basis) VALUES(?,?,'apart until compared')",
+                   (f"apart:{apart}:{store.digest(row['name'])}", apart))
+        db.execute("UPDATE files SET doc=?,maybe=?,read=0 WHERE id=?", (apart, None if contradicted else 1, file))
+        store.tend_orphans(db, drop=False)
+        doc = apart
+    for key in keys:
         owner = db.execute("SELECT doc FROM doc_keys WHERE key=?", (key,)).fetchone()
         if owner is None:
             db.execute("INSERT INTO doc_keys(key,doc,basis) VALUES(?,?,'source')", (key, doc))

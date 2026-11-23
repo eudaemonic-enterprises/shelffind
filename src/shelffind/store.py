@@ -5,10 +5,14 @@ Text belongs to a document, and a document is recognised by its content, not by 
 files of the folders point at documents, so a file that is moved, renamed or copied keeps its
 text. Addresses are stored from the home folder (`~/...`) and expanded when used.
 
-A file is given the text of a document only on evidence: the same size, date and format as a
-file already known (the inventory tells that much without reading anything), or the same
-content, proved by a fingerprint or a checksum. A mere likeness (the size of a document whose
-file is gone) is kept as a question, `files.maybe`, which a reading of the file answers.
+A file is given the text of a document only on evidence. The inventory alone tells one thing
+without reading anything: a file with the name, the size, the date and the format of a file
+that is there is a copy of it. Everything else is settled by content, proved by a fingerprint
+or a checksum: a file that resembles a known document (a stamp whose file is gone, a stamp that
+several documents share, the size of a document that was read) gets a document of its own and
+the mark `files.maybe`, and joins the document that has its fingerprint when it is compared.
+`files.read` marks the file a document's pages were read from, and `files.print` keeps the
+fingerprint taken of a file as it is.
 """
 import contextlib
 import fcntl
@@ -27,6 +31,7 @@ from .extract import SUPPORTED, file_format
 
 INDEX, EARLIER = "index2.sqlite3", "index.sqlite3"
 FORMAT = 2
+RETIRED = 101           # the format number of an earlier index once it has been converted
 SMALL = 64 * 1024       # below this size a file is identified together with its address
 KEEP = 30 * 86400       # seconds a document keeps its text after its last file has gone
 
@@ -51,10 +56,10 @@ CREATE TABLE files (
     id INTEGER PRIMARY KEY, root INTEGER NOT NULL REFERENCES roots ON DELETE CASCADE,
     rel TEXT NOT NULL, name TEXT NOT NULL, folded TEXT NOT NULL, format TEXT NOT NULL, size INTEGER NOT NULL,
     mtime INTEGER NOT NULL, doc INTEGER NOT NULL REFERENCES docs,
-    maybe INTEGER REFERENCES docs ON DELETE SET NULL, UNIQUE(root, rel)
+    maybe INTEGER, read INTEGER NOT NULL DEFAULT 0, print TEXT, UNIQUE(root, rel)
 );
 CREATE INDEX files_doc ON files(doc);
-CREATE INDEX files_maybe ON files(maybe) WHERE maybe IS NOT NULL;
+CREATE INDEX files_maybe ON files(root) WHERE maybe IS NOT NULL;
 CREATE VIRTUAL TABLE names USING fts5(name, folder, title, byline, tokenize='unicode61 remove_diacritics 2');
 CREATE TRIGGER files_ad AFTER DELETE ON files BEGIN
     DELETE FROM names WHERE rowid=old.id;
@@ -147,7 +152,9 @@ def connect(directory, upgrade=True):
     directory = Path(directory).absolute()
     directory.mkdir(mode=0o700, parents=True, exist_ok=True)
     filename = directory / INDEX
-    if (not filename.exists() or filename.stat().st_size == 0) and earlier_format(directory) == 1:
+    # An earlier index without a new one beside it waits to be converted, also when it bears
+    # the mark of a conversion: that conversion was cut before the new index took its name.
+    if (not filename.exists() or filename.stat().st_size == 0) and earlier_format(directory) in (1, RETIRED):
         if not upgrade:
             raise NeedsUpgrade("The index has the earlier format: run shelffind upgrade")
         from . import migrate
@@ -382,42 +389,41 @@ def new_document(db, key, size, fmt, basis="stamp"):
     return doc
 
 
+def hopeful(db, doc, size, fmt):
+    """True when some other document of this size and format has a fingerprint or a checksum:
+    the file may be that document, and a comparison will tell."""
+    return db.execute(
+        "SELECT 1 FROM docs d WHERE d.size=? AND d.format=? AND d.id!=? AND EXISTS (SELECT 1 FROM doc_keys k "
+        "WHERE k.doc=d.id AND (k.key LIKE 'fp:%' OR k.key LIKE 'sha256:%' OR k.key LIKE 'md5:%')) LIMIT 1",
+        (size, fmt, doc)).fetchone() is not None
+
+
 def document_for(db, place, rel, name, size, mtime, fmt, edited=False):
     """The document of a file that is new at this address, or changed there, from the inventory
-    alone. Returns the document and, sometimes, another that the file might be.
+    alone. Returns the document and whether the file is still to be compared with the documents
+    it resembles.
 
-    A known stamp under the same name means a copy; under another name while the first file is
-    still there, the two are kept apart until their contents are compared; a known stamp whose
-    file is gone means that file under a new address. A file `edited` in place without a change
-    of size or of second gets a document of its own, since nothing tells what it holds now. An
-    unknown stamp with the size of the one document whose files are all gone, such as a filing
-    tool leaves when it copies a file and removes the original, is given a document of its own
-    and the question whether it is that one.
+    One case is settled without reading: the stamp of the file (size, date and format) belongs
+    to one document only, and a file of that document that is there bears the same name. The
+    file is then a copy. In every other case the file gets a document of its own: a stamp whose
+    file is gone (moved, renamed, or another file altogether), a stamp under another name, a
+    stamp that several documents share, an address `edited` without a change of size or of
+    second, a stamp never seen. Its text, if a known document has it, comes back by proof.
     """
-    key = stamp_key(size, mtime, fmt, place, rel)
-    if edited:
-        key += f":changed:{mtime}:{digest(f'{place}/{rel}')}"
-        known = db.execute("SELECT doc FROM doc_keys WHERE key=?", (key,)).fetchone()
-        return (known["doc"] if known else new_document(db, key, size, fmt, "changed in place")), None
-    named = key + ":" + digest(name)
-    known = db.execute("SELECT doc FROM doc_keys WHERE key=?", (named,)).fetchone()
-    if known and size >= SMALL:
-        return known["doc"], None
-    known = db.execute("SELECT doc FROM doc_keys WHERE key=?", (key,)).fetchone()
-    if known:
-        names = [row["name"] for row in db.execute("SELECT name FROM files WHERE doc=?", (known["doc"],))]
-        if not names or name in names or size < SMALL:
-            return known["doc"], None
-        return new_document(db, named, size, fmt, "stamp and name"), None
-    doc = new_document(db, key, size, fmt)
-    if size >= SMALL:
-        # Only a document that was read can answer the question: its fingerprint is compared.
-        gone = db.execute("SELECT d.id FROM docs d WHERE d.size=? AND d.format=? AND d.gone IS NOT NULL AND EXISTS "
-                          "(SELECT 1 FROM doc_keys k WHERE k.doc=d.id AND k.key LIKE 'fp:%') LIMIT 2",
-                          (size, fmt)).fetchall()
-        if len(gone) == 1:
-            return doc, gone[0]["id"]
-    return doc, None
+    base = stamp_key(size, mtime, fmt, place, rel)
+    owners = [row["doc"] for row in db.execute(
+        "SELECT DISTINCT doc FROM doc_keys WHERE key=? OR (key>? AND key<?)", (base, base + ":", base + ";"))]
+    if not edited and len(owners) == 1 and db.execute(
+            "SELECT 1 FROM doc_keys WHERE key=? AND doc=?", (base, owners[0])).fetchone():
+        names = [row["name"] for row in db.execute("SELECT name FROM files WHERE doc=?", (owners[0],))]
+        if name in names:
+            return owners[0], False
+    state = "pending" if fmt in SUPPORTED else "name-only"
+    doc = db.execute("INSERT INTO docs(size,format,state) VALUES(?,?,?)", (size, fmt, state)).lastrowid
+    # The first document of a stamp carries the stamp itself; the others a key of their own.
+    key, basis = (base, "stamp") if not owners else (f"{base}:{digest(name)}:{doc}", "stamp shared")
+    db.execute("INSERT INTO doc_keys(key,doc,basis) VALUES(?,?,?)", (key, doc, basis))
+    return doc, bool(owners) or hopeful(db, doc, size, fmt)
 
 
 def describe(db, doc):
@@ -429,24 +435,38 @@ def describe(db, doc):
                    (told["title"] or "", told["byline"] or "", doc))
 
 
+def blanks(db, doc):
+    """How far the reading of a document went: (pages still to recognise, pages), with a large
+    first number for a document without pages."""
+    pages, waiting = db.execute("SELECT count(*),coalesce(sum(needs_ocr),0) FROM pages WHERE doc=?", (doc,)).fetchone()
+    return (waiting if pages else 1 << 30, pages)
+
+
 def merge(db, one, other):
-    """Two documents turned out to be the same: make them one and return it. The document that
-    was read is kept, and the files, the keys and the records of the other go to it. Documents
-    of two formats are not merged, since each is read by its own reader, nor documents of two
-    sizes, which cannot hold the same bytes: None is returned. The caller holds the
-    transaction."""
+    """Two documents turned out to be the same: make them one and return it. The document whose
+    reading went furthest is kept, a page recognised in the other only is taken from it, and the
+    files, the keys and the records of the other go to the one kept. Documents of two formats
+    are not merged, since each is read by its own reader, nor documents of two sizes, which
+    cannot hold the same bytes: None is returned. The caller holds the transaction."""
     if one == other:
         return one
-    rank = {"indexed": 0, "needs-ocr": 1, "ocr-error": 2, "covered": 3, "error": 4, "pending": 5, "name-only": 6}
+    rank = {"indexed": 0, "needs-ocr": 1, "ocr-error": 1, "covered": 3, "error": 4, "pending": 5, "name-only": 6}
     told = {row["id"]: row for row in db.execute("SELECT * FROM docs WHERE id IN (?,?)", (one, other))}
     if len(told) < 2:
         return one if one in told else other if other in told else None
     if (told[one]["format"], told[one]["size"]) != (told[other]["format"], told[other]["size"]):
         return None
-    keep, drop = sorted((one, other), key=lambda doc: (rank.get(told[doc]["state"], 9), doc))
+    keep, drop = sorted((one, other), key=lambda doc: (rank.get(told[doc]["state"], 9), blanks(db, doc)[0], doc))
+    # A page that only the other document has recognised is not lost with it.
+    theirs = {row["page"]: row["ztext"] for row in db.execute(
+        "SELECT page,ztext FROM pages WHERE doc=? AND needs_ocr=0 AND page IS NOT NULL", (drop,))}
+    if theirs and blanks(db, keep)[1] == blanks(db, drop)[1]:
+        for row in db.execute("SELECT id,page FROM pages WHERE doc=? AND needs_ocr=1", (keep,)).fetchall():
+            if row["page"] in theirs:
+                db.execute("UPDATE pages SET ztext=?,needs_ocr=0 WHERE id=?", (theirs[row["page"]], row["id"]))
+        if told[keep]["state"] in ("needs-ocr", "ocr-error") and blanks(db, keep)[0] == 0:
+            db.execute("UPDATE docs SET state='indexed',error=NULL WHERE id=?", (keep,))
     db.execute("UPDATE files SET doc=? WHERE doc=?", (keep, drop))
-    db.execute("UPDATE files SET maybe=? WHERE maybe=?", (keep, drop))
-    db.execute("UPDATE files SET maybe=NULL WHERE maybe=doc")
     db.execute("UPDATE OR IGNORE doc_keys SET doc=? WHERE doc=?", (keep, drop))
     # What a source said of the document is kept in preference to its not knowing it.
     db.execute("DELETE FROM records WHERE doc=? AND ref='' AND EXISTS (SELECT 1 FROM records r "
@@ -522,9 +542,10 @@ def scan(db, root, directory):
             # A change that keeps the size and the second leaves the stamp as it was: only a
             # reading can tell what the file holds now.
             edited = bool(old) and (size, mtime // 10**9, fmt) == (old["size"], old["mtime"] // 10**9, old["format"])
-            doc, maybe = document_for(db, root["name"], rel, path.name, size, mtime, fmt, edited)
+            doc, unsure = document_for(db, root["name"], rel, path.name, size, mtime, fmt, edited)
+            maybe = 1 if unsure else None
             if old:
-                db.execute("UPDATE files SET size=?,mtime=?,format=?,doc=?,maybe=? WHERE id=?",
+                db.execute("UPDATE files SET size=?,mtime=?,format=?,doc=?,maybe=?,read=0,print=NULL WHERE id=?",
                            (size, mtime, fmt, doc, maybe, old["id"]))
                 told = db.execute("SELECT title,byline FROM docs WHERE id=?", (doc,)).fetchone()
                 db.execute("UPDATE names SET title=?,byline=? WHERE rowid=?",

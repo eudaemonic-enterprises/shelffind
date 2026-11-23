@@ -45,12 +45,13 @@ def proven(path, row):
 
 
 def settle(db, root, progress):
-    """Answer by reading what the inventory left open in one folder. A file that might be a
-    document whose own file is gone is compared with it, and joins it only when their
-    fingerprints agree. A document that was read before fingerprints existed is given one.
-    Returns the number of files that could not be read."""
+    """Answer by reading what the inventory left open in one folder. A file that resembles a
+    known document is fingerprinted, and joins the document that has this fingerprint, if there
+    is one; otherwise it stays the new document it was given. A document read before
+    fingerprints existed gets its own through the very file it was read from. Returns the
+    number of files that could not be read."""
     failures = 0
-    asked = db.execute("SELECT id,maybe,rel,size,mtime,format FROM files WHERE root=? AND maybe IS NOT NULL",
+    asked = db.execute("SELECT id,rel,size,mtime,format FROM files WHERE root=? AND maybe IS NOT NULL",
                        (root["id"],)).fetchall()
     for row in asked:
         try:
@@ -62,19 +63,27 @@ def settle(db, root, progress):
             failures += 1
             continue
         with db:
-            same = db.execute("SELECT 1 FROM doc_keys WHERE key=? AND doc=?", (found, row["maybe"])).fetchone()
+            owner = db.execute("SELECT doc FROM doc_keys WHERE key=?", (found,)).fetchone()
             now = db.execute("SELECT doc FROM files WHERE id=?", (row["id"],)).fetchone()
-            db.execute("UPDATE files SET maybe=NULL WHERE id=?", (row["id"],))
-            if same and now:
-                store.merge(db, row["maybe"], now["doc"])
+            db.execute("UPDATE files SET maybe=NULL,print=? WHERE id=?", (found, row["id"]))
+            if owner and now and owner["doc"] != now["doc"]:
+                store.merge(db, owner["doc"], now["doc"])
+    # The file a document was read from, unchanged since, is the one proof of what its pages
+    # hold: no other file may lend the document a fingerprint.
     bare = db.execute(
-        "SELECT min(f.id) AS id,f.doc,f.rel,f.size,f.mtime,f.format FROM files f WHERE f.root=? AND f.maybe IS NULL "
+        "SELECT f.id,f.doc,f.rel,f.size,f.mtime,f.format FROM files f WHERE f.root=? AND f.read=1 AND f.maybe IS NULL "
         "AND EXISTS (SELECT 1 FROM pages p WHERE p.doc=f.doc) AND NOT EXISTS "
-        "(SELECT 1 FROM doc_keys k WHERE k.doc=f.doc AND k.key LIKE 'fp:%') GROUP BY f.doc", (root["id"],)).fetchall()
+        "(SELECT 1 FROM doc_keys k WHERE k.doc=f.doc AND k.key LIKE 'fp:%') ORDER BY f.id", (root["id"],)).fetchall()
     for row in bare:
+        if db.execute("SELECT 1 FROM doc_keys WHERE doc=? AND key LIKE 'fp:%'", (row["doc"],)).fetchone():
+            continue                        # another of its files gave it a moment ago
         try:
             found = proven(Path(root["path"]) / row["rel"], row)
-        except (OSError, ValueError):
+        except ValueError:
+            continue
+        except OSError as fault:
+            progress(f"Could not fingerprint {row['rel']}: {fault}")
+            failures += 1
             continue
         with db:
             owner = db.execute("SELECT doc FROM doc_keys WHERE key=?", (found,)).fetchone()
@@ -95,6 +104,8 @@ def update_text(db, root, row, ocr, languages):
         check_stamp(path, row)
     else:
         key = proven(path, row)
+        with db:
+            db.execute("UPDATE files SET print=? WHERE root=? AND rel=?", (key, root["id"], row["rel"]))
         owner = db.execute("SELECT doc FROM doc_keys WHERE key=?", (key,)).fetchone()
         if owner and owner["doc"] != doc:
             with db:
@@ -113,6 +124,7 @@ def update_text(db, root, row, ocr, languages):
                     fuzzy.remember_more(db, (text,))
             with db:
                 db.execute("UPDATE docs SET state='indexed',error=NULL WHERE id=?", (doc,))
+                db.execute("UPDATE files SET read=1 WHERE root=? AND rel=?", (root["id"], row["rel"]))
             return True
         pages = list(extract.passages(source, fmt, work))
         if not pages:
@@ -127,6 +139,7 @@ def update_text(db, root, row, ocr, languages):
             db.execute("UPDATE docs SET state=?,error=NULL WHERE id=?", (state, doc))
             # The fingerprint is kept once the reading has succeeded, and not before.
             db.execute("INSERT OR IGNORE INTO doc_keys(key,doc,basis) VALUES(?,?,'content')", (key, doc))
+            db.execute("UPDATE files SET read=1 WHERE root=? AND rel=?", (root["id"], row["rel"]))
     return True
 
 

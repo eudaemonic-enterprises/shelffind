@@ -181,21 +181,27 @@ class Conversion(Earlier):
         self.assertEqual(sorted(p.name for p in self.data.glob("index2*.partial*")), [])
         self.assertEqual(len(search(db, "spring tide")), 1)
 
-    def test_a_conversion_cut_after_the_new_index_appeared_is_completed(self):
-        with patch("shelffind.migrate.history.absorb", side_effect=KeyboardInterrupt), \
-                self.assertRaises(KeyboardInterrupt):
+    def test_a_conversion_cut_after_the_old_index_was_marked_is_done_again(self):
+        real = os.replace
+
+        def cut(source, target):
+            if str(target).endswith(store.INDEX):           # the very last step: the new index takes its name
+                raise KeyboardInterrupt
+            return real(source, target)
+
+        with patch("shelffind.migrate.os.replace", side_effect=cut), self.assertRaises(KeyboardInterrupt):
             migrate.upgrade(self.data)
-        self.assertTrue((self.data / store.INDEX).exists())
-        self.assertEqual(self.old_state()[0], 1)
-        self.assertEqual(history.queries(self.data), [])
-        self.converted()
-        self.assertEqual(self.old_state()[0], 1)            # an ordinary opening changes nothing
-        self.assertEqual(run_main(self.data, "upgrade")[0], 0)
+        # The old index is frozen, and no new index stands in its place: both programs wait.
         self.assertEqual(self.old_state()[0], migrate.RETIRED)
+        self.assertEqual(sorted(p.name for p in self.data.glob("index2*")), [])
+        self.assertEqual(run_main(self.data, "status", "--json")[0], 0)
+        db = self.converted()                               # the next opening converts again
+        self.assertEqual(db.execute("SELECT count(*) FROM files").fetchone()[0], 6)
+        self.assertEqual(len(search(db, "spring tide")), 1)
         self.assertEqual(history.queries(self.data), ["wind roses", "spring tide"])
-        run_main(self.data, "upgrade")
         with (self.data / history.NAME).open() as journal:
             self.assertEqual(len(journal.readlines()), 2)   # the searches were not written twice
+        self.assertGreater(migrate.discard_old(self.data), 0)
 
     def test_an_old_index_being_written_is_not_converted_until_it_is_free(self):
         before = self.old_state()
@@ -224,35 +230,46 @@ class Conversion(Earlier):
         rows = json.loads(run_main(self.data, "doctor", "--json")[1])
         self.assertTrue(any(row["status"] == "fail" and row["label"] == "earlier index" for row in rows))
 
-    def test_a_new_index_that_was_not_made_from_the_old_one_never_retires_it(self):
+    def test_a_new_index_that_was_not_made_from_the_old_one_says_nothing_of_it(self):
         (self.data / store.INDEX).write_bytes(b"")          # an empty file under the name of the new index
         db = self.converted()                               # is no index: the old one is converted over it
         self.assertEqual(db.execute("SELECT count(*) FROM files").fetchone()[0], 6)
         self.assertEqual(store.earlier_format(self.data), migrate.RETIRED)
         db.close()
-        # A new index made on its own, beside an old one that nobody converted.
-        retire = sqlite3.connect(self.data / store.EARLIER)
-        retire.execute("PRAGMA user_version=1")
-        retire.commit()
-        retire.close()
+        # The new index is lost: the old one, though marked, is converted again, not replaced by nothing.
         (self.data / store.INDEX).unlink()
-        with patch("shelffind.store.earlier_format", return_value=0):
-            store.connect(self.data).close()
-        self.assertEqual(migrate.upgrade(self.data), self.data / store.INDEX)
-        self.assertEqual(store.earlier_format(self.data), 1)
+        db = store.connect(self.data)
+        self.assertEqual(db.execute("SELECT count(*) FROM files").fetchone()[0], 6)
+        db.close()
+        # A new index made on its own, or made from another old index, beside this old one.
+        other = self.home / "elsewhere"
+        other.mkdir()
+        store.connect(other).close()
+        for stranger, version in ((other / store.INDEX, 1), (other / store.INDEX, migrate.RETIRED)):
+            (self.data / store.INDEX).write_bytes(stranger.read_bytes())
+            mark = sqlite3.connect(self.data / store.EARLIER)
+            mark.execute(f"PRAGMA user_version={version}")
+            mark.commit()
+            mark.close()
+            self.assertEqual(migrate.upgrade(self.data), self.data / store.INDEX)
+            self.assertEqual(store.earlier_format(self.data), version)      # left exactly as it was
+            with self.assertRaises(ValueError):
+                migrate.discard_old(self.data)
+            self.assertTrue((self.data / store.EARLIER).exists())
+
+    def test_an_old_index_that_gained_something_since_is_not_discarded(self):
+        self.converted()
+        late = sqlite3.connect(self.data / store.EARLIER)   # an earlier version, still running, writes on
+        late.execute("INSERT INTO pages(file,page,section,text,needs_ocr) VALUES(1,3,NULL,'A page recognised late',0)")
+        late.commit()
+        late.close()
         with self.assertRaises(ValueError) as kept:
             migrate.discard_old(self.data)
-        self.assertIn("was not converted", str(kept.exception))
+        self.assertIn("holds something the new one was not made from", str(kept.exception))
         self.assertTrue((self.data / store.EARLIER).exists())
-
-    def test_discarding_completes_a_conversion_cut_short_before_it_deletes(self):
-        with patch("shelffind.migrate.history.absorb", side_effect=KeyboardInterrupt), \
-                self.assertRaises(KeyboardInterrupt):
-            migrate.upgrade(self.data)
-        self.assertEqual(history.queries(self.data), [])
-        self.assertGreater(migrate.discard_old(self.data), 0)
-        self.assertEqual(history.queries(self.data), ["wind roses", "spring tide"])     # saved before the deletion
-        self.assertFalse((self.data / store.EARLIER).exists())
+        code, _, err = run_main(self.data, "upgrade", "--discard-old")
+        self.assertEqual(code, 1)
+        self.assertIn("it is kept", err)
 
     def test_text_that_the_earlier_version_read_apart_stays_apart(self):
         # Two files of one name, size and date in two folders, whose pages differ: two documents.
@@ -284,13 +301,15 @@ class Conversion(Earlier):
         self.assertFalse((self.home / "nowhere").exists())
         self.assertEqual(run_main(self.home / "nowhere", "upgrade")[0], 0)
 
-    def test_a_reading_by_the_earlier_version_is_waited_for_then_passed(self):
+    def test_a_reading_by_the_earlier_version_holds_the_conversion_back(self):
         import fcntl
-        said = []
         with (self.data / "index.lock").open("a") as lock:
             fcntl.flock(lock, fcntl.LOCK_EX)
-            migrate.upgrade(self.data, said.append, wait=0.3)
-        self.assertTrue(any("under way" in text for text in said))
+            with self.assertRaises(ValueError) as refused:
+                migrate.upgrade(self.data, wait=0.3)
+            self.assertIn("A reading of documents is under way", str(refused.exception))
+            self.assertEqual(sorted(p.name for p in self.data.glob("index2*")), [])
+            self.assertEqual(self.old_state()[0], 1)
         self.assertEqual(len(search(self.converted(), "spring tide")), 1)
 
     def test_a_development_version_spares_the_index_in_use(self):

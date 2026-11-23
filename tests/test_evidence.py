@@ -86,8 +86,9 @@ class Likeness(Reading):
         self.assertEqual(self.db.execute("SELECT count(*) FROM doc_keys WHERE key LIKE 'fp:%'").fetchone()[0], 1)
         os.utime(path, (1_800_000_000, 1_800_000_000))      # so that a mere new date reads nothing again
         self.read.clear()
-        self.assertEqual(self.build(), (1, 0))
+        self.assertEqual(self.build(), (0, 0))
         self.assertEqual(self.read, [])
+        self.assertEqual(names(self.db, "northern harbours"), ["Reading Room/old.txt"])
 
     def test_a_file_that_changes_while_it_is_compared_proves_nothing(self):
         self.write("a/book.txt")
@@ -101,10 +102,10 @@ class Likeness(Reading):
             return real(path, fmt)
 
         with patch("shelffind.indexer.fingerprint", side_effect=racing):
-            self.assertEqual(self.build(), (1, 1))
+            self.assertEqual(self.build(), (0, 0))          # nothing is concluded from such a reading
         self.assertEqual(names(self.db, "northern harbours"), ["a/book.txt"])
         self.assertEqual(self.db.execute("SELECT count(*) FROM doc_keys WHERE key LIKE 'fp:%'").fetchone()[0], 1)
-        self.assertEqual(self.build(), (1, 0))              # the next inventory sees the file as it is now,
+        self.assertEqual(self.build(), (0, 0))              # the next inventory sees the file as it is now,
         found = search(self.db, "northern harbours")        # a second copy of the first document
         self.assertEqual((len(found), found[0]["copies"]), (1, [str(other)]))
 
@@ -128,6 +129,140 @@ class Likeness(Reading):
         self.assertEqual(names(self.db, "northern harbours"), ["Reading Room/second.txt"])
         self.assertEqual(self.build(retry=True), (1, 0))    # the first is now known by its content
         self.assertEqual(len(search(self.db, "northern harbours")[0]["copies"]), 1)
+
+
+class Ambiguity(Reading):
+    """A size and a second that several documents share prove nothing: content decides."""
+
+    def test_a_copy_of_an_edited_file_gets_the_edited_text(self):
+        first, second = self.write("a/book.txt"), self.write("x/book.txt")
+        for path in (first, second):
+            os.utime(path, ns=(100, 100))
+        self.build()
+        second.write_text(OTHER)
+        os.utime(second, ns=(900, 900))
+        self.build()
+        third = self.root / "z" / "book.txt"
+        third.parent.mkdir()
+        shutil.copy2(second, third)                         # the same name, size and date as the edited file
+        self.read.clear()
+        self.assertEqual(self.build(), (0, 0))
+        self.assertEqual(self.read, [])
+        self.assertEqual(names(self.db, "northern harbours"), ["a/book.txt"])
+        found = search(self.db, "southern capes")
+        self.assertEqual((len(found), sorted([found[0]["path"], *found[0]["copies"]])), (1, sorted([str(second), str(third)])))
+
+    def test_every_edit_within_one_second_is_read_for_itself(self):
+        path = self.write("book.txt", "alpha " * 12000)
+        seen = []
+        for moment, word in ((100, "alpha"), (900, "bravo"), (400, "gamma"), (900, "delta")):
+            path.write_text(f"{word} " * 12000)
+            os.utime(path, ns=(moment, moment))
+            self.build()
+            seen.append([word for word in ("alpha", "bravo", "gamma", "delta") if search(self.db, word)])
+        self.assertEqual(seen, [["alpha"], ["bravo"], ["gamma"], ["delta"]])
+
+    def test_a_renamed_file_is_not_given_the_text_of_one_that_left_in_the_same_second(self):
+        alpha, blue = self.write("alpha.txt"), self.write("blue.txt", OTHER)
+        self.build()
+        alpha.unlink()
+        blue.rename(self.root / "green.txt")
+        self.read.clear()
+        self.assertEqual(self.build(), (0, 0))
+        self.assertEqual(self.read, [])
+        self.assertEqual(names(self.db, "southern capes"), ["Reading Room/green.txt"])
+        self.assertEqual(search(self.db, "northern harbours"), [])
+
+    def test_a_file_that_replaces_another_of_its_size_and_second_is_read(self):
+        old = self.write("old.txt")
+        self.build()
+        self.db.execute("DELETE FROM doc_keys WHERE key LIKE 'fp:%'")       # read before fingerprints existed
+        self.db.commit()
+        old.unlink()
+        new = self.write("new.txt", OTHER)
+        os.utime(new, ns=(1_700_000_000 * 10**9 + 77, 1_700_000_000 * 10**9 + 77))    # the same second
+        self.read.clear()
+        self.assertEqual(self.build(), (1, 0))
+        self.assertEqual(self.read, ["new.txt"])
+        self.assertEqual((search(self.db, "northern harbours"), names(self.db, "southern capes")),
+                         ([], ["Reading Room/new.txt"]))
+        # No fingerprint was lent to the pages of the file that left.
+        self.assertEqual(self.db.execute("SELECT count(*) FROM doc_keys k JOIN docs d ON d.id=k.doc "
+                                         "WHERE k.key LIKE 'fp:%' AND d.gone IS NOT NULL").fetchone()[0], 0)
+
+    def test_a_file_moved_to_a_folder_listed_earlier_keeps_its_text(self):
+        annex = self.base / "Zannex"
+        annex.mkdir()
+        self.run_cli("roots", "add", str(annex))
+        (annex / "book.txt").write_text(LARGE)
+        self.build()
+        (annex / "book.txt").unlink()
+        self.write("moved.txt", when=1_800_000_000)         # written anew in the folder that is listed first
+        self.read.clear()
+        self.assertEqual(self.build(), (0, 0))
+        self.assertEqual((self.read, names(self.db, "northern harbours")), ([], ["Reading Room/moved.txt"]))
+
+    def test_two_checksums_of_one_kind_prove_two_documents(self):
+        from shelffind import link
+        first, second = self.write("a/book.txt"), self.write("b/book.txt", OTHER)       # one name, size and date
+        self.assertEqual(self.build(), (1, 0))
+        self.assertEqual(self.documents(), 1)               # the inventory took them for copies
+        ids = dict(self.db.execute("SELECT rel,id FROM files"))
+        with self.db:
+            for rel, sha in (("a/book.txt", "aa"), ("b/book.txt", "bb")):
+                link.attach(self.db, ids[rel], "library", {"id": rel, "keys": ["sha256:" + sha * 32], "text": False},
+                            False, set())
+        self.assertEqual(self.documents(), 2)
+        shown = names(self.db, "northern harbours") + names(self.db, "southern capes")
+        self.assertEqual(len(shown), 1)                     # only the file that was read shows a text: its own
+        self.build()
+        self.assertEqual((names(self.db, "northern harbours"), names(self.db, "southern capes")),
+                         (["a/book.txt"], ["b/book.txt"]))
+        self.assertEqual((first.read_text()[:4], second.read_text()[:4]), ("Tide", "Wind"))
+
+    def test_a_true_copy_set_apart_by_a_checksum_joins_its_document_again(self):
+        from shelffind import link
+        self.write("a/book.txt")
+        self.write("b/book.txt")
+        self.build()
+        ids = dict(self.db.execute("SELECT rel,id FROM files"))
+        record = {"id": "W1", "keys": ["sha256:" + "aa" * 32], "title": "Tide Tables", "text": False}
+        with self.db:
+            for rel in ("a/book.txt", "b/book.txt"):
+                link.attach(self.db, ids[rel], "library", record, False, set())
+        self.read.clear()
+        self.assertEqual(self.build(), (0, 0))              # compared by fingerprint, not read again
+        self.assertEqual((self.read, self.documents()), ([], 1))
+        found = search(self.db, "northern harbours")
+        self.assertEqual((len(found), len(found[0]["copies"]), found[0]["title"]), (1, 1, "Tide Tables"))
+
+    def test_a_page_recognised_in_either_copy_survives_their_merging(self):
+        with self.db:
+            one = store.new_document(self.db, "stamp:9:1:pdf", 9, "pdf")
+            two = store.new_document(self.db, "stamp:9:2:pdf", 9, "pdf")
+            for doc, pages in ((one, [(1, "", 1), (2, "second page", 0)]), (two, [(1, "first page", 0), (2, "", 1)])):
+                self.db.executemany("INSERT INTO pages(doc,page,section,ztext,needs_ocr) VALUES(?,?,NULL,?,?)",
+                                    [(doc, page, store.deflate(body), blank) for page, body, blank in pages])
+                self.db.execute("UPDATE docs SET state='needs-ocr' WHERE id=?", (doc,))
+            kept = store.merge(self.db, one, two)
+        rows = [(row[0], store.inflate(row[1]), row[2]) for row in self.db.execute(
+            "SELECT page,ztext,needs_ocr FROM pages WHERE doc=? ORDER BY page", (kept,))]
+        self.assertEqual(rows, [(1, "first page", 0), (2, "second page", 0)])
+        self.assertEqual(self.db.execute("SELECT state FROM docs WHERE id=?", (kept,)).fetchone()[0], "indexed")
+        self.assertEqual(self.db.execute("SELECT count(*) FROM passages WHERE passages MATCH 'first'").fetchone()[0], 1)
+
+    @unittest.skipIf(os.geteuid() == 0, "The administrator reads every file")
+    def test_a_fingerprint_that_cannot_be_taken_is_reported(self):
+        path = self.write("old.txt")
+        self.build()
+        self.db.execute("DELETE FROM doc_keys WHERE key LIKE 'fp:%'")
+        self.db.commit()
+        path.chmod(0)
+        self.addCleanup(path.chmod, 0o600)
+        said = []
+        done = indexer.build(self.db, self.data, store.roots(self.db), progress=said.append)
+        self.assertEqual(done, (0, 1))
+        self.assertTrue(any("Could not fingerprint old.txt" in line for line in said))
 
 
 class Robustness(Reading):
@@ -194,9 +329,9 @@ class Lost(Reading):
         self.build()
         self.read.clear()
         os.utime(note, (1_800_000_000, 1_800_000_000))
-        self.assertEqual(self.build(), (1, 0))
+        self.assertEqual(self.build(), (0, 0))
         note.rename(self.root / "renamed.txt")
-        self.assertEqual(self.build(), (1, 0))
+        self.assertEqual(self.build(), (0, 0))
         self.assertEqual(self.read, [])
         self.assertEqual(names(self.db, "short note"), ["Reading Room/renamed.txt"])
         self.assertEqual(self.documents(), 1)

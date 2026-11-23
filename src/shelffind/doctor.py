@@ -66,7 +66,7 @@ def checks(directory, explicit):
         yield "fail", "earlier index", str(fault), "make the file readable; nothing is converted or replaced meanwhile"
     if earlier is None:
         pass
-    elif not index.is_file() and earlier == 1:
+    elif not index.is_file() and earlier in (1, store.RETIRED):
         yield "warn", "index", f"{directory / store.EARLIER} has the earlier format", \
             "run `shelffind upgrade`; the earlier index is kept beside the new one"
     elif not index.is_file():

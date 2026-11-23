@@ -117,7 +117,7 @@ class Moves(Reading):
 
     def test_a_new_date_on_the_same_content_reads_nothing_again(self):
         os.utime(self.first, (1_800_000_000, 1_800_000_000))
-        self.assertEqual(self.build(), (1, 0))              # looked at, and found to be known
+        self.assertEqual(self.build(), (0, 0))              # compared, and found to be known
         self.assertEqual(self.read, [])
         self.assertEqual(len(search(self.db, "northern harbours")), 1)
 
