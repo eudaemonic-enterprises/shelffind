@@ -136,6 +136,29 @@ The exchange between ShelfFind and a source is small and stable: one JSON questi
 
 The private index, the registered sources and the searches made are under `$XDG_DATA_HOME/shelffind`, normally `~/.local/share/shelffind`. Use `--data-dir DIRECTORY` before the command for a separate collection, which then reads only `DIRECTORY/config.toml`.
 
+## Several machines
+
+When you work on several machines, ShelfFind can share between them the journal of what you searched and opened, so that a search made on one is offered on the others, and the documents opened lately, wherever that was, come first in an empty panel and rise among the results. Nothing is shared unless you ask for it:
+
+```toml
+[share]
+history = true
+folder  = "~/Sync/ShelfFind"        # a folder that some tool keeps in step between the machines
+# remote = "cloud:ShelfFind"        # or a remote of rclone
+```
+
+Give each machine a name once with `shelffind machine --name home`. `shelffind sync` exchanges at once, and the panel starts an exchange by itself after it closes when the last one is more than ten minutes old. Each machine writes only its own files in the shared place, a journal for each month and a list of them with their checksums, and takes a journal of another machine only when its checksum agrees. An address travels written from the home folder (`~/Books/atlas.pdf`), so it means the same on a machine where your home folder has another name. What the journal holds is the words of each search, the address and the name of each document opened, and the time; a search that begins with a blank is not recorded, and `history.record = false` records nothing at all.
+
+## Keeping the folders in order
+
+```sh
+shelffind report copies             # the documents kept in several places, the largest first
+shelffind report unlinked           # the files of readable formats that no source knows
+shelffind report names              # the files whose name does not show the work a source says they are
+```
+
+Each list can be limited to one folder with `--root NAME` and printed as JSON with `--json`. The list of files is refreshed by itself beside the panel when it is more than an hour old (`index.refresh`, in minutes; 0 leaves it to `shelffind index`), so a file you filed elsewhere a moment ago is found at its new place with its text.
+
 ## Coming from version 0.2
 
 The index of version 0.3 has a new form. The first time you open the panel or run `shelffind index`, the earlier index is converted by copy: the new index is written beside it, and the earlier one is kept, marked so that an earlier ShelfFind no longer uses it. Nothing has to be read again. `shelffind status` answers from the earlier index without converting it, and a command run by a script on a large earlier index stops with exit code 75 and asks for `shelffind upgrade`, which converts at once. When the new index has served you well, `shelffind upgrade --discard-old` deletes the earlier one.
