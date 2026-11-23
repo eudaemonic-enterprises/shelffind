@@ -508,17 +508,22 @@ def at_hand(path, slow=None):
 
 def tend_orphans(db, root=None, now=None, drop=True):
     """Note the documents that have just lost their last file and, when `drop` allows, forget
-    those that have nothing worth keeping or have waited long enough. A document that was read
-    keeps its text for a month after its last file has gone, for the day that file is found
-    again elsewhere."""
+    those that have nothing worth keeping or have waited long enough. A document that was read,
+    or that a source knows, is kept for a month after its last file has gone, for the day that
+    file is found again elsewhere."""
     now = int(time.time()) if now is None else now
     db.execute("UPDATE docs SET gone=NULL,gone_from=NULL WHERE gone IS NOT NULL AND EXISTS "
                "(SELECT 1 FROM files f WHERE f.doc=docs.id)")
     db.execute("UPDATE docs SET gone=?,gone_from=? WHERE gone IS NULL AND NOT EXISTS "
                "(SELECT 1 FROM files f WHERE f.doc=docs.id)", (now, root))
     if drop:
-        unread = "NOT EXISTS (SELECT 1 FROM pages p WHERE p.doc=docs.id)"
-        db.execute(f"DELETE FROM docs WHERE gone IS NOT NULL AND ({unread} OR gone<?)", (now - KEEP,))
+        # Worth keeping for a while: the text that was read, what a source said of the document,
+        # and the fingerprint or the checksums by which its file can be recognised again.
+        bare = ("NOT EXISTS (SELECT 1 FROM pages p WHERE p.doc=docs.id) "
+                "AND NOT EXISTS (SELECT 1 FROM records r WHERE r.doc=docs.id AND r.ref!='') "
+                "AND NOT EXISTS (SELECT 1 FROM doc_keys k WHERE k.doc=docs.id AND "
+                "(k.key LIKE 'fp:%' OR k.key LIKE 'sha256:%' OR k.key LIKE 'md5:%'))")
+        db.execute(f"DELETE FROM docs WHERE gone IS NOT NULL AND (({bare}) OR gone<?)", (now - KEEP,))
 
 
 def scan(db, root, directory):

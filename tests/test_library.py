@@ -212,6 +212,42 @@ class Linked(Shelf):
         rows, _ = self.find("lighthill src:library")
         self.assertEqual(len(rows), 1)
 
+    def moved(self):
+        """File the book elsewhere as a filing tool does: a new copy with a new date, the original removed."""
+        target = self.root / "Mechanics" / "Whitham-LinearAndNonlinearWaves-Wiley-1974.txt"
+        target.parent.mkdir()
+        target.write_text(BOOK)
+        os.utime(target, (1_800_000_000, 1_800_000_000))
+        self.book.unlink()
+        return target
+
+    def test_a_moved_file_that_only_the_library_has_read_keeps_its_record(self):
+        self.build()
+        target = self.moved()
+        self.read.clear()
+        self.assertEqual(self.build(), (0, 0))
+        self.assertEqual(self.read, [])                     # compared by its checksum, never read for its text
+        self.assertEqual(self.states(), {target.name: "covered", "notes.txt": "indexed"})
+        rows, _ = self.find("dispersion relation")
+        self.assertEqual([(hit["path"], hit["title"], hit["record"]["id"]) for hit in rows],
+                         [(str(target), "Linear and Nonlinear Waves", "W1")])
+        self.assertEqual(self.db.execute("SELECT count(*) FROM docs WHERE gone IS NOT NULL").fetchone()[0], 0)
+
+    def test_the_storage_tells_the_checksum_without_the_file_being_read(self):
+        digest = hashlib.md5(BOOK.encode()).hexdigest()
+        self.works[0]["keys"].append("md5:" + digest)
+        self.catalogue()
+        tools = self.fake_tool("rclone", f'[ "$1 $2" = "hashsum md5" ] && echo "{digest}  $(basename "$3")"\n')
+        store.declare({"Reading Room": {"path": str(self.root), "remote": "cloud:Room"}})
+        self.addCleanup(store.declare, {})
+        self.build()
+        target = self.moved()
+        with patch.dict(os.environ, {"PATH": str(tools) + os.pathsep + os.environ["PATH"]}), \
+                patch("shelffind.indexer.proven", side_effect=AssertionError("the file was opened")):
+            self.assertEqual(self.build(), (0, 0))
+        self.assertEqual(self.states()[target.name], "covered")
+        self.assertEqual(search(self.db, "whitham")[0]["path"], str(target))
+
     def test_the_lists_for_keeping_the_folders_in_order(self):
         second = self.root / "Desk" / "scan-0042.txt"
         second.parent.mkdir()

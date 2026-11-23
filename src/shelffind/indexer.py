@@ -2,6 +2,7 @@
 """Inventory first. Commit extracted text per document and OCR per page."""
 import hashlib
 import sqlite3
+import subprocess
 from pathlib import Path
 
 from . import extract, fuzzy, link, store
@@ -44,6 +45,46 @@ def proven(path, row):
     return key
 
 
+def stored_checksum(remote, rel):
+    """The MD5 of a file as its storage gives it through rclone, without reading the file; None
+    when rclone or the storage does not give one."""
+    try:
+        done = subprocess.run(["rclone", "hashsum", "md5", f"{remote.rstrip('/')}/{rel}"], capture_output=True,
+                              text=True, timeout=120)
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    word = (done.stdout.split() or [""])[0].lower() if done.returncode == 0 else ""
+    return f"md5:{word}" if len(word) == 32 and all(char in "0123456789abcdef" for char in word) else None
+
+
+def whole_checksums(path, row):
+    """The MD5 and the SHA-256 of a file read in full, which stayed as the inventory saw it."""
+    check_stamp(path, row)
+    sums = hashlib.md5(), hashlib.sha256()
+    with path.open("rb") as source:
+        while block := source.read(1 << 20):
+            for one in sums:
+                one.update(block)
+    check_stamp(path, row)
+    return [f"md5:{sums[0].hexdigest()}", f"sha256:{sums[1].hexdigest()}"]
+
+
+def joined(db, file, keys):
+    """Give the document of `file` the checksums `keys` of its own bytes. A document that
+    carries one of them already is the same document: the two are merged. Returns True then."""
+    merged = False
+    for key in keys:
+        own = db.execute("SELECT doc FROM files WHERE id=?", (file,)).fetchone()
+        owner = db.execute("SELECT doc FROM doc_keys WHERE key=?", (key,)).fetchone()
+        if own is None:
+            break
+        if owner is None:
+            db.execute("INSERT INTO doc_keys(key,doc,basis) VALUES(?,?,'content')", (key, own["doc"]))
+        elif owner["doc"] != own["doc"] and store.merge(db, owner["doc"], own["doc"]) is not None:
+            merged = True
+    return merged
+
+
 def settle(db, root, progress):
     """Answer by reading what the inventory left open in one folder. A file that resembles a
     known document is fingerprinted, and joins the document that has this fingerprint, if there
@@ -53,9 +94,20 @@ def settle(db, root, progress):
     failures = 0
     asked = db.execute("SELECT id,rel,size,mtime,format FROM files WHERE root=? AND maybe IS NOT NULL",
                        (root["id"],)).fetchall()
+    sums = "SELECT 1 FROM docs d JOIN doc_keys k ON k.doc=d.id WHERE d.size=? AND d.format=? AND k.key LIKE ? LIMIT 1"
     for row in asked:
+        path = Path(root["path"]) / row["rel"]
+        # The storage may tell the checksum of the file without its being read: a document that
+        # a source described by that checksum is then recognised at no cost.
+        if root.get("remote") and db.execute(sums, (row["size"], row["format"], "md5:%")).fetchone():
+            given = stored_checksum(root["remote"], row["rel"])
+            if given:
+                with db:
+                    if joined(db, row["id"], [given]):
+                        db.execute("UPDATE files SET maybe=NULL WHERE id=?", (row["id"],))
+                        continue
         try:
-            found = proven(Path(root["path"]) / row["rel"], row)
+            found = proven(path, row)
         except ValueError:                  # changed since the inventory, which will see it again
             continue
         except OSError as fault:
@@ -68,6 +120,18 @@ def settle(db, root, progress):
             db.execute("UPDATE files SET maybe=NULL,print=? WHERE id=?", (found, row["id"]))
             if owner and now and owner["doc"] != now["doc"]:
                 store.merge(db, owner["doc"], now["doc"])
+                continue
+        # No document has this fingerprint. One that was never read here, but that a source
+        # described by a checksum of the whole file, can still be this file: without a storage
+        # that tells the checksum, the file is read once in full to know.
+        if not root.get("remote") and (db.execute(sums, (row["size"], row["format"], "md5:%")).fetchone()
+                                       or db.execute(sums, (row["size"], row["format"], "sha256:%")).fetchone()):
+            try:
+                given = whole_checksums(path, row)
+            except (OSError, ValueError):
+                continue
+            with db:
+                joined(db, row["id"], given)
     # The file a document was read from, unchanged since, is the one proof of what its pages
     # hold: no other file may lend the document a fingerprint.
     bare = db.execute(
