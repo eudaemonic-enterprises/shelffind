@@ -3,8 +3,10 @@
 
 A small world is driven at random: files are written, changed, copied, moved and removed in
 two folders, one of which has a storage that tells checksums and may lag behind; two sources
-recognise files, by their address, rightly or wrongly, or by their checksum; the index is
-brought up to date now and then, by an inventory or in full. Since the test knows what every
+recognise files, by their address, rightly or wrongly, or by their checksum; one work in four
+is a scan, whose second page is recognised by a later run; the index is brought up to date now
+and then, by an inventory, in full, for one file, or for the recognition; a folder is forgotten
+and registered again, and a month passes. Since the test knows what every
 file holds, it can tell after each step whether a file shows a text that is not its own, and
 whether the documents are those that the facts name, whatever the order of the events.
 
@@ -15,6 +17,7 @@ import os
 import random
 import shutil
 import tempfile
+import time
 import unittest
 from pathlib import Path
 from unittest.mock import patch
@@ -55,7 +58,9 @@ class World:
         self.known = {"library": set(), "catalogue": set()}     # source -> works it knows by their checksums
         self.questions = 0
         self.aged = False
+        self.aim = None
         self.extracted = []
+        self.recognised = []
         self.log = []
 
     # ---- the truth ------------------------------------------------------------------------
@@ -123,9 +128,11 @@ class World:
         dice = self.dice
         kind = dice.choice(("add", "add", "again", "copy", "move", "rename", "change", "remove", "sync", "sync",
                             "believe", "believe", "learn", "forget", "silence", "lie", "inventory", "inventory",
-                            "full", "full", "limited", "relink"))
+                            "full", "full", "limited", "relink", "recognise", "targeted", "retry"))
         if not self.aged and dice.random() < 0.01:
             kind = "age"
+        elif dice.random() < 0.01:
+            kind = dice.choice(("refold", "month"))
         path = self.some_file()
         if kind == "add":
             self.put(self.fresh_address(), self.new_work())
@@ -173,10 +180,32 @@ class World:
             self.twin[path] = (dice.choice(others), *self.twin[path][1:])
         elif kind == "age":
             self.age()
-        elif kind in ("inventory", "full", "limited", "relink"):
+        elif kind == "refold":                              # a folder is forgotten, then registered again
+            store.remove_root(self.db, "Room")
+            self.sound(kind)
+            store.add_root(self.db, self.rooms["Room"], self.data, name="Room")
+        elif kind == "month":                               # the documents without file have waited long enough
+            with self.db:
+                store.tend_orphans(self.db, now=int(time.time()) + store.KEEP + 60)
+            self.sound(kind)
+        elif kind == "targeted":
+            if path is None:
+                return None
+            self.aim = path
+            return kind
+        elif kind in ("inventory", "full", "limited", "relink", "recognise", "retry"):
             return kind
         self.log.append(kind)
         return None
+
+    def sound(self, kind):
+        breaches = invariants.structure(self.db)
+        if breaches or invariants.actual(self.db) != invariants.canonical(self.db):
+            raise AssertionError(f"after {' '.join(self.log)} {kind}: {breaches or 'the documents are not those the facts name'}")
+
+    def scan_of(self, work):
+        """True for a work that is a scan: its second page waits for a recognition."""
+        return work % 4 == 0
 
     def misled(self):
         """The files of which the storage holds other bytes under the same size and the same
@@ -205,7 +234,12 @@ class World:
                 path = places[file["root"]] / file["rel"]
                 same = path.is_file() and (path.stat().st_size, path.stat().st_mtime_ns) == (file["size"], file["mtime"])
                 read = same and file["format"] in extract.SUPPORTED and self.dice.random() < 0.7
-                if read:
+                if read and self.scan_of(self.holds[path]):
+                    db.execute("INSERT INTO pages(doc,page,section,ztext,needs_ocr) VALUES(?,1,NULL,?,0)",
+                               (doc, store.deflate(path.read_bytes().decode())))
+                    db.execute("INSERT INTO pages(doc,page,section,ztext,needs_ocr) VALUES(?,2,NULL,?,1)", (doc, store.deflate("")))
+                    db.execute("UPDATE docs SET state='needs-ocr' WHERE id=?", (doc,))
+                elif read:
                     db.execute("INSERT INTO pages(doc,page,section,ztext,needs_ocr) VALUES(?,NULL,NULL,?,0)",
                                (doc, store.deflate(path.read_bytes().decode())))
                     db.execute("UPDATE docs SET state='indexed' WHERE id=?", (doc,))
@@ -220,7 +254,8 @@ class World:
 
     def build(self, kind):
         options = {"inventory": {"names_only": True}, "full": {}, "limited": {"limit": 1},
-                   "relink": {"names_only": True, "relink": True}}[kind]
+                   "relink": {"names_only": True, "relink": True}, "recognise": {"ocr": True}, "retry": {"retry": True},
+                   "targeted": {"paths": [self.aim]}}[kind]
         self.log.append(kind)
         before = len(self.extracted)
         self.liars |= self.misled()                         # what it says of them now may be kept for long
@@ -235,8 +270,16 @@ class Histories(unittest.TestCase):
             original = extract.passages
 
             def reading(path, fmt, work):
-                world.extracted.append((world.work_of(path.read_bytes()), fmt))
+                held = world.work_of(path.read_bytes())
+                world.extracted.append((held, fmt))
+                if world.scan_of(held):                     # a scan: one page of text, one still to recognise
+                    return [extract.Passage(1, None, path.read_bytes().decode()), extract.Passage(2, None, "", True)]
                 return original(path, fmt, work)
+
+            def recognising(path, fmt, work, number, languages):
+                held = world.work_of(path.read_bytes())
+                world.recognised.append((held, fmt))
+                return f"work{held:04d}token recognised on page {number}"
 
             usable = lambda directory, progress=None: (
                 {"library": ["library"], "catalogue": ["catalogue"]}, {"library": True, "catalogue": False}, set())
@@ -244,6 +287,7 @@ class Histories(unittest.TestCase):
             store.declare({"Vault": {"path": str(world.rooms["Vault"]), "remote": "twin:Vault"}})
             try:
                 with patch("shelffind.extract.passages", side_effect=reading), \
+                        patch("shelffind.extract.recognize", side_effect=recognising), \
                         patch("shelffind.indexer.stored_checksums", side_effect=world.stored), \
                         patch("shelffind.sources.question", side_effect=world.question), \
                         patch("shelffind.sources.policy", side_effect=policy), \
@@ -270,6 +314,10 @@ class Histories(unittest.TestCase):
         db = world.db
         where = f"history {seed}, after {' '.join(world.log)} {kind}"
         sealed = {(row["origin"], row["format"]) for row in db.execute("SELECT origin,format FROM docs WHERE origin LIKE '%sha256:%'")}
+        complete = {(row["origin"], row["format"]) for row in db.execute(
+            "SELECT origin,format FROM docs d WHERE origin LIKE '%sha256:%' AND NOT EXISTS "
+            "(SELECT 1 FROM pages p WHERE p.doc=d.id AND p.needs_ocr=1)")}
+        recognised = len(world.recognised)
         (done, failures), extracted = world.build(kind)
         self.assertEqual(failures, 0, where)
         self.assertEqual(invariants.structure(db), [], where)
@@ -277,6 +325,8 @@ class Histories(unittest.TestCase):
         # No document is read a second time while the text read from its bytes is kept.
         for work, fmt in extracted:
             self.assertNotIn((" ".join(world.sums(work)), fmt), sealed, f"{where}: work {work} was read again")
+        for work, fmt in world.recognised[recognised:]:
+            self.assertNotIn((" ".join(world.sums(work)), fmt), complete, f"{where}: work {work} was recognised again")
         # No file shows a text that is not its own, unless a source says so of a file never measured.
         places = {root["id"]: Path(root["path"]) for root in store.roots(db)}
         texts = self.texts(db)
@@ -293,20 +343,21 @@ class Histories(unittest.TestCase):
             words = db.execute("SELECT 1 FROM records WHERE file=? LIMIT 1", (file["id"],)).fetchone()
             self.assertTrue(not file["sum"] and words and len(shown) == 1, f"{where}: {file['rel']} holds work {work} and shows {shown}")
         liars = {path for path in world.liars if path in world.holds}
-        if kind != "full" or world.silent or liars:
+        if kind not in ("full", "recognise") or world.silent or liars:
             return
         current = {path: (work, path.stat().st_size, path.stat().st_mtime_ns // 10**9)
                    for path, work in world.holds.items() if path.is_relative_to(world.rooms["Vault"])}
         if current != {path: held for path, held in world.twin.items() if path in world.holds}:
             return
         # A full run with a storage that is up to date leaves nothing waiting, and a second run nothing to do.
-        waiting = db.execute("SELECT f.rel FROM files f JOIN docs d ON d.id=f.doc WHERE d.state IN ('pending','error')").fetchall()
+        states = "'needs-ocr','ocr-error'" if kind == "recognise" else "'pending','error'"
+        waiting = db.execute(f"SELECT f.rel FROM files f JOIN docs d ON d.id=f.doc WHERE d.state IN ({states})").fetchall()
         self.assertEqual([row["rel"] for row in waiting], [], where)
         snapshot = lambda: [db.execute(question).fetchall() for question in (
             "SELECT id,doc,sum,read,asked FROM files ORDER BY id", "SELECT id,state,origin,title FROM docs ORDER BY id",
             "SELECT key,doc,basis FROM doc_keys ORDER BY key", "SELECT id,doc,file,source,ref,keys FROM records ORDER BY id")]
         before, questions = [[tuple(row) for row in rows] for rows in snapshot()], world.questions
-        (done, failures), extracted = world.build("full")
+        (done, failures), extracted = world.build(kind)
         world.log.pop()
         self.assertEqual((done, failures, extracted, world.questions - questions), (0, 0, [], 0), f"{where}, a second full run")
         self.assertEqual([[tuple(row) for row in rows] for rows in snapshot()], before, f"{where}, a second full run")

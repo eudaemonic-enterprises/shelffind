@@ -312,6 +312,21 @@ class Words2(Placing):
         self.assertEqual(names(self.db, "loose card"), [])
         self.sound()
 
+    def test_a_source_that_repeats_itself_moves_no_file(self):
+        for folder in "abc":
+            self.write(f"{folder}/book.txt")
+        self.build(names_only=True)
+        key = ["md5:" + "aa" * 16]
+        for folder in "abc":
+            self.assertTrue(self.say(f"{folder}/book.txt", "W1", key, title="First Title"))
+        docs = self.docs()
+        with patch("shelffind.store.place", side_effect=AssertionError("a file was placed again")):
+            for folder in "abc":
+                self.assertTrue(self.say(f"{folder}/book.txt", "W1", key, title="Second Title"))
+        self.assertEqual((self.docs(), self.documents()), (docs, 1))
+        self.assertEqual((len(names(self.db, "second title")), names(self.db, "first title")), (1, []))
+        self.sound()
+
     def test_files_held_together_through_one_file_part_when_it_says_less(self):
         for folder in "abc":
             self.write(f"{folder}/book.txt")
@@ -381,7 +396,8 @@ class Reading3(Placing):
     def test_a_file_opened_under_the_name_of_another_is_not_measured(self):
         path = self.write("book.txt")
         row = {"size": path.stat().st_size, "mtime": path.stat().st_mtime_ns}
-        other = self.write("other.txt", OTHER, when=1_800_000_000)
+        other = self.write("other.txt", OTHER)              # the same size and the same date: only the file itself differs
+        os.utime(other, ns=(path.stat().st_mtime_ns, path.stat().st_mtime_ns))
         real = Path.open
 
         def swapped(self_path, *args, **kwargs):            # at the instant of its opening, another file has the name
@@ -451,18 +467,67 @@ class Reading3(Placing):
         self.assertEqual((self.build(), len(self.read), self.documents()), ((1, 0), 1, 1))
         self.sound()
 
+    def test_the_copies_of_a_document_that_was_just_read_are_not_even_opened(self):
+        for number in range(4):
+            self.write(f"copies/{number}.txt")
+        self.build(names_only=True)
+        for number in range(4):
+            self.measure(f"copies/{number}.txt")
+        self.assertEqual(self.documents(), 1)
+        real, taken = indexer.private_copy, []
+
+        def counting(path, row, hold, known=None):
+            taken.append(path.name)
+            return real(path, row, hold, known)
+
+        with patch("shelffind.indexer.private_copy", side_effect=counting):
+            self.assertEqual(self.build(), (1, 0))
+        self.assertEqual(len(taken), 1)
+
 
 class Storage2(Placing):
     def test_what_a_storage_says_of_pages_tied_to_nothing_is_not_taken(self):
-        self.twin()
+        questions = self.twin()
         path = self.write("book.txt")
+        self.write("other.txt", OTHER)                      # of the same size: each would be asked about
         self.build()
         self.unmeasured()                                   # read by an earlier version
+        before = len(questions())
         self.assertEqual(self.build(names_only=True), (0, 0))
-        self.assertEqual(tuple(self.db.execute("SELECT sum FROM files").fetchone()), (None,))
+        self.assertEqual(len(questions()), before)          # the storage is not even asked
+        with self.db:
+            self.assertFalse(indexer.joined(self.db, self.ids()["book.txt"], self.sums(path)[:1], local=False))
+        self.assertEqual([row["sum"] for row in self.db.execute("SELECT sum FROM files")], [None, None])
+        self.read.clear()
         self.assertEqual(self.build(), (0, 0))              # a reading in full ties the pages to the bytes
-        self.assertEqual(self.db.execute("SELECT origin FROM docs").fetchone()[0].split(), self.sums(path))
-        self.assertEqual(self.read, ["book.txt"])
+        origin = self.db.execute("SELECT d.origin FROM docs d JOIN files f ON f.doc=d.id WHERE f.rel='book.txt'").fetchone()[0]
+        self.assertEqual((origin.split(), self.read), (self.sums(path), []))
+        self.sound()
+
+    def test_a_complete_run_proves_against_the_storage_what_a_source_said(self):
+        questions = self.twin()
+        path = self.write("book.txt")
+        self.build(names_only=True)
+        wrong = ["md5:" + hashlib.md5(OTHER.encode()).hexdigest()]
+        self.assertTrue(self.say("book.txt", "W1", wrong, title="Wrong Work"))
+        self.assertEqual(self.build(names_only=True), (0, 0))       # an inventory believes it,
+        self.assertEqual((names(self.db, "wrong work"), [call for call in questions() if call[0] == "hashsum"]),
+                         (["Reading Room/book.txt"], []))
+        self.assertEqual(self.build(limit=0), (0, 0))       # and a complete run asks the storage, which refutes it
+        self.assertEqual(names(self.db, "wrong work"), [])
+        self.assertEqual(self.db.execute("SELECT sum FROM files").fetchone()[0], self.sums(path)[0])
+        self.sound()
+
+    def test_in_a_folder_with_a_storage_no_file_is_read_in_full_to_be_compared(self):
+        behind = self.base / "behind"
+        behind.mkdir()
+        self.twin(behind)                                   # a storage that has received nothing yet
+        self.write("a/book.txt")
+        self.write("b/book.txt", OTHER)
+        self.build(names_only=True)
+        self.assertTrue(self.say("a/book.txt", "W1", ["md5:" + "ee" * 16]))     # one of the two is known by a checksum
+        with patch("shelffind.indexer.whole_checksums", side_effect=AssertionError("a file was read")):
+            self.assertEqual(self.build(limit=0), (0, 0))   # the other waits for the storage: nothing is read
         self.sound()
 
     def test_what_the_first_batches_taught_is_used_though_the_storage_then_falls_silent(self):
@@ -477,6 +542,53 @@ class Storage2(Placing):
             self.assertEqual(self.build(names_only=True), (0, 0))
         self.assertEqual(len(calls), 2)
         self.assertEqual(self.documents(), 2)               # the two that were answered for are one document
+        self.sound()
+
+
+class Changed(Placing):
+    """A file found changed keeps nothing of what was known of the file that stood there."""
+
+    def known(self):
+        one = self.write("a/book.txt")
+        self.write("b/book.txt", OTHER)
+        self.build(names_only=True)
+        self.measure("b/book.txt")                          # a document of its size is known by a checksum
+        self.assertTrue(self.say("a/book.txt", "W1", ["sha256:" + "ee" * 32], title="Said Before"))
+        return one
+
+    def kept(self):
+        """What is still said of a file, and what the title said before finds."""
+        return self.db.execute("SELECT count(*) FROM records WHERE file IS NOT NULL").fetchone()[0], names(self.db, "said before")
+
+    def test_while_it_is_compared(self):
+        one = self.known()
+        real = indexer.whole_checksums
+
+        def changing(path, row, copy=None):
+            if path == one:
+                raise ValueError(indexer.CHANGED)
+            return real(path, row, copy)
+
+        with patch("shelffind.indexer.whole_checksums", side_effect=changing):
+            self.assertEqual(self.build(limit=0), (0, 1))
+        self.assertEqual(self.kept(), (0, []))
+        self.assertEqual(tuple(self.db.execute("SELECT sum,asked FROM files WHERE rel='a/book.txt'").fetchone()), (None, ""))
+        self.sound()
+
+    def test_between_the_inventory_and_the_answer_of_the_storage(self):
+        one = self.known()
+        self.twin()
+        real = indexer.check_stamp
+
+        def changing(path, row, same=None):
+            if path == one:
+                raise ValueError(indexer.CHANGED)
+            return real(path, row, same)
+
+        with patch("shelffind.indexer.check_stamp", side_effect=changing):
+            self.assertEqual(self.build(names_only=True), (0, 0))
+        self.assertEqual(self.kept(), (0, []))
+        self.assertEqual(tuple(self.db.execute("SELECT sum,asked FROM files WHERE rel='a/book.txt'").fetchone()), (None, ""))
         self.sound()
 
 

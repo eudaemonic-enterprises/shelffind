@@ -510,6 +510,7 @@ def build(db, directory, selected, *, names_only=False, ocr=False, languages="en
                 progress(f"{done // 100 * 100:,} documents processed")
         if done:
             # What was just read may be what other files hold, and what the sources know by its
-            # checksum: neither needs a reading.
-            acquaint(False, True)
+            # checksum: the files of its size are compared with it now, so that the next run
+            # finds nothing left to do.
+            acquaint(True, True)
     return done, failures

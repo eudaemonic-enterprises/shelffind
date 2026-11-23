@@ -48,6 +48,7 @@ def say(db, file, name, record, known=None):
     row = db.execute("SELECT doc,size,format,sum FROM files WHERE id=?", (file,)).fetchone()
     if row is None:
         return False
+    before = db.execute("SELECT keys FROM records WHERE file=? AND source=?", (file, name)).fetchone()
     changed = db.execute("DELETE FROM records WHERE (file=? OR (doc=? AND file IS NULL)) AND source=?",
                          (file, row["doc"], name)).rowcount
     kept = False
@@ -66,7 +67,9 @@ def say(db, file, name, record, known=None):
             kept = True
             if title and known is not None:
                 fuzzy.remember_names(db, (title, byline), known)
-    if changed or kept:
+    if kept and before is not None and before["keys"] == " ".join(keys):
+        store.retitle(db, row["doc"])               # the same checksums as before: the file stays where it is
+    elif changed or kept:
         doc = store.replace(db, file)
         if kept and doc != row["doc"]:              # the same holds in the document the file is in now
             db.execute("DELETE FROM records WHERE doc=? AND file IS NULL AND source=?", (doc, name))
