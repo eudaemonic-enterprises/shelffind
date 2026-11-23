@@ -212,6 +212,29 @@ class Linked(Shelf):
         rows, _ = self.find("lighthill src:library")
         self.assertEqual(len(rows), 1)
 
+    def test_the_lists_for_keeping_the_folders_in_order(self):
+        second = self.root / "Desk" / "scan-0042.txt"
+        second.parent.mkdir()
+        second.write_text(BOOK)
+        os.utime(second, (self.book.stat().st_mtime, self.book.stat().st_mtime))
+        named = self.root / "Waves" / "Lighthill-WavesInFluids-CUP-1978.txt"
+        named.write_text("Internal waves. " * 5000)
+        self.works[1].update(file=named.name, size=named.stat().st_size)
+        self.catalogue()
+        self.build()
+        code, out, err = self.run_cli("report", "copies", "--json")
+        self.assertEqual([(row["title"], sorted(row["paths"])) for row in json.loads(out)],
+                         [("Linear and Nonlinear Waves", sorted([str(self.book), str(second)]))])
+        self.assertEqual(json.loads(self.run_cli("report", "copies", "--json", "--root", "Reading Room")[1]),
+                         json.loads(out))
+        code, out, err = self.run_cli("report", "unlinked")
+        self.assertEqual((out.split("\n")[0], err.strip()), (str(self.root / "Waves" / "notes.txt"), "1 files no source knows"))
+        listed = json.loads(self.run_cli("report", "names", "--json")[1])
+        self.assertEqual([(Path(row["path"]).name, row["lacks"]) for row in listed],
+                         [("scan-0042.txt", ["author", "title", "year"])] * 2)   # the well-named file is not listed
+        code, out, _ = self.run_cli("report", "names")
+        self.assertIn("    lacks author, title, year: G. B. Whitham (1974) Linear and Nonlinear Waves", out)
+
     def test_a_source_is_checked_question_by_question(self):
         code, out, _ = self.run_cli("sources", "check", "library", "group", "velocity")
         self.assertEqual(code, 0, out)

@@ -11,14 +11,14 @@ import time
 from contextlib import closing
 from pathlib import Path
 
-from . import (__version__, config, desktop, doctor, helptext, indexer, machine, migrate, sharing, shell, sources,
-               store)
+from . import (__version__, config, curate, desktop, doctor, helptext, indexer, machine, migrate, sharing, shell,
+               sources, store)
 from .picker import panel
 from .text import json_text, safe
 from .tui import report, style
 
 COMMANDS = ["search", "pick", "open", "apps", "reveal", "roots", "sources", "index", "status",
-            "config", "doctor", "upgrade", "sync", "machine", "cheatsheet", "init", "completion"]
+            "config", "doctor", "upgrade", "report", "sync", "machine", "cheatsheet", "init", "completion"]
 
 
 def search_options(command):
@@ -88,6 +88,13 @@ def parser():
     dr.add_argument("--json", action="store_true")
     up = cmds.add_parser("upgrade", help="Convert an index of the earlier format; the old one is kept")
     up.add_argument("--discard-old", action="store_true", help="Delete the earlier index once converted")
+    rp = cmds.add_parser("report", help="Lists for keeping the folders in order")
+    rp.add_argument("what", choices=["copies", "unlinked", "names"],
+                    help="copies: documents kept in several places; unlinked: files no source knows; "
+                         "names: files whose name does not show the work a source says they are")
+    rp.add_argument("--root", help="One registered folder")
+    rp.add_argument("--source", help="For unlinked: the files this source does not know")
+    rp.add_argument("--json", action="store_true")
     sy = cmds.add_parser("sync", help="Exchange the journal of searches with your other machines")
     sy.add_argument("--quiet", action="store_true", help="Say nothing unless something fails")
     mc = cmds.add_parser("machine", help="The name of this machine among those that share")
@@ -311,6 +318,26 @@ def execute(args, db, directory, settings):
         return int(bool(failures))
     elif args.command == "status":
         return status(args, coverage(db, args.errors), directory, settings)
+    elif args.command == "report":
+        rows = {"copies": lambda: curate.copies(db, args.root),
+                "unlinked": lambda: curate.unlinked(db, args.root, args.source),
+                "names": lambda: curate.names(db, args.root)}[args.what]()
+        if args.json:
+            print(json_text(rows))
+        else:
+            for row in rows:
+                if args.what == "copies":
+                    print(safe(f"{row['size']:>12,}  {row['title'] or Path(row['paths'][0]).name}"))
+                    for path in row["paths"]:
+                        print("              " + safe(path))
+                elif args.what == "unlinked":
+                    print(safe(row["path"]))
+                else:
+                    work = " ".join(str(part) for part in (row["byline"], f"({row['year']})" if row["year"] else "",
+                                                           row["title"]) if part)
+                    print(safe(f"{row['path']}\n    lacks {', '.join(row['lacks'])}: {work}"))
+            print(f"{len(rows):,} " + {"copies": "documents kept in several places", "unlinked": "files no source knows",
+                                      "names": "names that do not show their work"}[args.what], file=sys.stderr)
     elif args.command in ("search", "pick"):
         return find(args, db, directory, settings)
     return 0
