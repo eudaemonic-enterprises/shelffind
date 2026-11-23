@@ -123,7 +123,7 @@ def picker(screen, db, directory, query, options):
                 line(screen, 2 + i - start, label, curses.A_REVERSE if i == selected else 0)
             if results:
                 item = results[selected]
-                line(screen, max(2, height - 4), item["path"] or f"{item['source']}  {item['availability'] or item['match']}  {item['id']}")
+                line(screen, max(2, height - 4), item["path"] or f"{item['source']}  {item.get('byline') or ''}  {item['availability'] or item['match']}")
                 where = f"page {item['page']}  " if item["page"] else ""
                 line(screen, max(3, height - 3), where + (item["snippet"] or item["match"]))
             line(screen, max(4, height - 2), message)

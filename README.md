@@ -65,7 +65,7 @@ shelffind sources remove catalogue
 A provider reads one JSON object from standard input and writes one JSON response to standard output. ShelfFind runs only executables the user registers. It sends the query to each selected provider. The folder picker shows local matches as soon as they are ready. Providers may implement their own storage, authentication, and search.
 
 - A search request carries `version` (currently `1`), `op: "search"`, `query`, `limit`, `format` (or null), `exact`, `where` and `terms`. Each term has `text`, `literal` and alternative spellings in `alternatives`.
-- Return an array of results with string `id` and `name`. Optional fields are `format`, `availability`, `match`, `snippet`, `page` and `section`. A folder filter selects local files. Use `--source files` to search the local collection alone.
+- Return an array of results with string `id` and `name`. Optional fields are `byline`, `format`, `availability`, `match`, `snippet`, `page` and `section`. A folder filter selects local files. Use `--source files` to search the local collection alone.
 - An open, open-with or reveal action sends `{"version":1,"op":"resolve","id":"RECORD-ID"}`. Return `{"path":"/absolute/path/to/document"}` for an available file or `{"uri":"https://example.org/record"}` for a catalogue record. Retrieval can take place at selection time. A provider error is shown alongside any successful results.
 
 ## Tests

@@ -116,7 +116,7 @@ def find(db, directory, query, options, publish, cancelled=lambda: False):
                 rows.append(dict(source=name, id=record["id"], name=record["name"], path=None, root=None,
                                  format=record.get("format"), match=record.get("match") or "catalogue",
                                  page=record.get("page"), section=record.get("section"),
-                                 snippet=record.get("snippet"), availability=record.get("availability")))
+                                 snippet=record.get("snippet"), byline=record.get("byline"), availability=record.get("availability")))
             groups.append(rows)
         except (OSError, ValueError) as exc:
             errors.append(f"{name}: {exc}")

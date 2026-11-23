@@ -135,7 +135,9 @@ def execute(args, db, directory):
                     if hit["source"] == "files":
                         print(hit["path"])
                     else:
-                        print(f"[{hit['source']}] {hit['name']}  ({hit['availability'] or hit['match']}, {hit['id']})")
+                        print(f"[{hit['source']}] {hit['name']}  ({hit['availability'] or hit['match']})")
+                        if hit.get("byline"):
+                            print("  " + hit["byline"])
                     if hit["snippet"]:
                         location = f"p. {hit['page']}  " if hit["page"] else ""
                         print("  " + location + hit["snippet"])
