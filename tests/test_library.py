@@ -313,6 +313,24 @@ class Linked(Shelf):
         with patch("shelffind.extract.recognize", side_effect=AssertionError("recognised for nothing")):
             self.assertEqual(self.build(ocr=True), (0, 0))
 
+    def test_a_partly_read_file_found_late_to_be_a_work_the_library_holds_waits_for_no_recognition(self):
+        self.twin()
+        self.works[0].update(file="elsewhere.txt")          # the library does not know the shelf file by its name
+        self.catalogue()
+        silent = patch.dict(os.environ, {"SHELFFIND_TEST_TWIN_SILENT": "1"})    # and the storage gives no answer
+        with silent:
+            self.build()
+        self.assertEqual(self.states()["scan-0042.txt"], "indexed")
+        with self.db:                                       # as a scan leaves it: one page still to recognise
+            self.db.execute("UPDATE pages SET needs_ocr=1 WHERE doc=(SELECT doc FROM files WHERE name='scan-0042.txt')")
+            self.db.execute("UPDATE docs SET state='needs-ocr' WHERE id=(SELECT doc FROM files WHERE name='scan-0042.txt')")
+        copy = self.root / "Mechanics" / "elsewhere.txt"    # a copy arrives under the name the library knows
+        copy.parent.mkdir()
+        copy.write_text(BOOK)
+        with silent, patch("shelffind.extract.recognize", side_effect=AssertionError("recognised for nothing")):
+            self.assertEqual(self.build(ocr=True), (0, 0))  # read in full after the library spoke, the two are one
+        self.assertEqual((self.states()["scan-0042.txt"], self.states()["elsewhere.txt"]), ("covered", "covered"))
+
     def test_a_source_that_says_it_holds_no_text_any_more_gives_the_reading_back(self):
         self.build()
         self.assertEqual(self.states()["scan-0042.txt"], "covered")
