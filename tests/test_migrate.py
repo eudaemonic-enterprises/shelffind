@@ -73,7 +73,7 @@ class Earlier(unittest.TestCase):
                          (str(self.root), store.mount_point(self.home)))
         # Two copies of one large document, each read by the earlier version; one of them still
         # waits for its scanned pages while the other is complete.
-        self.file("Harbours/TideTables.txt", LARGE, "needs-ocr", [(1, "Tides of the", 0), (2, "", 1)])
+        self.file("Harbours/TideTables.txt", LARGE, "needs-ocr", [(1, "Tides of the northern harbours", 0), (2, "", 1)])
         self.file("Desk/TideTables.txt", LARGE, "indexed",
                   [(1, "Tides of the northern harbours", 0), (2, "The spring tide follows the new moon", 0)])
         # The same size and date under another name: another document until proved otherwise.
@@ -182,7 +182,8 @@ class Conversion(Earlier):
         self.assertEqual(len(search(db, "spring tide")), 1)
 
     def test_a_conversion_cut_after_the_new_index_appeared_is_completed(self):
-        with patch("shelffind.migrate.finish", side_effect=KeyboardInterrupt), self.assertRaises(KeyboardInterrupt):
+        with patch("shelffind.migrate.history.absorb", side_effect=KeyboardInterrupt), \
+                self.assertRaises(KeyboardInterrupt):
             migrate.upgrade(self.data)
         self.assertTrue((self.data / store.INDEX).exists())
         self.assertEqual(self.old_state()[0], 1)
@@ -196,16 +197,92 @@ class Conversion(Earlier):
         with (self.data / history.NAME).open() as journal:
             self.assertEqual(len(journal.readlines()), 2)   # the searches were not written twice
 
-    def test_a_busy_old_index_is_marked_later(self):
+    def test_an_old_index_being_written_is_not_converted_until_it_is_free(self):
+        before = self.old_state()
         self.old.execute("BEGIN IMMEDIATE")                 # an earlier version is writing
-        real = sqlite3.connect
-        with patch("shelffind.migrate.sqlite3.connect",
-                   side_effect=lambda *a, **k: real(*a, **{**k, "timeout": 0.1})):
-            self.assertEqual(migrate.upgrade(self.data, wait=0), self.data / store.INDEX)
-        self.assertEqual(store.earlier_format(self.data), 1)
+        self.old.execute("DELETE FROM roots")               # ... and forgets a folder, not yet for good
+        with self.assertRaises(ValueError) as refused:
+            migrate.upgrade(self.data, wait=0)
+        self.assertIn("in use by another program", str(refused.exception))
+        self.assertEqual(sorted(p.name for p in self.data.glob("index2*")), [])
         self.old.rollback()
-        migrate.upgrade(self.data)
+        self.assertEqual(self.old_state(), before)
+        self.assertEqual(migrate.upgrade(self.data), self.data / store.INDEX)
         self.assertEqual(store.earlier_format(self.data), migrate.RETIRED)
+
+    def test_an_old_index_that_cannot_be_read_is_never_taken_for_none(self):
+        self.old.close()
+        (self.data / store.EARLIER).write_bytes(b"this is not an index" * 400)
+        for attempt in (lambda: store.connect(self.data), lambda: migrate.upgrade(self.data),
+                        lambda: migrate.discard_old(self.data)):
+            with self.assertRaises(ValueError):
+                attempt()
+        self.assertEqual(sorted(p.name for p in self.data.glob("index2*")), [])
+        code, _, err = run_main(self.data, "status")
+        self.assertEqual(code, 1)
+        self.assertIn("The earlier index cannot be read", err)
+        rows = json.loads(run_main(self.data, "doctor", "--json")[1])
+        self.assertTrue(any(row["status"] == "fail" and row["label"] == "earlier index" for row in rows))
+
+    def test_a_new_index_that_was_not_made_from_the_old_one_never_retires_it(self):
+        (self.data / store.INDEX).write_bytes(b"")          # an empty file under the name of the new index
+        db = self.converted()                               # is no index: the old one is converted over it
+        self.assertEqual(db.execute("SELECT count(*) FROM files").fetchone()[0], 6)
+        self.assertEqual(store.earlier_format(self.data), migrate.RETIRED)
+        db.close()
+        # A new index made on its own, beside an old one that nobody converted.
+        retire = sqlite3.connect(self.data / store.EARLIER)
+        retire.execute("PRAGMA user_version=1")
+        retire.commit()
+        retire.close()
+        (self.data / store.INDEX).unlink()
+        with patch("shelffind.store.earlier_format", return_value=0):
+            store.connect(self.data).close()
+        self.assertEqual(migrate.upgrade(self.data), self.data / store.INDEX)
+        self.assertEqual(store.earlier_format(self.data), 1)
+        with self.assertRaises(ValueError) as kept:
+            migrate.discard_old(self.data)
+        self.assertIn("was not converted", str(kept.exception))
+        self.assertTrue((self.data / store.EARLIER).exists())
+
+    def test_discarding_completes_a_conversion_cut_short_before_it_deletes(self):
+        with patch("shelffind.migrate.history.absorb", side_effect=KeyboardInterrupt), \
+                self.assertRaises(KeyboardInterrupt):
+            migrate.upgrade(self.data)
+        self.assertEqual(history.queries(self.data), [])
+        self.assertGreater(migrate.discard_old(self.data), 0)
+        self.assertEqual(history.queries(self.data), ["wind roses", "spring tide"])     # saved before the deletion
+        self.assertFalse((self.data / store.EARLIER).exists())
+
+    def test_text_that_the_earlier_version_read_apart_stays_apart(self):
+        # Two files of one name, size and date in two folders, whose pages differ: two documents.
+        self.file("North/almanac.txt", LARGE, "indexed", [(1, "An almanac of the northern lights", 0)])
+        self.file("South/almanac.txt", LARGE.replace("northern", "southern"), "indexed",
+                  [(1, "An almanac of the southern cross", 0)])
+        # Two copies waiting for their scanned pages, of which the second went further.
+        scans = [(1, "", 1), (2, "", 1)]
+        self.file("North/scan.txt", LARGE.replace("Tide", "Scan"), "needs-ocr", scans)
+        self.file("South/scan.txt", LARGE.replace("Tide", "Scan"), "needs-ocr", [(1, "A recognised first page", 0), (2, "", 1)])
+        self.old.commit()
+        db = self.converted()
+        self.assertEqual([hit["path"] for hit in search(db, "northern lights")], [str(self.root / "North/almanac.txt")])
+        self.assertEqual([hit["path"] for hit in search(db, "southern cross")], [str(self.root / "South/almanac.txt")])
+        found = search(db, "recognised first page")
+        self.assertEqual((len(found), len(found[0]["copies"])), (1, 1))
+        self.assertEqual(db.execute("SELECT count(*) FROM pages p JOIN files f ON f.doc=p.doc "
+                                    "WHERE f.rel='North/scan.txt' AND p.needs_ocr=1").fetchone()[0], 1)
+
+    def test_a_folder_with_a_dollar_sign_in_its_name_is_carried_over(self):
+        self.old.execute("UPDATE roots SET path=?", (str(self.home / "receipts$NOT_A_VARIABLE"),))
+        self.old.commit()
+        db = self.converted()
+        self.assertEqual(store.roots(db)[0]["path"], str(self.home / "receipts$NOT_A_VARIABLE"))
+        self.assertEqual(db.execute("SELECT path FROM roots").fetchone()[0], "~/receipts$NOT_A_VARIABLE")
+
+    def test_a_folder_that_does_not_exist_yet_has_nothing_to_convert(self):
+        self.assertIsNone(migrate.upgrade(self.home / "nowhere"))
+        self.assertFalse((self.home / "nowhere").exists())
+        self.assertEqual(run_main(self.home / "nowhere", "upgrade")[0], 0)
 
     def test_a_reading_by_the_earlier_version_is_waited_for_then_passed(self):
         import fcntl

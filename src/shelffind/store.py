@@ -4,6 +4,11 @@
 Text belongs to a document, and a document is recognised by its content, not by its address: the
 files of the folders point at documents, so a file that is moved, renamed or copied keeps its
 text. Addresses are stored from the home folder (`~/...`) and expanded when used.
+
+A file is given the text of a document only on evidence: the same size, date and format as a
+file already known (the inventory tells that much without reading anything), or the same
+content, proved by a fingerprint or a checksum. A mere likeness (the size of a document whose
+file is gone) is kept as a question, `files.maybe`, which a reading of the file answers.
 """
 import contextlib
 import fcntl
@@ -12,29 +17,31 @@ import os
 import re
 import sqlite3
 import stat
+import time
 import zlib
 from pathlib import Path
 
 from . import fuzzy
-from .config import expand, portable
 from .extract import SUPPORTED, file_format
 
 INDEX, EARLIER = "index2.sqlite3", "index.sqlite3"
 FORMAT = 2
 SMALL = 64 * 1024       # below this size a file is identified together with its address
+KEEP = 30 * 86400       # seconds a document keeps its text after its last file has gone
 
 SCHEMA = """
 CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
 CREATE TABLE roots (
-    id INTEGER PRIMARY KEY, name TEXT NOT NULL UNIQUE, path TEXT NOT NULL UNIQUE,
+    id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT NOT NULL UNIQUE, path TEXT NOT NULL UNIQUE,
     mount TEXT NOT NULL, scanned TEXT, problem TEXT
 );
 CREATE TABLE docs (
     id INTEGER PRIMARY KEY, size INTEGER NOT NULL, format TEXT NOT NULL, state TEXT NOT NULL,
-    error TEXT, title TEXT, byline TEXT, year TEXT
+    error TEXT, title TEXT, byline TEXT, year TEXT, gone INTEGER, gone_from INTEGER
 );
 CREATE INDEX docs_state ON docs(state, id);
 CREATE INDEX docs_size ON docs(size, format);
+CREATE INDEX docs_gone ON docs(gone) WHERE gone IS NOT NULL;
 CREATE TABLE doc_keys (
     key TEXT PRIMARY KEY, doc INTEGER NOT NULL REFERENCES docs ON DELETE CASCADE, basis TEXT NOT NULL
 );
@@ -42,9 +49,11 @@ CREATE INDEX doc_keys_doc ON doc_keys(doc);
 CREATE TABLE files (
     id INTEGER PRIMARY KEY, root INTEGER NOT NULL REFERENCES roots ON DELETE CASCADE,
     rel TEXT NOT NULL, name TEXT NOT NULL, folded TEXT NOT NULL, format TEXT NOT NULL, size INTEGER NOT NULL,
-    mtime INTEGER NOT NULL, doc INTEGER NOT NULL REFERENCES docs, UNIQUE(root, rel)
+    mtime INTEGER NOT NULL, doc INTEGER NOT NULL REFERENCES docs,
+    maybe INTEGER REFERENCES docs ON DELETE SET NULL, UNIQUE(root, rel)
 );
 CREATE INDEX files_doc ON files(doc);
+CREATE INDEX files_maybe ON files(maybe) WHERE maybe IS NOT NULL;
 CREATE VIRTUAL TABLE names USING fts5(name, folder, title, byline, tokenize='unicode61 remove_diacritics 2');
 CREATE TRIGGER files_ad AFTER DELETE ON files BEGIN
     DELETE FROM names WHERE rowid=old.id;
@@ -103,6 +112,23 @@ def inflate(blob):
         return ""
 
 
+def from_home(path):
+    """An address as the index keeps it: from the home folder when it lies there. Nothing else
+    is changed, so a name that holds a dollar sign or a tilde further on stays what it is."""
+    path, home = str(path), os.environ.get("HOME") or str(Path.home())
+    home = home.rstrip("/") or "/"
+    if home != "/" and (path == home or path.startswith(home + "/")):
+        return "~" + path[len(home):]
+    return path
+
+
+def to_home(stored):
+    """The address on this machine of what `from_home` stored."""
+    if stored == "~" or stored.startswith("~/"):
+        return (os.environ.get("HOME") or str(Path.home())).rstrip("/") + stored[1:]
+    return stored
+
+
 def open_index(filename):
     db = sqlite3.connect(filename, timeout=30)
     db.row_factory = sqlite3.Row
@@ -117,9 +143,10 @@ def open_index(filename):
 def connect(directory, upgrade=True):
     """Open the index of `directory`, creating it when there is none. An index of the earlier
     format is converted first when `upgrade` allows it; otherwise NeedsUpgrade is raised."""
+    directory = Path(directory).absolute()
     directory.mkdir(mode=0o700, parents=True, exist_ok=True)
     filename = directory / INDEX
-    if not filename.exists() and earlier_format(directory) == 1:
+    if (not filename.exists() or filename.stat().st_size == 0) and earlier_format(directory) == 1:
         if not upgrade:
             raise NeedsUpgrade("The index has the earlier format: run shelffind upgrade")
         from . import migrate
@@ -143,8 +170,10 @@ def connect(directory, upgrade=True):
 
 
 def earlier_format(directory):
-    """The format number of an index of the earlier kind in `directory`, 0 when there is none."""
-    filename = directory / EARLIER
+    """The format number of an index of the earlier kind in `directory`, 0 when there is none.
+    An index that is there and cannot be read is an error, never an absence: a new index made
+    beside it would hide what it holds."""
+    filename = Path(directory).absolute() / EARLIER
     if not filename.is_file():
         return 0
     try:
@@ -153,8 +182,8 @@ def earlier_format(directory):
             return old.execute("PRAGMA user_version").fetchone()[0]
         finally:
             old.close()
-    except sqlite3.Error:
-        return 0
+    except sqlite3.Error as fault:
+        raise ValueError(f"The earlier index cannot be read ({fault}): {filename}") from None
 
 
 @contextlib.contextmanager
@@ -176,8 +205,8 @@ def mount_point(path):
 
 def root_row(row):
     """A registered folder with its address expanded for this machine."""
-    return {"id": row["id"], "name": row["name"], "path": expand(row["path"]), "stored": row["path"],
-            "mount": expand(row["mount"]), "scanned": row["scanned"], "problem": row["problem"]}
+    return {"id": row["id"], "name": row["name"], "path": to_home(row["path"]), "stored": row["path"],
+            "mount": to_home(row["mount"]), "scanned": row["scanned"], "problem": row["problem"]}
 
 
 def free_name(db, wanted):
@@ -189,7 +218,7 @@ def free_name(db, wanted):
 
 
 def add_root(db, path, directory, name=None):
-    path = Path(expand(str(path))).resolve(strict=True)
+    path = Path(os.path.expanduser(str(path))).resolve(strict=True)
     if not path.is_dir() or path.is_relative_to(directory.resolve()):
         raise ValueError(f"Choose a document directory: {path}")
     for row in roots(db):
@@ -200,45 +229,60 @@ def add_root(db, path, directory, name=None):
             raise ValueError(f"Overlapping root already registered: {other}")
     with db:
         db.execute("INSERT INTO roots(name,path,mount) VALUES(?,?,?)",
-                   (free_name(db, name or path.name or "root"), portable(path), portable(mount_point(path))))
+                   (free_name(db, name or path.name or "root"), from_home(path), from_home(mount_point(path))))
     return str(path)
 
 
 def roots(db, selector=None):
+    """The registered folders, or the one that `selector` designates: by its name first, which
+    is unique, then by its address, then by the last part of its address when no other folder
+    ends alike."""
     rows = [root_row(row) for row in db.execute("SELECT * FROM roots ORDER BY id")]
     if selector is None:
         return rows
-    matches = [r for r in rows if selector in (r["path"], r["stored"], r["name"], Path(r["path"]).name)]
-    if len(matches) != 1:
-        folded = [r for r in rows if selector.lower() in (r["name"].lower(), Path(r["path"]).name.lower())]
-        if len(folded) != 1:
-            raise ValueError(f"Choose one registered root by its full path: {selector}")
-        matches = folded
-    return matches
+    for match in (lambda r: r["name"] == selector, lambda r: selector in (r["path"], r["stored"]),
+                  lambda r: Path(r["path"]).name == selector, lambda r: r["name"].lower() == selector.lower(),
+                  lambda r: Path(r["path"]).name.lower() == selector.lower()):
+        found = [r for r in rows if match(r)]
+        if len(found) == 1:
+            return found
+        if found:
+            break
+    raise ValueError(f"Choose one registered root by its name or its full path: {selector}")
 
 
 def remove_root(db, selector):
     """Forget one registered folder with its names, and the text of the documents that no other
-    folder holds. The documents themselves are not touched."""
+    folder holds, those it lost earlier included. The documents themselves are not touched."""
     try:
         root = roots(db, selector)[0]
     except ValueError:
         root = roots(db, str(Path(selector).expanduser().absolute()))[0]
     with db:
-        db.execute("CREATE TEMP TABLE leaving AS SELECT DISTINCT doc FROM files WHERE root=?", (root["id"],))
+        db.execute("CREATE TEMP TABLE leaving AS SELECT DISTINCT doc FROM files WHERE root=? "
+                   "UNION SELECT id FROM docs WHERE gone_from=?", (root["id"], root["id"]))
         db.execute("DELETE FROM files WHERE root=?", (root["id"],))
         db.execute("DELETE FROM roots WHERE id=?", (root["id"],))
-        alone = "doc IN (SELECT doc FROM leaving) AND NOT EXISTS (SELECT 1 FROM files f WHERE f.doc={})"
-        db.execute("DELETE FROM pages WHERE " + alone.format("pages.doc"))
+        db.execute("DELETE FROM pages WHERE doc IN (SELECT doc FROM leaving) AND NOT EXISTS "
+                   "(SELECT 1 FROM files f WHERE f.doc=pages.doc)")
         db.execute("DELETE FROM docs WHERE id IN (SELECT doc FROM leaving) AND NOT EXISTS "
                    "(SELECT 1 FROM files f WHERE f.doc=docs.id)")
         db.execute("DROP TABLE leaving")
+        if not db.execute("SELECT 1 FROM roots LIMIT 1").fetchone():
+            db.execute("DELETE FROM pages")         # no folder is left: nothing is kept for later
+            db.execute("DELETE FROM docs")
     return root["path"]
 
 
 def available(root):
     path = Path(root["path"])
     return path.is_dir() and mount_point(path) == root["mount"]
+
+
+def current(db, root):
+    """True when `root`, read earlier, is still the registered folder it was."""
+    row = db.execute("SELECT path FROM roots WHERE id=?", (root["id"],)).fetchone()
+    return row is not None and row["path"] == root["stored"]
 
 
 def terms_for_name(name):
@@ -270,13 +314,17 @@ def inventory(root, exclude):
     return entries
 
 
-def stamp_key(size, mtime, fmt, rel):
+def digest(text):
+    return hashlib.sha256(text.encode("utf-8", "surrogateescape")).hexdigest()[:16]
+
+
+def stamp_key(size, mtime, fmt, place, rel):
     """What the inventory alone tells of a file's content: its size, its date to the second and
-    its format. A small file is identified with its address as well, since many small files are
-    written in the same second."""
+    its format. A small file is identified with its folder and address as well, since many
+    small files are written in the same second."""
     key = f"stamp:{size}:{mtime // 1_000_000_000}:{fmt}"
     if size < SMALL:
-        key += ":" + hashlib.sha256(rel.encode("utf-8", "surrogateescape")).hexdigest()[:16]
+        key += ":" + digest(f"{place}/{rel}")
     return key
 
 
@@ -287,46 +335,84 @@ def new_document(db, key, size, fmt, basis="stamp"):
     return doc
 
 
-def document_for(db, rel, name, size, mtime, fmt):
-    """The document of a file that is new at this address, from the inventory alone.
+def document_for(db, place, rel, name, size, mtime, fmt, edited=False):
+    """The document of a file that is new at this address, or changed there, from the inventory
+    alone. Returns the document and, sometimes, another that the file might be.
 
-    A known stamp means a copy, or the same file under a new address. Under another name while
-    the first file is still there, the two are kept apart until their contents are compared. An
-    unknown stamp with the size of a document whose files are all gone is taken for that
-    document written anew, as a filing tool does when it copies a file and removes the original.
+    A known stamp under the same name means a copy; under another name while the first file is
+    still there, the two are kept apart until their contents are compared; a known stamp whose
+    file is gone means that file under a new address. A file `edited` in place without a change
+    of size or of second gets a document of its own, since nothing tells what it holds now. An
+    unknown stamp with the size of the one document whose files are all gone, such as a filing
+    tool leaves when it copies a file and removes the original, is given a document of its own
+    and the question whether it is that one.
     """
-    key = stamp_key(size, mtime, fmt, rel)
-    found = db.execute("SELECT doc FROM doc_keys WHERE key=?", (key,)).fetchone()
-    if found:
-        names = [row["name"] for row in db.execute("SELECT name FROM files WHERE doc=?", (found["doc"],))]
+    key = stamp_key(size, mtime, fmt, place, rel)
+    if edited:
+        key += f":changed:{mtime}:{digest(f'{place}/{rel}')}"
+        known = db.execute("SELECT doc FROM doc_keys WHERE key=?", (key,)).fetchone()
+        return (known["doc"] if known else new_document(db, key, size, fmt, "changed in place")), None
+    named = key + ":" + digest(name)
+    known = db.execute("SELECT doc FROM doc_keys WHERE key=?", (named,)).fetchone()
+    if known and size >= SMALL:
+        return known["doc"], None
+    known = db.execute("SELECT doc FROM doc_keys WHERE key=?", (key,)).fetchone()
+    if known:
+        names = [row["name"] for row in db.execute("SELECT name FROM files WHERE doc=?", (known["doc"],))]
         if not names or name in names or size < SMALL:
-            return found["doc"]
-        key += ":" + hashlib.sha256(name.encode("utf-8", "surrogateescape")).hexdigest()[:16]
-        again = db.execute("SELECT doc FROM doc_keys WHERE key=?", (key,)).fetchone()
-        return again["doc"] if again else new_document(db, key, size, fmt, "stamp and name")
+            return known["doc"], None
+        return new_document(db, named, size, fmt, "stamp and name"), None
+    doc = new_document(db, key, size, fmt)
     if size >= SMALL:
-        gone = db.execute("SELECT d.id FROM docs d WHERE d.size=? AND d.format=? AND NOT EXISTS "
-                          "(SELECT 1 FROM files f WHERE f.doc=d.id) LIMIT 2", (size, fmt)).fetchall()
+        # Only a document that was read can answer the question: its fingerprint is compared.
+        gone = db.execute("SELECT d.id FROM docs d WHERE d.size=? AND d.format=? AND d.gone IS NOT NULL AND EXISTS "
+                          "(SELECT 1 FROM doc_keys k WHERE k.doc=d.id AND k.key LIKE 'fp:%') LIMIT 2",
+                          (size, fmt)).fetchall()
         if len(gone) == 1:
-            db.execute("INSERT INTO doc_keys(key,doc,basis) VALUES(?,?,'size')", (key, gone[0]["id"]))
-            return gone[0]["id"]
-    return new_document(db, key, size, fmt)
+            return doc, gone[0]["id"]
+    return doc, None
+
+
+def describe(db, doc):
+    """Give the files of a document the title and the authors that the document carries, for
+    the search by name."""
+    told = db.execute("SELECT title,byline FROM docs WHERE id=?", (doc,)).fetchone()
+    if told is not None:
+        db.execute("UPDATE names SET title=?,byline=? WHERE rowid IN (SELECT id FROM files WHERE doc=?)",
+                   (told["title"] or "", told["byline"] or "", doc))
 
 
 def merge(db, one, other):
     """Two documents turned out to be the same: make them one and return it. The document that
-    was read is kept, and the files, the keys and the records of the other go to it. The caller
-    holds the transaction."""
+    was read is kept, and the files, the keys and the records of the other go to it. Documents
+    of two formats are not merged, since each is read by its own reader, nor documents of two
+    sizes, which cannot hold the same bytes: None is returned. The caller holds the
+    transaction."""
     if one == other:
         return one
     rank = {"indexed": 0, "needs-ocr": 1, "ocr-error": 2, "covered": 3, "error": 4, "pending": 5, "name-only": 6}
-    states = dict(db.execute("SELECT id,state FROM docs WHERE id IN (?,?)", (one, other)).fetchall())
-    keep, drop = sorted((one, other), key=lambda doc: (rank.get(states.get(doc), 9), doc))
+    told = {row["id"]: row for row in db.execute("SELECT * FROM docs WHERE id IN (?,?)", (one, other))}
+    if len(told) < 2:
+        return one if one in told else other if other in told else None
+    if (told[one]["format"], told[one]["size"]) != (told[other]["format"], told[other]["size"]):
+        return None
+    keep, drop = sorted((one, other), key=lambda doc: (rank.get(told[doc]["state"], 9), doc))
     db.execute("UPDATE files SET doc=? WHERE doc=?", (keep, drop))
+    db.execute("UPDATE files SET maybe=? WHERE maybe=?", (keep, drop))
+    db.execute("UPDATE files SET maybe=NULL WHERE maybe=doc")
     db.execute("UPDATE OR IGNORE doc_keys SET doc=? WHERE doc=?", (keep, drop))
+    # What a source said of the document is kept in preference to its not knowing it.
+    db.execute("DELETE FROM records WHERE doc=? AND ref='' AND EXISTS (SELECT 1 FROM records r "
+               "WHERE r.doc=? AND r.source=records.source AND r.ref!='')", (keep, drop))
     db.execute("UPDATE OR IGNORE records SET doc=? WHERE doc=?", (keep, drop))
+    if not told[keep]["title"] and told[drop]["title"]:
+        db.execute("UPDATE docs SET title=?,byline=?,year=? WHERE id=?",
+                   (told[drop]["title"], told[drop]["byline"], told[drop]["year"], keep))
+    db.execute("UPDATE docs SET gone=NULL,gone_from=NULL WHERE id=? AND EXISTS (SELECT 1 FROM files WHERE doc=?)",
+               (keep, keep))
     db.execute("DELETE FROM pages WHERE doc=?", (drop,))
     db.execute("DELETE FROM docs WHERE id=?", (drop,))
+    describe(db, keep)
     return keep
 
 
@@ -353,14 +439,19 @@ def at_hand(path, slow=None):
     return not any(str(path).startswith(place) for place in slow)
 
 
-def forget_orphans(db):
-    """Drop the small documents that no file points at any more: their identity includes their
-    address, so nothing can find them again. A larger document stays, with its text, for the
-    day its file is found again under another address."""
-    db.execute("DELETE FROM pages WHERE doc IN (SELECT id FROM docs WHERE size<? AND NOT EXISTS "
-               "(SELECT 1 FROM files f WHERE f.doc=docs.id))", (SMALL,))
-    db.execute("DELETE FROM docs WHERE size<? AND NOT EXISTS (SELECT 1 FROM files f WHERE f.doc=docs.id)",
-               (SMALL,))
+def tend_orphans(db, root=None, now=None, drop=True):
+    """Note the documents that have just lost their last file and, when `drop` allows, forget
+    those that have nothing worth keeping or have waited long enough. A document that was read
+    keeps its text for a month after its last file has gone, for the day that file is found
+    again elsewhere."""
+    now = int(time.time()) if now is None else now
+    db.execute("UPDATE docs SET gone=NULL,gone_from=NULL WHERE gone IS NOT NULL AND EXISTS "
+               "(SELECT 1 FROM files f WHERE f.doc=docs.id)")
+    db.execute("UPDATE docs SET gone=?,gone_from=? WHERE gone IS NULL AND NOT EXISTS "
+               "(SELECT 1 FROM files f WHERE f.doc=docs.id)", (now, root))
+    if drop:
+        unread = "NOT EXISTS (SELECT 1 FROM pages p WHERE p.doc=docs.id)"
+        db.execute(f"DELETE FROM docs WHERE gone IS NOT NULL AND ({unread} OR gone<?)", (now - KEEP,))
 
 
 def scan(db, root, directory):
@@ -377,23 +468,31 @@ def scan(db, root, directory):
         # The addresses that vanished go first: a file found again elsewhere then meets a
         # document without a file, and takes it back with its text.
         db.executemany("DELETE FROM files WHERE id=?", [(r["id"],) for r in existing.values()])
+        tend_orphans(db, root["id"], drop=False)
         for rel, size, mtime, old in fresh:
             path = Path(rel)
             fmt = file_format(path)
-            doc = document_for(db, rel, path.name, size, mtime, fmt)
+            # A change that keeps the size and the second leaves the stamp as it was: only a
+            # reading can tell what the file holds now.
+            edited = bool(old) and (size, mtime // 10**9, fmt) == (old["size"], old["mtime"] // 10**9, old["format"])
+            doc, maybe = document_for(db, root["name"], rel, path.name, size, mtime, fmt, edited)
             if old:
-                db.execute("UPDATE files SET size=?,mtime=?,doc=? WHERE id=?", (size, mtime, doc, old["id"]))
+                db.execute("UPDATE files SET size=?,mtime=?,format=?,doc=?,maybe=? WHERE id=?",
+                           (size, mtime, fmt, doc, maybe, old["id"]))
+                told = db.execute("SELECT title,byline FROM docs WHERE id=?", (doc,)).fetchone()
+                db.execute("UPDATE names SET title=?,byline=? WHERE rowid=?",
+                           (told["title"] or "", told["byline"] or "", old["id"]))
                 continue
-            cur = db.execute("INSERT INTO files(root,rel,name,folded,format,size,mtime,doc) "
-                             "VALUES(?,?,?,?,?,?,?,?)",
-                             (root["id"], rel, path.name, fuzzy.fold(path.name), fmt, size, mtime, doc))
+            cur = db.execute("INSERT INTO files(root,rel,name,folded,format,size,mtime,doc,maybe) "
+                             "VALUES(?,?,?,?,?,?,?,?,?)",
+                             (root["id"], rel, path.name, fuzzy.fold(path.name), fmt, size, mtime, doc, maybe))
             folder = str(Path(Path(root["path"]).name) / path.parent)
             described = db.execute("SELECT title,byline FROM docs WHERE id=?", (doc,)).fetchone()
             fuzzy.remember_names(db, (terms_for_name(path.name), terms_for_name(folder)), known)
             db.execute("INSERT INTO names(rowid,name,folder,title,byline) VALUES(?,?,?,?,?)",
                        (cur.lastrowid, terms_for_name(path.name), terms_for_name(folder),
                         described["title"] or "", described["byline"] or ""))
-        forget_orphans(db)
+        tend_orphans(db, root["id"])
         if not available(root):
             raise OSError(f"Root disconnected: {root['path']}")
         db.execute("UPDATE roots SET scanned=CURRENT_TIMESTAMP,problem=NULL WHERE id=?", (root["id"],))

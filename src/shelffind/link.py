@@ -15,34 +15,39 @@ from . import fuzzy, sources, store
 BATCH = 500             # files in one question
 AGAIN = 20 * 3600       # seconds after which the files a source did not know are asked about again
 WAITING = ("pending", "error", "needs-ocr", "ocr-error")
+# What a document whose text was left to a source becomes when that source is gone: what its
+# own pages say of it.
+RESTORED = ("CASE WHEN EXISTS (SELECT 1 FROM pages p WHERE p.doc=docs.id AND p.needs_ocr=1) THEN 'needs-ocr' "
+            "WHEN EXISTS (SELECT 1 FROM pages p WHERE p.doc=docs.id) THEN 'indexed' ELSE 'pending' END")
 
 
-def attach(db, doc, name, record, trusted, known):
-    """Keep what the source `name` says of the document `doc`, and return the document: another
-    one when a checksum shows that two documents of the index are the same."""
+def attach(db, file, name, record, trusted, known):
+    """Keep what the source `name` says of the document of the file `file`. A checksum that
+    another document of the same format carries already shows that the two are one."""
+    row = db.execute("SELECT doc FROM files WHERE id=?", (file,)).fetchone()
+    if row is None:
+        return
+    doc = row["doc"]
     for key in record.get("keys") or ():
         owner = db.execute("SELECT doc FROM doc_keys WHERE key=?", (key,)).fetchone()
         if owner is None:
             db.execute("INSERT INTO doc_keys(key,doc,basis) VALUES(?,?,'source')", (key, doc))
         elif owner["doc"] != doc:
-            doc = store.merge(db, owner["doc"], doc)        # the same content under two dates
+            doc = store.merge(db, owner["doc"], doc) or doc         # the same content under two dates
     title, byline = record.get("title") or "", record.get("byline") or ""
     year = "" if record.get("year") is None else str(record["year"])
-    local = record.get("path")
     db.execute("INSERT OR REPLACE INTO records(doc,source,ref,title,byline,year,flags,basis,text,local) "
                "VALUES(?,?,?,?,?,?,?,?,?,?)",
                (doc, name, record["id"], title, byline, year, json.dumps(record.get("flags") or []),
-                record.get("basis") or "", int(record.get("text") is True), local))
+                record.get("basis") or "", int(record.get("text") is True), record.get("path")))
     if title:
         db.execute("UPDATE docs SET title=?,byline=?,year=? WHERE id=?", (title, byline, year, doc))
-        db.execute("UPDATE names SET title=?,byline=? WHERE rowid IN (SELECT id FROM files WHERE doc=?)",
-                   (title, byline, doc))
+        store.describe(db, doc)
         fuzzy.remember_names(db, (title, byline), known)
     if trusted and record.get("text") is True:
         placeholders = ",".join("?" * len(WAITING))
         db.execute(f"UPDATE docs SET state='covered',error=NULL WHERE id=? AND state IN ({placeholders})",
                    (doc, *WAITING))
-    return doc
 
 
 def link(db, directory, selected, progress=lambda text: None, everything=False):
@@ -53,12 +58,12 @@ def link(db, directory, selected, progress=lambda text: None, everything=False):
     except (OSError, ValueError) as fault:
         progress(f"Source configuration: {fault}")
         return 0
-    # A document whose text was left to a source waits to be read again once that source is
-    # no longer registered or no longer relied upon. A source that merely fails to answer at
-    # this moment keeps its documents: a passing fault must not start a reading of thousands.
+    # A document whose text was left to a source is the reader's again once that source is no
+    # longer registered or no longer relied upon. A source that merely fails to answer at this
+    # moment keeps its documents: a passing fault must not start a reading of thousands.
     relied_upon = [name for name in programs if sources.policy(name)["text"] == "trust"]
     with db:
-        db.execute("UPDATE docs SET state='pending' WHERE state='covered' AND NOT EXISTS (SELECT 1 FROM records r "
+        db.execute(f"UPDATE docs SET state={RESTORED} WHERE state='covered' AND NOT EXISTS (SELECT 1 FROM records r "
                    f"WHERE r.doc=docs.id AND r.text=1 AND r.source IN ({','.join('?' * len(relied_upon))}))",
                    relied_upon)
     usable = {}
@@ -80,8 +85,9 @@ def link(db, directory, selected, progress=lambda text: None, everything=False):
                 db.execute("DELETE FROM records WHERE source=? AND ref=''", (name,))
                 db.execute("INSERT OR REPLACE INTO meta(key,value) VALUES(?,?)", (f"asked:{name}", str(time.time())))
         for root in selected:
+            # A file whose document is still in question is left for the day it is settled.
             waiting = db.execute(
-                "SELECT f.doc,f.rel,f.size,f.mtime FROM files f WHERE f.root=? AND NOT EXISTS "
+                "SELECT f.id,f.doc,f.rel,f.size,f.mtime FROM files f WHERE f.root=? AND f.maybe IS NULL AND NOT EXISTS "
                 "(SELECT 1 FROM records r WHERE r.doc=f.doc AND r.source=?) ORDER BY f.id", (root["id"], name)).fetchall()
             for start in range(0, len(waiting), BATCH):
                 batch = waiting[start:start + BATCH]
@@ -102,11 +108,11 @@ def link(db, directory, selected, progress=lambda text: None, everything=False):
                     for record in answer["records"]:
                         if 0 <= record["n"] < len(batch) and record["n"] not in answered:
                             answered.add(record["n"])
-                            attach(db, batch[record["n"]]["doc"], name, record, relied, known)
+                            attach(db, batch[record["n"]]["id"], name, record, relied, known)
                     # The files the source does not know are remembered as asked.
-                    db.executemany("INSERT OR IGNORE INTO records(doc,source,ref,text) SELECT id,?,'',0 "
-                                   "FROM docs WHERE id=?",
-                                   [(name, row["doc"]) for number, row in enumerate(batch) if number not in answered])
+                    db.executemany("INSERT OR IGNORE INTO records(doc,source,ref,text) "
+                                   "SELECT doc,?,'',0 FROM files WHERE id=?",
+                                   [(name, row["id"]) for number, row in enumerate(batch) if number not in answered])
                 recognised += len(answered)
         if recognised:
             progress(f"{name}: {recognised:,} files recognised")

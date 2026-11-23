@@ -1,7 +1,6 @@
 # Copyright 2026 Eudaemonic Enterprises Inc.
 """Command-line interface to ShelfFind."""
 import argparse
-import curses
 import os
 import shutil
 import sqlite3
@@ -12,7 +11,7 @@ from contextlib import closing
 from pathlib import Path
 
 from . import __version__, config, desktop, doctor, helptext, indexer, migrate, shell, sources, store
-from .picker import panel, picker
+from .picker import panel
 from .text import json_text, safe
 from .tui import report, style
 
@@ -176,12 +175,6 @@ def find(args, db, directory, settings):
         opts = {"root": args.root, "fmt": args.fmt, "exact": args.exact, "source": args.source,
                 "limit": args.limit or settings["search.limit"],
                 "where": args.where or settings["search.scope"]}
-        if not picking and os.environ.get("SHELFFIND_UI") == "curses":
-            try:
-                curses.wrapper(picker, db, directory, query, opts)
-            except KeyboardInterrupt:
-                return 130
-            return 0
         if picking:
             code, text, _ = panel(db, directory, query, opts, settings, enter=args.enter,
                                   quote=args.quote, widget=args.widget)
@@ -408,7 +401,7 @@ def main(argv=None):
     except KeyboardInterrupt:
         print("Interrupted. Completed documents and OCR pages have been saved.", file=sys.stderr)
         return 130
-    except (OSError, ValueError, sqlite3.Error, subprocess.SubprocessError, curses.error,
+    except (OSError, ValueError, sqlite3.Error, subprocess.SubprocessError,
             termios.error) as exc:
         print(f"shelffind: {safe(exc)}", file=sys.stderr)
         return 1

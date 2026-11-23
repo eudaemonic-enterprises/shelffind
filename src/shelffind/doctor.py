@@ -59,7 +59,14 @@ def checks(directory, explicit):
         yield "fail", "settings", str(error), "correct the settings file"
 
     index = directory / store.INDEX
-    if not index.is_file() and store.earlier_format(directory) == 1:
+    try:
+        earlier = store.earlier_format(directory)
+    except ValueError as fault:
+        earlier = None
+        yield "fail", "earlier index", str(fault), "make the file readable; nothing is converted or replaced meanwhile"
+    if earlier is None:
+        pass
+    elif not index.is_file() and earlier == 1:
         yield "warn", "index", f"{directory / store.EARLIER} has the earlier format", \
             "run `shelffind upgrade`; the earlier index is kept beside the new one"
     elif not index.is_file():
@@ -85,7 +92,10 @@ def checks(directory, explicit):
                             "mount it; its last inventory stays searchable"
             finally:
                 db.close()
-            if store.earlier_format(directory):
+            if earlier == 1:
+                yield "warn", "earlier index", f"{directory / store.EARLIER} was not converted into the index in use", \
+                    "`shelffind upgrade` completes a conversion that was cut short; otherwise move that file away"
+            elif earlier:
                 yield "note", "earlier index", f"{directory / store.EARLIER} is kept", \
                     "`shelffind upgrade --discard-old` deletes it once the new index has served you well"
         except sqlite3.Error as error:

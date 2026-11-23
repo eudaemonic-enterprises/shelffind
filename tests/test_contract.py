@@ -70,8 +70,7 @@ class Contract(Shelf):
 
         errors = io.StringIO()
         with patch.object(sys, "stdin", Terminal()), patch.object(sys, "stdout", Terminal()), \
-                patch.object(sys, "stderr", errors), patch.dict("os.environ", {"SHELFFIND_UI": "curses"}), \
-                patch("shelffind.cli.curses.wrapper", side_effect=KeyboardInterrupt):
+                patch.object(sys, "stderr", errors), patch("shelffind.cli.panel", return_value=(130, "", "")):
             code = main(["--data-dir", str(self.data), "search", "orchard"])
         self.assertEqual((code, errors.getvalue()), (130, ""))
 

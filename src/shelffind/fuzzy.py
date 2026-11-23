@@ -45,19 +45,21 @@ def size(word):
     return f"len{min(len(word), 49)}"
 
 
-def remember(db, found, tier):
+def remember(db, found, tier, count=True):
     """Enter words among the known ones, then into the spelling indexes those that have become
     eligible: the words of names, the words that two documents contain, and every word while the
     collection is small enough for the misprints of scans not to matter. The cost follows the
-    number of words given, never the number of words known."""
+    number of words given, never the number of words known. The number of documents kept with
+    a word counts readings: it only orders the suggestions, and is not lowered when a document
+    leaves the index."""
     if not found:
         return
     db.execute("CREATE TEMP TABLE IF NOT EXISTS arriving(term TEXT PRIMARY KEY) WITHOUT ROWID")
     db.execute("DELETE FROM arriving")
     db.executemany("INSERT INTO arriving VALUES(?)", ((word,) for word in sorted(found)))
-    change = "tier=0" if tier == 0 else "df=df+1"
+    change = "DO UPDATE SET tier=0" if tier == 0 else "DO UPDATE SET df=df+1" if count else "DO NOTHING"
     db.execute("INSERT INTO words(term,tier,df) SELECT term,?,1 FROM arriving WHERE true "
-               f"ON CONFLICT(term) DO UPDATE SET {change}", (tier,))
+               f"ON CONFLICT(term) {change}", (tier,))
     mine = "term IN (SELECT term FROM arriving)"
     ready = f"listed=0 AND {mine}"
     if (db.execute("SELECT max(id) FROM words").fetchone()[0] or 0) >= SMALL_VOCABULARY:
@@ -97,13 +99,23 @@ def remember_names(db, texts, known):
     known.update(pending)
 
 
-def remember_text(db, texts):
-    """Count one more document for each distinct word of a text. Only words made of letters,
-    of 3 to 24 of them, are counted."""
+def text_words(texts):
+    """The words of a text that may serve as spellings: made of letters, of 3 to 24 of them."""
     seen = set()
     for text in texts:
         seen.update(w for w in words(text) if 3 <= len(w) <= 24 and w.isalpha())
-    remember(db, seen, 1)
+    return seen
+
+
+def remember_text(db, texts):
+    """Count one more document for each distinct word of a document's text."""
+    remember(db, text_words(texts), 1)
+
+
+def remember_more(db, texts):
+    """Keep the words of text added to a document already counted, such as a page recognised
+    later: the new words become known, and no word is counted twice for one document."""
+    remember(db, text_words(texts), 1, count=False)
 
 
 def distance(a, b, bound):

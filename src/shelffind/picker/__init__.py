@@ -16,12 +16,11 @@ from ..text import safe
 from ..tui import style
 from ..tui.app import App, Terminal
 from ..tui.keys import Key
-from .legacy import picker                      # the earlier full-screen screen, kept as a fallback
 from .model import Model, update
 from .view import Look, frame
 from .worker import Reply, Searches
 
-__all__ = ["panel", "picker"]
+__all__ = ["panel"]
 
 
 @dataclass(frozen=True)
