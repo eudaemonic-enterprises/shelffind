@@ -149,6 +149,8 @@ def joined(db, file, measured, local=True):
         db.execute("UPDATE files SET asked='' WHERE id=?", (file,))
         store.unback(db, doc)
         store.retitle(db, doc)
+        store.release(db, doc)
+        doc = db.execute("SELECT doc FROM files WHERE id=?", (file,)).fetchone()["doc"]
     read = store.has_pages(db, doc)
     alone = db.execute("SELECT count(*) FROM files WHERE doc=?", (doc,)).fetchone()[0] == 1
     measured_there = {found["key"].split("@")[0] for found in
@@ -439,7 +441,7 @@ def build(db, directory, selected, *, names_only=False, ocr=False, languages="en
                 break
             if on_document:
                 on_document(seen, total, copies[0][1]["rel"])
-            fault, tried = None, False
+            fault, tried = None, 0
             for root, row in copies:
                 if root["id"] in offline:
                     continue
@@ -449,8 +451,7 @@ def build(db, directory, selected, *, names_only=False, ocr=False, languages="en
                     failures += 1
                     continue
                 try:
-                    fault, tried = None, update_text(db, root, row, ocr, languages)
-                    break
+                    tried += update_text(db, root, row, ocr, languages)
                 except sqlite3.Error:
                     raise
                 except AnotherDocument:
@@ -464,17 +465,26 @@ def build(db, directory, selected, *, names_only=False, ocr=False, languages="en
                     if str(exc) == CHANGED:     # another file stands in its place: nothing known of it holds
                         with db:
                             forget(db, row["id"])
-                    fault, tried = fault or (row["rel"], exc), True
+                    fault = fault or (row["rel"], exc)
+                    continue
+                # Done with this document when it was read, or needs no reading any more. A file
+                # that turned out to be another document was read as that one: the next file of
+                # this document is then tried.
+                state = db.execute("SELECT state FROM docs WHERE id=?", (doc,)).fetchone()
+                if state is None or state["state"] not in states:
+                    fault = None
+                    break
             if fault:
                 with db:
                     db.execute("UPDATE docs SET state=?,error=? WHERE id=?",
                                ("ocr-error" if ocr else "error", str(fault[1])[:1200], doc))
                 progress(f"Could not read {fault[0]}: {fault[1]}")
                 failures += 1
+                tried += 1
             if tried:
-                done += 1
-                if done % 100 == 0:
-                    progress(f"{done:,} documents processed")
+                done += tried
+                if done // 100 > (done - tried) // 100:
+                    progress(f"{done // 100 * 100:,} documents processed")
         if done:
             # What was just read may be what other files hold, and its checksum is asked where
             # a storage tells it: neither needs a reading.

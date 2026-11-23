@@ -44,6 +44,7 @@ def withdraw(db, file, name):
         db.execute("DELETE FROM records WHERE file=? AND source=?", (file, name))
         store.unback(db, said["doc"])
         store.retitle(db, said["doc"])
+        store.release(db, said["doc"])          # a file that only this word had brought there leaves
 
 
 def attach(db, file, name, record, known):

@@ -427,13 +427,49 @@ class Words(Evidence):
         key = "sha256:" + "aa" * 32
         self.assertTrue(self.say("a/book.txt", "W1", key, title="AlphaAtlas"))
         self.assertTrue(self.say("b/book.txt", "W1", key, title="AlphaAtlas"))
-        self.assertTrue(self.say("b/book.txt", "W2", None, title="BravoAtlas", byline="Someone Else"))   # of the second only
         self.assertEqual(self.documents(), 1)
-        self.assertEqual(self.build(), (1, 0))              # read through the first; then both are measured
-        self.assertEqual(self.build(), (1, 0))              # and the second, which is another document, is read
+        self.assertEqual(len(search(self.db, "alphaatlas")[0]["copies"]), 1)
+        # The source then says of the second file alone that it is another work, without a
+        # checksum: the word that had brought the file is replaced, and the file leaves.
+        self.assertTrue(self.say("b/book.txt", "W2", None, title="BravoAtlas", byline="Someone Else"))
+        self.assertEqual(self.documents(), 2)
+        self.assertEqual((names(self.db, "alphaatlas"), names(self.db, "bravoatlas")), (["a/book.txt"], ["b/book.txt"]))
+        self.assertEqual(self.build(), (2, 0))
         self.assertEqual((names(self.db, "northern harbours"), names(self.db, "southern capes")),
                          (["a/book.txt"], ["b/book.txt"]))
+        self.assertEqual(names(self.db, "bravoatlas"), ["b/book.txt"])      # its title stays with it
         self.assertEqual(self.db.execute("SELECT count(*) FROM records WHERE ref='W1'").fetchone()[0], 0)
+
+    def test_what_another_source_said_of_a_file_goes_with_it_when_it_leaves(self):
+        self.write("a/book.txt")
+        self.write("b/book.txt", OTHER)
+        self.build(names_only=True)
+        key = "sha256:" + "aa" * 32
+        self.assertTrue(self.say("a/book.txt", "W1", key))
+        self.assertTrue(self.say("b/book.txt", "W1", key))  # one source takes the second for the first,
+        with self.db:                                       # another names it, without a checksum
+            link.attach(self.db, self.ids()["b/book.txt"], "catalogue", {"id": "C7", "title": "BravoCard"}, set())
+        self.assertEqual(self.documents(), 1)
+        self.assertEqual(self.build(), (2, 0))              # measured, the two part, and each is read in this run
+        self.assertEqual((names(self.db, "northern harbours"), names(self.db, "southern capes")),
+                         (["a/book.txt"], ["b/book.txt"]))
+        self.assertEqual(names(self.db, "bravocard"), ["b/book.txt"])
+        self.assertEqual([row["ref"] for row in self.db.execute("SELECT ref FROM records")], ["C7"])
+
+    def test_a_file_brought_by_a_word_leaves_when_the_word_is_withdrawn(self):
+        one = self.write("a/book.txt")
+        self.write("b/book.txt", OTHER)
+        self.build(names_only=True)
+        key = self.sha(one)
+        self.assertTrue(self.say("a/book.txt", "W1", key))
+        self.assertTrue(self.say("b/book.txt", "W1", key))  # the source takes the second for the first
+        self.assertEqual(self.documents(), 1)
+        with self.db:
+            link.withdraw(self.db, self.ids()["b/book.txt"], "library")     # asked again, it says so no more
+        self.assertEqual(self.documents(), 2)
+        self.assertEqual(self.build(), (2, 0))
+        self.assertEqual((names(self.db, "northern harbours"), names(self.db, "southern capes")),
+                         (["a/book.txt"], ["b/book.txt"]))
 
     def test_a_checksum_given_on_a_word_goes_when_the_word_is_withdrawn(self):
         self.write("a/alpha.txt")

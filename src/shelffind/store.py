@@ -477,8 +477,9 @@ def set_apart(db, file):
     it. What was measured of the file stays with it, and what the sources said of that very
     file goes with it; the document it leaves keeps its text and what was said of its other
     files. A checksum that was said of this file alone goes with it too; one that the document
-    it leaves still holds for its other files stays there, and never draws the file back.
-    Returns the new document, or None when the file is not there."""
+    it leaves still holds for its other files stays there, and never draws the file back; one
+    that a third document holds lets the file join that document, as the word of a source may.
+    Returns the document of the file afterwards, or None when the file is not there."""
     row = db.execute("SELECT root,size,format,doc FROM files WHERE id=?", (file,)).fetchone()
     if row is None:
         return None
@@ -489,10 +490,29 @@ def set_apart(db, file):
     unback(db, row["doc"])
     retitle(db, row["doc"])
     for key in said:
-        db.execute("INSERT OR IGNORE INTO doc_keys(key,doc,basis) VALUES(?,?,'source')", (f"{key}@{row['format']}", apart))
+        owner = db.execute("SELECT doc FROM doc_keys WHERE key=?", (f"{key}@{row['format']}",)).fetchone()
+        if owner is None or owner["doc"] != row["doc"]:
+            apart = claim(db, apart, key, "source")
     retitle(db, apart)
     tend_orphans(db, row["root"], drop=False)
     return apart
+
+
+def release(db, doc):
+    """Set apart the files of a document that nothing ties to it any more. A file belongs to a
+    document because the document was read from it, because a checksum measured of the file is
+    one the document carries, or because a source says of the file a checksum that the
+    document carries. When the word that had brought a file is withdrawn or refuted, the file
+    is a document of its own again."""
+    files = db.execute("SELECT id,read,sum FROM files WHERE doc=?", (doc,)).fetchall()
+    if len(files) < 2:
+        return
+    carried = {key.split("@")[0] for key in keys_of(db, doc)}
+    for row in files:
+        said = {key for record in db.execute("SELECT keys FROM records WHERE file=?", (row["id"],))
+                for key in record["keys"].split()}
+        if not row["read"] and not carried & (said | set((row["sum"] or "").split())):
+            set_apart(db, row["id"])
 
 
 def part(db, doc, file, keys):
@@ -511,6 +531,7 @@ def part(db, doc, file, keys):
             db.execute("DELETE FROM doc_keys WHERE key=? AND doc=?", (key, doc))
     unback(db, doc)
     retitle(db, doc)
+    release(db, doc)
 
 
 def part_strangers(db, doc):
