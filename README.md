@@ -14,7 +14,7 @@ shelffind index
 shelffind
 ```
 
-The first pass lists every regular file. The second reads supported documents one at a time. To start with filenames, use `shelffind index --names-only`. Run `shelffind index` again after adding or moving files. Press Ctrl-C to interrupt a build. A later run continues with pending and changed files. A disconnected registered mount retains its last complete inventory. Folder symlinks and overlapping roots are excluded from traversal.
+The first pass lists every regular file. The second reads supported documents one at a time. To start with filenames, use `shelffind index --names-only`. Run `shelffind index` again after adding or moving files. `shelffind roots remove FOLDER` forgets a folder and what was indexed from it, and leaves the documents where they are. Press Ctrl-C to interrupt a build. A later run continues with pending and changed files. A disconnected registered mount retains its last complete inventory. Folder symlinks and overlapping roots are excluded from traversal.
 
 ```sh
 shelffind search --list orchadr
@@ -27,7 +27,7 @@ shelffind index --retry
 shelffind index --ocr --lang eng
 ```
 
-Fuzzy matching is built in. It handles prefixes, abbreviations, omitted letters, and adjacent transpositions. Exact name and path matches appear first. Passage results include a snippet and the file page when available. Enclose a phrase in double quotes for an exact phrase. Use `--exact` for whole words without spelling expansion. In the picker, F4 changes folder, F5 changes format, F6 changes source, and Ctrl-P recalls a previous successful search. Piped output is plain text. `--json` adds machine-readable fields.
+Fuzzy matching is built in. It handles prefixes, abbreviations, omitted letters, and adjacent transpositions. Exact name and path matches appear first. Passage results include a snippet and the file page when available. Enclose a phrase in double quotes for an exact phrase. Use `--exact` for whole words without spelling expansion. In the picker, F4 changes folder, F5 changes format, F6 changes source, and Ctrl-P recalls a previous successful search. Piped output is plain text. `--json` adds machine-readable fields. Names and passages are untrusted text: control characters are removed from what a terminal shows and escaped in JSON.
 
 ## Reading and opening files
 

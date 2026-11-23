@@ -2,7 +2,6 @@
 """Command-line interface to ShelfFind."""
 import argparse
 import curses
-import json
 import sqlite3
 import subprocess
 import sys
@@ -11,6 +10,7 @@ from pathlib import Path
 
 from . import __version__, desktop, indexer, sources, store
 from .picker import picker
+from .text import json_text, safe
 
 
 def parser():
@@ -20,6 +20,7 @@ def parser():
     cmds = p.add_subparsers(dest="command")
     rs = cmds.add_parser("roots", help="Choose document folders").add_subparsers(dest="action", required=True)
     rs.add_parser("add").add_argument("folders", nargs="+", type=Path)
+    rs.add_parser("remove", help="Forget a folder and everything indexed from it").add_argument("folder")
     rs.add_parser("list")
     external = cmds.add_parser("sources", help="Configure optional search providers").add_subparsers(dest="action", required=True)
     provider = external.add_parser("add", help="Register a trusted local executable")
@@ -59,6 +60,21 @@ def parser():
     return p
 
 
+def listing(hits, terminal):
+    """Lines of `search --list`. Text taken from names and documents is cleaned before it is
+    shown; a piped file path stays exact, so that another program can use it."""
+    for hit in hits:
+        if hit["source"] == "files":
+            yield safe(hit["path"]) if terminal else hit["path"]
+        else:
+            yield safe(f"[{hit['source']}] {hit['name']}  ({hit['availability'] or hit['match']})")
+            if hit.get("byline"):
+                yield "  " + safe(hit["byline"])
+        if hit["snippet"]:
+            location = f"p. {hit['page']}  " if hit["page"] else ""
+            yield "  " + location + safe(hit["snippet"])
+
+
 def coverage(db, errors):
     result = []
     for root in store.roots(db):
@@ -79,6 +95,9 @@ def execute(args, db, directory):
             with store.index_lock(directory):
                 for path in args.folders:
                     print(store.add_root(db, path, directory))
+        elif args.action == "remove":
+            with store.index_lock(directory):
+                print(store.remove_root(db, args.folder))
         else:
             for root in store.roots(db):
                 print(root["path"])
@@ -101,26 +120,29 @@ def execute(args, db, directory):
                 raise ValueError(f"File outside the selected roots: {path}")
         count, failures = indexer.build(db, directory, roots, names_only=args.names_only, ocr=args.ocr,
                                         languages=args.lang, retry=args.retry, limit=args.limit,
-                                        paths=files, progress=lambda s: print(s, file=sys.stderr, flush=True))
+                                        paths=files, progress=lambda s: print(safe(s), file=sys.stderr, flush=True))
         print(f"{count:,} documents processed, {failures:,} problems", file=sys.stderr)
         return int(bool(failures))
     elif args.command == "status":
         rows = coverage(db, args.errors)
         if args.json:
-            print(json.dumps(rows, ensure_ascii=False, indent=2))
+            print(json_text(rows))
             return 0
         for row in rows:
             states = ", ".join(f"{n:,} {k}" for k, n in row["states"].items())
-            print(f"{row['path']}   {row['files']:,} files   {states}")
+            print(safe(f"{row['path']}   {row['files']:,} files   {states}"))
             if not row["available"] or row["problem"]:
-                print("  " + (row["problem"] or "Folder unavailable"))
+                print("  " + safe(row["problem"] or "Folder unavailable"))
             for e in row.get("errors", []):
-                print(f"  {e['rel']}: {e['error']}")
+                print("  " + safe(f"{e['rel']}: {e['error']}"))
     elif args.command == "search":
         opts = {"root": args.root, "fmt": args.fmt, "exact": args.exact, "limit": args.limit, "source": args.source, "where": args.where}
         query = " ".join(args.query)
         if not args.json and not args.list and sys.stdin.isatty() and sys.stdout.isatty():
-            curses.wrapper(picker, db, directory, query, opts)
+            try:
+                curses.wrapper(picker, db, directory, query, opts)
+            except KeyboardInterrupt:
+                return 130
         else:
             hits, problem = [], ""
             def collect(rows, message):
@@ -128,20 +150,12 @@ def execute(args, db, directory):
                 hits, problem = rows, message
             sources.find(db, directory, query, opts, collect)
             if problem:
-                print(problem, file=sys.stderr)
+                print(safe(problem), file=sys.stderr)
             if args.json:
-                print(json.dumps(hits, ensure_ascii=False, indent=2))
+                print(json_text(hits))
             else:
-                for hit in hits:
-                    if hit["source"] == "files":
-                        print(hit["path"])
-                    else:
-                        print(f"[{hit['source']}] {hit['name']}  ({hit['availability'] or hit['match']})")
-                        if hit.get("byline"):
-                            print("  " + hit["byline"])
-                    if hit["snippet"]:
-                        location = f"p. {hit['page']}  " if hit["page"] else ""
-                        print("  " + location + hit["snippet"])
+                for line in listing(hits, sys.stdout.isatty()):
+                    print(line)
             return int(bool(problem) and not hits)
     return 0
 
@@ -173,7 +187,7 @@ def main(argv=None):
         print("Interrupted. Completed documents and OCR pages have been saved.", file=sys.stderr)
         return 130
     except (OSError, ValueError, sqlite3.Error, subprocess.SubprocessError, curses.error) as exc:
-        print(f"shelffind: {exc}", file=sys.stderr)
+        print(f"shelffind: {safe(exc)}", file=sys.stderr)
         return 1
 
 

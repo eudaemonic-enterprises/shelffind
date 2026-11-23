@@ -90,6 +90,7 @@ def picker(screen, db, directory, query, options):
     screen.keypad(True)
     screen.timeout(60)
     try:
+        curses.set_escdelay(25)  # The default waits a full second before Esc acts.
         curses.curs_set(0)
     except curses.error:
         pass

@@ -6,32 +6,18 @@ import os
 import shutil
 import subprocess
 import sys
-import tempfile
 import unittest
-from pathlib import Path
 from unittest.mock import patch
 from zipfile import ZipFile
 
-from shelffind import desktop, indexer, sources, store
+from shelffind import desktop, sources
 from shelffind.cli import main
 from shelffind.search import search
 
+from support import Shelf
 
-class Collection(unittest.TestCase):
-    def setUp(self):
-        tmp = tempfile.TemporaryDirectory()
-        self.addCleanup(tmp.cleanup)
-        self.base = Path(tmp.name)
-        self.root = self.base / "Reading Room"
-        self.root.mkdir()
-        self.data = self.base / "state"
-        self.db = store.connect(self.data)
-        self.addCleanup(self.db.close)
-        store.add_root(self.db, self.root, self.data)
 
-    def build(self, **opts):
-        return indexer.build(self.db, self.data, store.roots(self.db), progress=lambda _:None, **opts)
-
+class Collection(Shelf):
     def test_fuzzy_filename_content_and_filters(self):
         path = self.root / "OrchardCalendar.txt"
         path.write_text("A telescope reveals the ultraviolet horizon.")

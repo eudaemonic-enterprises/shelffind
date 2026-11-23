@@ -120,6 +120,20 @@ def roots(db, selector=None):
     return matches
 
 
+def remove_root(db, selector):
+    """Forget one registered folder with its names and text. The documents are not touched."""
+    try:
+        root = roots(db, selector)[0]
+    except ValueError:
+        root = roots(db, str(Path(selector).expanduser().absolute()))[0]
+    with db:
+        # Pages go first and in one statement, so that their search entries follow them.
+        db.execute("DELETE FROM pages WHERE file IN (SELECT id FROM files WHERE root=?)", (root["id"],))
+        db.execute("DELETE FROM files WHERE root=?", (root["id"],))
+        db.execute("DELETE FROM roots WHERE id=?", (root["id"],))
+    return root["path"]
+
+
 def available(root):
     path = Path(root["path"])
     return path.is_dir() and mount_point(path) == root["mount"]
