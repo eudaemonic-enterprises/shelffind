@@ -195,9 +195,8 @@ def waiting(db, root, only=None, reading=False, thorough=False):
     those of which a source gave a checksum, which is then proved or refuted. For a reading in
     full (`reading`), which costs one: the files whose pages were read by an earlier version
     and never tied to bytes, which only a reading does; and, in a folder without storage, the
-    files of the size and format of a document known by a checksum and, with `thorough`, those
-    of which a source gave a checksum. In a folder with a storage these wait for the storage
-    to answer."""
+    files of the size and format of a document known by a checksum, and those of which a source
+    gave a checksum. In a folder with a storage these wait for the storage to answer."""
     lacking = "coalesce(f.sum,'')=''" if reading else "instr(coalesce(f.sum,''),'md5:')=0"
     rows = db.execute(f"SELECT {FILE},f.doc,f.read AND d.origin IS NULL AS untied,"
                       "EXISTS (SELECT 1 FROM records r WHERE r.file=f.id AND r.keys!='') AS said "
@@ -211,7 +210,7 @@ def waiting(db, root, only=None, reading=False, thorough=False):
         alike = {}                                  # size and format -> the documents known by a checksum
         for doc in db.execute("SELECT d.id,d.size,d.format FROM docs d WHERE EXISTS (SELECT 1 FROM doc_keys k WHERE k.doc=d.id)"):
             alike.setdefault((doc["size"], doc["format"]), set()).add(doc["id"])
-        return [row for row in rows if row["untied"] or (thorough and row["said"])
+        return [row for row in rows if row["untied"] or row["said"]
                 or alike.get((row["size"], row["format"]), set()) - {row["doc"]}]
     several = {(doc["size"], doc["format"]) for doc in
                db.execute("SELECT size,format FROM docs GROUP BY size,format HAVING count(*)>1")}
@@ -300,8 +299,7 @@ def settle(db, roots, chosen, progress, reads=True, failed=None, asked=None, tho
             if stopped:
                 silent.add(root["id"])
         for root in roots if reads else ():
-            rows = waiting(db, root, chosen[root["id"]], reading=True, thorough=thorough)
-            found, missed = read_in_full(db, root, rows, progress, failed)
+            found, missed = read_in_full(db, root, waiting(db, root, chosen[root["id"]], reading=True), progress, failed)
             learnt += found
             failures += missed
         if not learnt:
