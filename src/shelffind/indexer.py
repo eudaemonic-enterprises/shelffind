@@ -397,8 +397,9 @@ def build(db, directory, selected, *, names_only=False, ocr=False, languages="en
         if retry:
             states.append("ocr-error" if ocr else "error")
         failing = "ocr-error" if ocr else "error"
-        waits = lambda doc: db.execute(f"SELECT 1 FROM docs WHERE id=? AND state IN ({','.join('?' * len(states))})",
-                                       (doc, *states)).fetchone() is not None
+        waiting_of = lambda file: db.execute(
+            f"SELECT d.id FROM files f JOIN docs d ON d.id=f.doc WHERE f.id=? AND d.state IN ({','.join('?' * len(states))})",
+            (file, *states)).fetchone()
         # One document may be read through any of its files: the others are tried when one
         # fails, or turns out to hold something else.
         candidates = {}
@@ -421,11 +422,13 @@ def build(db, directory, selected, *, names_only=False, ocr=False, languages="en
                 break
             if on_document:
                 on_document(seen, total, copies[0][1]["rel"])
-            fault, before = None, done
+            untaken, replaced, before = {}, None, done
             for root, row in copies:
-                if (limit is not None and done >= limit) or not waits(doc):
-                    break                       # read through a copy meanwhile, or no reading is left to this run
-                if root["id"] in offline:
+                if limit is not None and done >= limit:
+                    break
+                # The file is followed to the document it is in now: a comparison may have
+                # placed it elsewhere, and its document may have been read through another file.
+                if root["id"] in offline or waiting_of(row["id"]) is None:
                     continue
                 if not store.available(root):       # the other folders go on being read
                     progress(f"Disconnected: {root['path']}; saved completed work")
@@ -445,10 +448,12 @@ def build(db, directory, selected, *, names_only=False, ocr=False, languages="en
                     if isinstance(exc, Unreadable):
                         # Nothing was learnt of what the file holds: another file of the
                         # document may be read in its place.
-                        if str(exc) == CHANGED:
+                        if str(exc) == CHANGED:     # another file stands there: it waits for the next run
                             with db:
                                 store.afresh(db, row["id"])
-                        fault = fault or (row["rel"], exc)
+                            replaced = replaced or (row["rel"], exc)
+                        else:
+                            untaken[row["id"]] = (row["rel"], exc)
                         continue
                     # What the file holds cannot be read: the fault is that of the document
                     # known by its checksums, which may be another than the one waited for.
@@ -458,12 +463,20 @@ def build(db, directory, selected, *, names_only=False, ocr=False, languages="en
                     progress(f"Could not read {row['rel']}: {exc}")
                     failures += 1
                     done += 1
-            if fault and done == before:
-                # No file of the document could be taken. It waits for a retry when all its
-                # files were tried; one that was not among those chosen may still be read.
-                if waits(doc) and db.execute("SELECT count(*) FROM files WHERE doc=?", (doc,)).fetchone()[0] <= len(copies):
+            # A document of which no file could be taken waits for a retry when all its files
+            # were tried; one that was not among those chosen may still be read.
+            stuck = {}
+            for file, fault in untaken.items():
+                now = waiting_of(file)
+                if now is not None:
+                    stuck.setdefault(now["id"], fault)
+            for now, fault in stuck.items():
+                inside = {row["id"] for row in db.execute("SELECT id FROM files WHERE doc=?", (now,))}
+                if inside <= set(untaken):
                     with db:
-                        db.execute("UPDATE docs SET state=?,error=? WHERE id=?", (failing, str(fault[1])[:1200], doc))
+                        db.execute("UPDATE docs SET state=?,error=? WHERE id=?", (failing, str(fault[1])[:1200], now))
+            if (untaken or replaced) and done == before:
+                fault = next(iter(stuck.values()), replaced or next(iter(untaken.values()), None))
                 progress(f"Could not read {fault[0]}: {fault[1]}")
                 failures += 1
                 done += 1

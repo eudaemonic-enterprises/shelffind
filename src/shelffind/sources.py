@@ -302,7 +302,7 @@ def find(db, directory, query, options, publish, cancelled=lambda: False):
     try:
         programs = registered(directory)
     except (OSError, ValueError) as exc:
-        publish(fuse(db, groups, opts["limit"]), f"Source configuration: {exc}")
+        publish(fuse(db, groups, opts["limit"], opts.get("fmt")), f"Source configuration: {exc}")
         return
     if source:
         if source not in programs:
@@ -348,7 +348,7 @@ def find(db, directory, query, options, publish, cancelled=lambda: False):
         if rows is not None:
             groups.append((name, rows))
             groups.sort(key=lambda group: -1 if group[0] == "files" else place[group[0]])
-        publish(fuse(db, groups, opts["limit"]), " | ".join(errors))
+        publish(fuse(db, groups, opts["limit"], opts.get("fmt")), " | ".join(errors))
 
 
 def resolve(directory, source, identifier):

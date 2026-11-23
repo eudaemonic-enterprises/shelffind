@@ -17,22 +17,35 @@ from .search import COLUMNS, result
 WEIGHT = 20
 
 
-def document(db, name, row):
-    """The document of the folders that a result of the source `name` stands for, or None."""
-    # The same work, or the same bytes, may be kept under several formats, each a document of
-    # its own: the one of the format of the result comes first, then one that has a file.
-    fmt = str(row.get("format") or "")
-    order = "ORDER BY (d.format=?) DESC,EXISTS (SELECT 1 FROM files f WHERE f.doc=d.id) DESC,d.id LIMIT 1"
-    known = db.execute("SELECT r.doc FROM records r JOIN docs d ON d.id=r.doc WHERE r.source=? AND r.ref=? " + order,
-                       (name, row["id"], fmt)).fetchone()
-    if known:
-        return known[0]
+def document(db, name, row, only=None):
+    """The document of the folders that a result of the source `name` stands for, or None.
+
+    The checksums of the result come first, all of them together and whatever their order:
+    they are those of the bytes the source holds now, while its reference may have been given
+    to a file of the folders that held other bytes. The reference serves when no checksum is
+    known here. The same work, or the same bytes, may be kept under several formats, each a
+    document of its own: the one of the format of the result is preferred, then one known by a
+    measure, then one that has a file. With `only`, the format the search is limited to, no
+    document of another format stands for the result."""
+    wanted = str(row.get("format") or "").lower().lstrip(".")
+    only = str(only).lower().lstrip(".") if only else None
+    filed = "EXISTS (SELECT 1 FROM files f WHERE f.doc=d.id) AS filed"
+
+    def best(found):
+        found = [one for one in found if only is None or one["format"] == only]
+        if not found:
+            return None
+        return min(found, key=lambda one: (one["format"] != wanted, not one["measured"], not one["filed"], one["doc"]))["doc"]
+
+    found = []
     for key in row.get("keys") or ():
-        known = db.execute("SELECT k.doc FROM doc_keys k JOIN docs d ON d.id=k.doc WHERE k.key>? AND k.key<? " + order,
-                           (str(key) + "@", str(key) + "A", fmt)).fetchone()
-        if known:
-            return known[0]
-    return None
+        found += db.execute(f"SELECT k.doc,d.format,k.basis='content' AS measured,{filed} FROM doc_keys k "
+                            "JOIN docs d ON d.id=k.doc WHERE k.key>? AND k.key<?", (str(key) + "@", str(key) + "A")).fetchall()
+    known = best(found)
+    if known is None:
+        known = best(db.execute(f"SELECT r.doc,d.format,0 AS measured,{filed} FROM records r JOIN docs d ON d.id=r.doc "
+                                "WHERE r.source=? AND r.ref=?", (name, row["id"])).fetchall())
+    return known
 
 
 def copies(db, doc, places):
@@ -72,9 +85,9 @@ def adopt(shown, name, found):
                      snippet=found["snippet"], marks=found.get("marks") or [])
 
 
-def fuse(db, groups, limit):
+def fuse(db, groups, limit, only=None):
     """Merge lists of results, given as (name of the source, rows) with the files first, into
-    one list with one row per document."""
+    one list with one row per document. `only` is the format the search is limited to."""
     places = {root["id"]: root["path"] for root in store.roots(db)}
     merged, worth = {}, {}
     for name, rows in groups:
@@ -83,7 +96,7 @@ def fuse(db, groups, limit):
                 key = ("files", found["doc"])
                 merged.setdefault(key, dict(found))
             else:
-                doc = document(db, name, found)
+                doc = document(db, name, found, only)
                 key = ("files", doc)
                 if doc is not None and key not in merged:
                     built = shelf_row(db, doc, found["match"], places)

@@ -7,19 +7,29 @@ text. Addresses are stored from the home folder (`~/...`) and expanded when used
 
 A document is known by the checksums of its whole content, MD5 and SHA-256, and by nothing
 else. Names, sizes and dates prove nothing and never join a file to a document: a file that is
-new at its address, or changed there, gets a document of its own. It joins a known document of
-its size and format in one of two ways:
+new at its address, or changed there, gets a document of its own. Where a file belongs follows
+from two kinds of facts, and from nothing else, the order in which they came least of all
+(`place`):
 
-- a measure: the checksum of the file, computed by a full reading or given by the storage of
-  the folder, is one the document carries (`files.sum` keeps what was measured of each file);
-- the word of a source, which says that the file is a work whose checksum a document carries.
+- what was measured of the file (`files.sum`): its checksums, computed by a reading in full or
+  given by the storage of its folder. A measured file belongs to the document known by its
+  checksums (`doc_keys`, basis `content`), whatever was said of it;
+- what the sources say of the file (`records`, each kept with the very file it was said of).
+  A file that was never measured belongs to the document that a measure knows by the checksums
+  the sources give for it, and otherwise shares a document with the files of its size and
+  format for which they give the same ones (basis `source`).
 
-A measure outranks a word. Two different checksums of one kind keep two documents apart; what
-was measured of a file refutes what a source says of it; and two documents that were both read
-become one by a measure only, never on a word. What a source says is kept in `records` with
-the very file it was said of, so that it follows that file and no other. `files.read` marks the
-file the pages of its document were read from, and `files.asked` names the sources that were
-asked about the file as it is.
+Pages belong to bytes. They are read from a copy of a file whose checksums are computed in the
+same pass, and `docs.origin` keeps those checksums: no other bytes complete them or take them.
+Pages that an earlier version read, when checksums were not kept, stay with the file they were
+read from (`files.read`) and with it alone, until a reading in full of that file ties them to
+its bytes; neither a storage nor a source can do that.
+
+What a source says is believed of a file for as long as no measure refutes it: it is dropped
+when the checksums it gives contradict those of the file, or are those of a document that the
+file is measured not to be, of another size, or known by another checksum of the same kind.
+What it said of bytes that a measure made known outlives the files that held them, for a month,
+with their text: a file that holds them is then found again wherever it reappears.
 """
 import contextlib
 import fcntl
@@ -457,6 +467,8 @@ def refuted(db, size, fmt, keys):
     `keys`, and otherwise the document that a measure knows by them: (refuted, document or
     None). A statement is refuted when its checksums are those of two documents, of a document
     of another size, or of a document that carries another checksum of the same kind."""
+    if any(len(found) > 1 for found in kinds(keys).values()):
+        return True, None                           # two checksums of one kind are the checksums of no file
     known = {doc for doc in (holder(db, key, fmt) for key in keys) if doc is not None}
     if not known:
         return False, None
@@ -621,17 +633,22 @@ def regroup(db, doc):
 
 
 def purge(db, doc):
-    """Drop what the sources said of the files of a document and that its measured checksums
-    refute; a file that such a word alone had brought is placed again."""
-    carried = keys_of(db, doc, "content")
+    """Drop what the sources said of the files of a document, or of its bytes, and that a
+    measure refutes: the checksums of the document, or those of another that the statement
+    names as well. A file that such a word alone had brought is placed again, and the sources
+    will be asked about a file whose record is dropped."""
+    told = db.execute("SELECT size,format FROM docs WHERE id=?", (doc,)).fetchone()
+    if told is None:
+        return
     astray = []
     for record in db.execute("SELECT r.id,r.file,r.keys,f.sum FROM records r LEFT JOIN files f ON f.id=r.file "
                              "WHERE r.doc=?", (doc,)).fetchall():
-        if against(record["keys"].split(), carried):
+        mine = (record["sum"] or "").split()
+        if refuted(db, told["size"], told["format"], sorted({*record["keys"].split(), *mine}))[0]:
             db.execute("DELETE FROM records WHERE id=?", (record["id"],))
             if record["file"] is not None:
                 db.execute("UPDATE files SET asked='' WHERE id=?", (record["file"],))
-                if not record["sum"]:
+                if not mine:
                     astray.append(record["file"])
     for file in astray:
         place(db, file)
@@ -665,28 +682,25 @@ def by_measure(db, row, mine):
     for key in mine:
         name = f"{key}@{fmt}"
         db.execute("INSERT OR IGNORE INTO doc_keys(key,doc,basis) VALUES(?,?,'content')", (name, target))
-        # The files that were this work on the word of a source alone are placed again: with
-        # this document when the word can be true of them, and without their word otherwise.
+        # A work known by this checksum on a word alone, and whose files had all gone, is
+        # found again: what was said of it is said of these bytes.
         for group in db.execute("SELECT DISTINCT k.doc,d.size FROM doc_keys k JOIN docs d ON d.id=k.doc "
-                                "WHERE k.key>? AND k.key<?", (name + "#", name + "$")).fetchall():
-            if db.execute("SELECT 1 FROM files WHERE doc=? LIMIT 1", (group["doc"],)).fetchone():
-                regroup(db, group["doc"])
-            else:                                   # the work whose file had gone is found again
-                if group["size"] == row["size"]:
-                    cards(db, group["doc"], target)
-                db.execute("DELETE FROM docs WHERE id=?", (group["doc"],))
-        # A source that said this checksum of a file measured to be another document, or of
-        # the bytes of another document, is refuted by the two measures.
+                                "WHERE k.key>? AND k.key<? AND NOT EXISTS (SELECT 1 FROM files f WHERE f.doc=k.doc)",
+                                (name + "#", name + "$")).fetchall():
+            if group["size"] == row["size"]:
+                cards(db, group["doc"], target)
+            db.execute("DELETE FROM docs WHERE id=?", (group["doc"],))
+        # Every statement that names this checksum is looked at again. A file never measured
+        # is placed anew by what is said of it, which may bring it here; a statement about a
+        # file measured to be another document, or about other bytes, is refuted.
         for record in db.execute(
-                "SELECT r.id,r.file,r.doc,f.sum FROM record_keys k JOIN records r ON r.id=k.record JOIN docs d ON d.id=r.doc "
-                "LEFT JOIN files f ON f.id=r.file WHERE k.key=? AND d.format=? AND r.doc!=?", (key, fmt, target)).fetchall():
+                "SELECT DISTINCT r.doc,r.file,coalesce(f.sum,'') AS sum FROM record_keys k JOIN records r ON r.id=k.record "
+                "JOIN docs d ON d.id=r.doc LEFT JOIN files f ON f.id=r.file WHERE k.key=? AND d.format=? AND r.doc!=?",
+                (key, fmt, target)).fetchall():
             if record["file"] is not None and not record["sum"]:
-                replace(db, record["file"])         # never measured: placed again by what is said of it
-            elif record["file"] is not None or keys_of(db, record["doc"], "content"):
-                db.execute("DELETE FROM records WHERE id=?", (record["id"],))
-                if record["file"] is not None:
-                    db.execute("UPDATE files SET asked='' WHERE id=?", (record["file"],))
-                retitle(db, record["doc"])
+                replace(db, record["file"])
+            else:
+                purge(db, record["doc"])
     if reader and has_pages(db, target):
         # The pages read from this file by an earlier version are those of the bytes measured.
         db.execute("UPDATE docs SET origin=? WHERE id=? AND origin IS NULL", (" ".join(mine), target))
@@ -801,16 +815,7 @@ def measure(db, file, measured, local=True):
         return False
     mine = [kept[kind] for kind in sorted(kept)]
     db.execute("UPDATE files SET sum=? WHERE id=?", (" ".join(mine), file))
-    db.executemany("DELETE FROM records WHERE id=?", [(record["id"],) for record in db.execute(
-        "SELECT id,keys FROM records WHERE file=?", (file,)).fetchall() if against(record["keys"].split(), mine)])
     place(db, file)
-    # Nor is a word kept that the measure refutes together with what was measured elsewhere.
-    told = db.execute("SELECT doc,size,format FROM files WHERE id=?", (file,)).fetchone()
-    refuted_now = [record["id"] for record in db.execute("SELECT id,keys FROM records WHERE file=?", (file,)).fetchall()
-                   if refuted(db, told["size"], told["format"], sorted({*record["keys"].split(), *mine}))[0]]
-    if refuted_now:
-        db.executemany("DELETE FROM records WHERE id=?", [(number,) for number in refuted_now])
-        retitle(db, told["doc"])
     still = " ".join(record["source"] for record in db.execute("SELECT source FROM records WHERE file=? ORDER BY source", (file,)))
     db.execute("UPDATE files SET asked=? WHERE id=?", (still, file))
     return True

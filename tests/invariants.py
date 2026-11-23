@@ -5,7 +5,58 @@
 the statements of sources together; `canonical(db)` computes, from what is measured and said
 now, the documents the files ought to form, to be compared with those they do form: the two
 agree only when the placing of the files does not depend on the order of the events."""
-from shelffind import store
+
+def kinds(keys):
+    """Kind -> the checksums of that kind among `keys`, whatever format or size they are kept under."""
+    found = {}
+    for key in keys:
+        key = key.split("@")[0]
+        if key.startswith(("md5:", "sha256:")):
+            found.setdefault(key.split(":")[0], set()).add(key)
+    return found
+
+
+def against(one, other):
+    one, other = kinds(one), kinds(other)
+    return any(kind in other and not one[kind] & other[kind] for kind in one)
+
+
+def measured(db, doc):
+    return [row["key"].split("@")[0] for row in db.execute("SELECT key FROM doc_keys WHERE doc=? AND basis='content'", (doc,))]
+
+
+def holder(db, key, fmt):
+    row = db.execute("SELECT doc FROM doc_keys WHERE key=? AND basis='content'", (f"{key}@{fmt}",)).fetchone()
+    return row["doc"] if row else None
+
+
+def said(db, file):
+    """One checksum of each kind among those the sources give for a file, or none when two of
+    their statements contradict each other."""
+    given = [row["keys"].split() for row in db.execute("SELECT keys FROM records WHERE file=? ORDER BY id", (file,))]
+    for number, one in enumerate(given):
+        for other in given[number + 1:]:
+            if against(one, other):
+                return []
+    found = {}
+    for keys in given:
+        for kind, values in kinds(keys).items():
+            found.setdefault(kind, sorted(values)[0])
+    return [found[kind] for kind in sorted(found)]
+
+
+def refuted(db, size, fmt, keys):
+    """(Whether a measure refutes that a file of this size and format has these checksums, the
+    document that a measure knows by them otherwise)."""
+    known = {holder(db, key, fmt) for key in keys} - {None}
+    if not known:
+        return False, None
+    if len(known) > 1:
+        return True, None
+    doc = min(known)
+    if db.execute("SELECT size FROM docs WHERE id=?", (doc,)).fetchone()["size"] != size or against(keys, measured(db, doc)):
+        return True, None
+    return False, doc
 
 
 def structure(db):
@@ -28,8 +79,7 @@ def structure(db):
         if doc not in docs:
             found.append(f"keys of a document that is not there: {doc}")
             continue
-        kinds = store.kinds(content(doc))
-        if any(len(values) > 1 for values in kinds.values()):
+        if any(len(values) > 1 for values in kinds(content(doc)).values()):
             found.append(f"document {doc} is known by two checksums of one kind: {sorted(content(doc))}")
         if source(doc) and (content(doc) or doc in paged):
             found.append(f"document {doc} holds checksums on a word beside measured ones or pages")
@@ -44,7 +94,7 @@ def structure(db):
         if (doc["size"], doc["format"]) != (file["size"], file["format"]):
             found.append(f"file {file['rel']} is in a document of another size or format")
         for key in (file["sum"] or "").split():
-            if store.holder(db, key, file["format"]) != file["doc"]:
+            if holder(db, key, file["format"]) != file["doc"]:
                 found.append(f"file {file['rel']} was measured {key} and its document is not the one known by it")
         if file["read"] and file["doc"] not in paged:
             found.append(f"file {file['rel']} is marked as read and its document has no pages")
@@ -68,11 +118,11 @@ def structure(db):
     for file in files:
         if file["sum"] or (file["read"] and file["doc"] in paged):
             continue
-        said = store.said(db, file["id"])
-        wrong, known = store.refuted(db, file["size"], file["format"], said)
+        told = said(db, file["id"])
+        wrong, known = refuted(db, file["size"], file["format"], told)
         alone = len(members[file["doc"]]) == 1 and not keys.get(file["doc"]) and file["doc"] not in paged
-        names = {f"{key}@{file['format']}#{file['size']}" for key in said}
-        if wrong or not said:
+        names = {f"{key}@{file['format']}#{file['size']}" for key in told}
+        if wrong or not told:
             if not alone:
                 found.append(f"file {file['rel']}, of which nothing usable is said, is not alone in a document without keys")
         elif known is not None:
@@ -83,10 +133,10 @@ def structure(db):
     for doc, inside in members.items():
         if not source(doc):
             continue
-        said = set()
+        told = set()
         for file in inside:
-            said |= {f"{key}@{file['format']}#{file['size']}" for key in store.said(db, file["id"])}
-        if set(source(doc)) != said:
+            told |= {f"{key}@{file['format']}#{file['size']}" for key in said(db, file["id"])}
+        if set(source(doc)) != told:
             found.append(f"document {doc} holds on a word checksums that no file of it is said to have")
         if db.execute("SELECT 1 FROM records WHERE doc=? AND file IS NULL LIMIT 1", (doc,)).fetchone():
             found.append(f"document {doc}, held together by words, keeps what was said of a file that is gone")
@@ -102,7 +152,7 @@ def structure(db):
         if record["home"] != record["doc"]:
             found.append(f"record {record['id']} is not with the document of its file")
         mine = (record["sum"] or "").split()
-        if store.against(given, mine) or (mine and store.refuted(db, record["size"], record["format"], sorted({*given, *mine}))[0]):
+        if against(given, mine) or (mine and refuted(db, record["size"], record["format"], sorted({*given, *mine}))[0]):
             found.append(f"record {record['id']} is kept although a measure refutes it")
     if db.execute("SELECT count(*) FROM names").fetchone()[0] != len(files):
         found.append("the names searched are not those of the files")
@@ -116,21 +166,21 @@ def canonical(db):
     paged = {row["doc"] for row in db.execute("SELECT DISTINCT doc FROM pages")}
     blocks, loose = {}, {}
     for file in files:
-        mine = store.sums(file["sum"])
+        mine = kinds((file["sum"] or "").split())
         if mine:
-            blocks.setdefault(("measured", mine["md5"], file["format"]), set()).add(file["id"])
+            blocks.setdefault(("measured", min(mine["md5"]), file["format"]), set()).add(file["id"])
         elif file["read"] and file["doc"] in paged:
             blocks[("reader", file["id"])] = {file["id"]}
         else:
-            said = store.said(db, file["id"])
-            wrong, known = store.refuted(db, file["size"], file["format"], said)
-            if wrong or not said:
+            told = said(db, file["id"])
+            wrong, known = refuted(db, file["size"], file["format"], told)
+            if wrong or not told:
                 blocks[("alone", file["id"])] = {file["id"]}
             elif known is not None:
-                md5 = store.sums(" ".join(store.keys_of(db, known, "content")))["md5"]
+                md5 = min(kinds(measured(db, known))["md5"])
                 blocks.setdefault(("measured", md5, file["format"]), set()).add(file["id"])
             else:
-                loose[file["id"]] = {f"{key}@{file['format']}#{file['size']}" for key in said}
+                loose[file["id"]] = {f"{key}@{file['format']}#{file['size']}" for key in told}
     # The files that words alone hold together: those that share a checksum said of them.
     leader = {file: file for file in loose}
 
