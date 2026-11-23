@@ -60,24 +60,61 @@ def default_handler(path):
     return found.group(1) if found else None
 
 
-def desktop_exec(name):
-    """The command of a desktop entry, without the places where the desktop puts the file."""
+def entry(name):
+    """The lines of the desktop entry `name`, from the first folder of applications that has
+    it; an empty list when none has."""
     home = os.environ.get("XDG_DATA_HOME") or str(Path.home() / ".local/share")
     shared = os.environ.get("XDG_DATA_DIRS") or "/usr/local/share:/usr/share"
     for base in [home, *shared.split(":")]:
-        entry = Path(base) / "applications" / name
         try:
-            lines = entry.read_text(errors="replace").splitlines()
+            return (Path(base) / "applications" / name).read_text(errors="replace").splitlines()
         except OSError:
             continue
-        for line in lines:
-            if line.startswith("Exec="):
-                try:
-                    words = shlex.split(line[5:])
-                except ValueError:
-                    return None
-                return [word for word in words if not re.fullmatch(r"%[a-zA-Z]", word)] or None
+    return []
+
+
+def desktop_exec(name):
+    """The command of a desktop entry, without the places where the desktop puts the file."""
+    for line in entry(name):
+        if line.startswith("Exec="):
+            try:
+                words = shlex.split(line[5:])
+            except ValueError:
+                return None
+            return [word for word in words if not re.fullmatch(r"%[a-zA-Z]", word)] or None
     return None
+
+
+def label(name):
+    """The name a person knows an application by: the name its desktop entry gives, with the
+    word of its identifier added when the two have nothing in common, as in `Document Viewer
+    (Papers)`. Without an entry, the identifier without its ending."""
+    stem = name.removesuffix(".desktop")
+    told = next((line[5:].strip() for line in entry(name) if line.startswith("Name=")), "")
+    if not told:
+        return stem
+    parts = stem.split(".")
+    word = parts[-1] if len(parts) >= 3 else ""             # the last part of org.gnome.Papers
+    plain = lambda text: re.sub(r"[^a-z0-9]", "", text.lower())
+    if word.isalpha() and plain(word) not in plain(told) and plain(told) not in plain(word):
+        return f"{told} ({word})"
+    return told
+
+
+def choices(path):
+    """The applications that can open `path`, as (identifier, name) pairs: the one that opens
+    it by default first and marked so, then the others, one line for each name."""
+    usual = default_handler(path)
+    listed = applications(path)
+    if usual in listed:
+        listed = [usual, *(name for name in listed if name != usual)]
+    found, seen = [], set()
+    for name in listed:
+        shown = label(name)
+        if shown not in seen:
+            seen.add(shown)
+            found.append((name, shown + (" (opens it by default)" if name == usual else "")))
+    return found
 
 
 def viewer_argv(path, page=None, phrase=None, handler=None, custom=None):

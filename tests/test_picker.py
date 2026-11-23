@@ -230,6 +230,13 @@ class Frames(unittest.TestCase):
                            80, 10, self.look))
         self.assertIn("▌ okular.desktop", apps)
         self.assertTrue(any(line.startswith("[ OPEN WITH ] okular.desktop") for line in apps))
+        named = self.model(mode="apps", apps=["org.gnome.Papers.desktop", "com.google.Chrome.desktop"], app=1,
+                           app_names=["Document Viewer (Papers)", "Google Chrome (opens it by default)"])
+        shown = plain(frame(named, 80, 10, self.look))
+        self.assertIn("  Document Viewer (Papers)", shown)
+        self.assertIn("▌ Google Chrome (opens it by default)", shown)
+        self.assertTrue(any(line.startswith("[ OPEN WITH ] Google Chrome") for line in shown))
+        self.assertEqual(press(named, "enter"), [("launch", named.results[0], "com.google.Chrome.desktop")])
         ascii_look = Look(preview=3, unicode=False, keys=tuple(KEYS.items()), home="/lib")
         text = "\n".join(plain(frame(self.model(), 80, 10, ascii_look)))
         self.assertTrue(text.isascii(), text)

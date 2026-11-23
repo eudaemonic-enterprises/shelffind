@@ -110,10 +110,10 @@ def panel(db, directory, query, options, settings, enter="open", quote=False, wi
             elif action == "reveal":
                 desktop.reveal(path)
             elif action == "apps":
-                found = desktop.applications(path)
+                found = desktop.choices(path)
                 if not found:
                     raise ValueError("No application is registered for this kind of file")
-                app.post(Done(action, hit, text="\n".join(found)))
+                app.post(Done(action, hit, text=json.dumps(found)))
                 return
             else:
                 custom = viewers.get(hit.get("format") or "")
@@ -136,7 +136,9 @@ def panel(db, directory, query, options, settings, enter="open", quote=False, wi
             model.message = done.error
             return False
         if done.action == "apps":
-            model.apps, model.app, model.mode = done.text.split("\n"), 0, "apps"
+            found = json.loads(done.text)
+            model.apps, model.app_names = [name for name, _ in found], [shown for _, shown in found]
+            model.app, model.mode = 0, "apps"
             return False
         if done.action == "copy":
             used = desktop.copy(done.text, terminal.write)
