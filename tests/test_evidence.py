@@ -388,6 +388,23 @@ class Words(Evidence):
         self.assertEqual((len(found[0]["copies"]), found[0]["title"]), (1, "Work W1"))
         self.assertEqual(self.db.execute("SELECT count(*) FROM doc_keys WHERE basis='source'").fetchone()[0], 0)
 
+    @unittest.skipIf(os.geteuid() == 0, "The administrator reads every file")
+    def test_a_word_about_a_file_that_was_read_does_not_vouch_for_its_pages(self):
+        one = self.write("a/book.txt")
+        other = self.base / "elsewhere.txt"
+        other.write_text(OTHER)
+        self.build()
+        self.unmeasured()                                   # read by an earlier version, never measured
+        self.assertTrue(self.say("a/book.txt", "W2", self.sha(other)))      # a source takes it for another work
+        one.chmod(0)                                        # ... and it cannot be measured for now
+        self.addCleanup(one.chmod, 0o600)
+        self.write("b/other.txt", OTHER)                    # the other work itself arrives
+        self.read.clear()
+        self.assertEqual(self.build(), (1, 1))              # it is read for itself, whatever was said of the first
+        self.assertEqual(self.read, ["other.txt"])
+        self.assertEqual((names(self.db, "northern harbours"), names(self.db, "southern capes")),
+                         (["a/book.txt"], ["b/other.txt"]))
+
     def test_a_wrong_word_about_a_file_that_was_read_costs_it_nothing(self):
         self.write("a/book.txt")
         other = self.write("b/other.txt", OTHER)
