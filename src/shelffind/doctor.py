@@ -144,6 +144,28 @@ def checks(directory, explicit):
     except (OSError, ValueError) as error:
         yield "fail", "sources", str(error), "correct sources.json in the data folder"
 
+    # The folders whose storage is to tell checksums: without rclone, or without that remote in
+    # its settings, the files are compared by reading instead.
+    twins = {name: table["remote"] for name, table in (settings.tables["roots"] if settings else {}).items()
+             if table.get("remote")}
+    if twins:
+        known = None
+        if shutil.which("rclone"):
+            try:
+                known = subprocess.run(["rclone", "listremotes"], capture_output=True, text=True, timeout=10,
+                                       check=False).stdout.split()
+            except (OSError, subprocess.SubprocessError):
+                known = []
+        for name, remote in twins.items():
+            if known is None:
+                yield "warn", f"storage of {name}", f"{remote}: rclone is missing", \
+                    "install rclone, or remove `remote` under [roots] in the settings"
+            elif remote.split(":", 1)[0] + ":" not in known:
+                yield "warn", f"storage of {name}", f"{remote}: rclone does not know this remote", \
+                    "name it in `rclone config`, or correct `remote` under [roots] in the settings"
+            else:
+                yield "ok", f"storage of {name}", f"{remote}: tells checksums without reading", ""
+
     try:
         place = sharing.carrier(config.load(directory, explicit))
     except ValueError:

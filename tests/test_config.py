@@ -1,6 +1,7 @@
 # Copyright 2026 Eudaemonic Enterprises Inc.
 """Settings: the layers, the origin of each value, and what a faulty file does."""
 import json
+import os
 import tempfile
 import unittest
 from pathlib import Path
@@ -179,6 +180,19 @@ class Commands(Shelf):
         self.assertIn("the defaults are used", err)
         self.assertEqual(self.run_cli("config", "show")[0], 1)
         self.assertEqual(self.run_cli("pick", "anything")[0], 1)
+
+    def test_doctor_says_whether_the_storage_of_a_folder_can_be_asked(self):
+        self.addCleanup(store.declare, {})
+        (self.data / "config.toml").write_text(f'[roots.Room]\npath = "{self.root}"\nremote = "cloud:Room"\n'
+                                               f'[roots.Other]\npath = "{self.base}"\nremote = "elsewhere:Other"\n')
+        tools = self.fake_tool("rclone", '[ "$1" = listremotes ] && echo "cloud:"\n')
+        with patch.dict(os.environ, {"PATH": f"{tools}{os.pathsep}{os.environ['PATH']}"}):
+            rows = {row["label"]: row for row in json.loads(self.run_cli("doctor", "--json")[1])}
+        self.assertEqual((rows["storage of Room"]["status"], rows["storage of Other"]["status"]), ("ok", "warn"))
+        self.assertIn("rclone does not know this remote", rows["storage of Other"]["detail"])
+        with patch("shelffind.doctor.shutil.which", side_effect=lambda name: None):
+            rows = {row["label"]: row for row in json.loads(self.run_cli("doctor", "--json")[1])}
+        self.assertIn("rclone is missing", rows["storage of Room"]["detail"])
 
     def test_doctor_cheatsheet_and_shell_snippets_print(self):
         code, out, _ = self.run_cli("doctor", "--json")
