@@ -68,7 +68,8 @@ def attach(db, file, name, record, known):
     for other in db.execute("SELECT keys FROM records WHERE file=? AND source!=?", (file, name)):
         if store.against(keys, other["keys"].split()):
             return False
-    withdraw(db, file, name)                    # what the same source said of the file before is replaced
+    withdraw(db, file, name)                    # what the same source said of the file before is replaced,
+    row = db.execute("SELECT doc,sum,read FROM files WHERE id=?", (file,)).fetchone()   # and may have been its only tie
     doc = row["doc"]
     if store.against(keys, store.keys_of(db, doc)):
         if row["read"]:

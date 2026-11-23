@@ -474,6 +474,22 @@ class Words(Evidence):
         self.assertEqual(names(self.db, "bravocard"), ["b/book.txt"])
         self.assertEqual([row["ref"] for row in self.db.execute("SELECT ref FROM records")], ["C7"])
 
+    def test_a_new_word_about_a_file_is_kept_with_that_file_and_not_where_the_old_word_had_put_it(self):
+        one = self.write("a/book.txt")
+        self.write("b/book.txt", OTHER)
+        self.build(names_only=True)
+        key = self.sha(one)
+        self.assertTrue(self.say("a/book.txt", "W1", key))
+        self.assertTrue(self.say("b/book.txt", "W1", key))  # the source takes the second for the first,
+        self.assertEqual(self.documents(), 1)
+        other = "md5:" + "cc" * 16
+        self.assertTrue(self.say("b/book.txt", "W2", other))    # then for another work, known by another checksum
+        docs = self.docs()
+        self.assertNotEqual(docs["a/book.txt"], docs["b/book.txt"])
+        held = lambda rel: sorted(row["key"] for row in self.db.execute("SELECT key FROM doc_keys WHERE doc=?", (docs[rel],)))
+        self.assertEqual((held("a/book.txt"), held("b/book.txt")), ([key + "@txt"], [other + "@txt"]))
+        self.assertEqual(self.documents(), 2)
+
     def test_a_file_brought_by_a_word_leaves_when_the_word_is_withdrawn(self):
         one = self.write("a/book.txt")
         self.write("b/book.txt", OTHER)
