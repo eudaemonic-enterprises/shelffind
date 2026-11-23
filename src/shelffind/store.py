@@ -660,7 +660,7 @@ def by_measure(db, row, mine):
     reader = bool(row["read"])
     if target != here:
         origin = db.execute("SELECT origin FROM docs WHERE id=?", (here,)).fetchone()["origin"]
-        reader = reader and has_pages(db, here) and "sha256:" not in (origin or "") and hand_over(db, here, target)
+        reader = reader and has_pages(db, here) and origin is None and hand_over(db, here, target)
         move(db, file, target, reader)
     for key in mine:
         name = f"{key}@{fmt}"
@@ -678,18 +678,18 @@ def by_measure(db, row, mine):
         # A source that said this checksum of a file measured to be another document, or of
         # the bytes of another document, is refuted by the two measures.
         for record in db.execute(
-                "SELECT r.id,r.file,r.doc FROM record_keys k JOIN records r ON r.id=k.record JOIN docs d ON d.id=r.doc "
-                "LEFT JOIN files f ON f.id=r.file WHERE k.key=? AND d.format=? AND r.doc!=? "
-                "AND (coalesce(f.sum,'')!='' OR (r.file IS NULL AND EXISTS "
-                "(SELECT 1 FROM doc_keys c WHERE c.doc=r.doc AND c.basis='content')))", (key, fmt, target)).fetchall():
-            db.execute("DELETE FROM records WHERE id=?", (record["id"],))
-            if record["file"] is not None:
-                db.execute("UPDATE files SET asked='' WHERE id=?", (record["file"],))
-            retitle(db, record["doc"])
+                "SELECT r.id,r.file,r.doc,f.sum FROM record_keys k JOIN records r ON r.id=k.record JOIN docs d ON d.id=r.doc "
+                "LEFT JOIN files f ON f.id=r.file WHERE k.key=? AND d.format=? AND r.doc!=?", (key, fmt, target)).fetchall():
+            if record["file"] is not None and not record["sum"]:
+                replace(db, record["file"])         # never measured: placed again by what is said of it
+            elif record["file"] is not None or keys_of(db, record["doc"], "content"):
+                db.execute("DELETE FROM records WHERE id=?", (record["id"],))
+                if record["file"] is not None:
+                    db.execute("UPDATE files SET asked='' WHERE id=?", (record["file"],))
+                retitle(db, record["doc"])
     if reader and has_pages(db, target):
-        origin = db.execute("SELECT origin FROM docs WHERE id=?", (target,)).fetchone()["origin"]
-        if origin is None or ("sha256:" not in origin and len(mine) > 1):
-            db.execute("UPDATE docs SET origin=? WHERE id=?", (" ".join(mine), target))
+        # The pages read from this file by an earlier version are those of the bytes measured.
+        db.execute("UPDATE docs SET origin=? WHERE id=? AND origin IS NULL", (" ".join(mine), target))
     purge(db, target)
     return target
 
@@ -716,9 +716,17 @@ def by_word(db, row):
     if known is not None:
         target, names = known, []
     else:
-        groups = sorted(found["doc"] for found in db.execute(
-            f"SELECT DISTINCT doc FROM doc_keys WHERE key IN ({','.join('?' * len(names))})", names)) if names else []
         here = db.execute("SELECT doc FROM files WHERE id=?", (file,)).fetchone()["doc"]
+        mine = own(db, here, file) and not has_pages(db, here)
+        if mine:                                    # what it holds, it held by what was said before
+            db.execute("DELETE FROM doc_keys WHERE doc=?", (here,))
+        groups = []
+        for found in db.execute(f"SELECT DISTINCT doc FROM doc_keys WHERE key IN ({','.join('?' * len(names))}) ORDER BY doc",
+                                names).fetchall() if names else ():
+            if db.execute("SELECT 1 FROM files WHERE doc=? LIMIT 1", (found["doc"],)).fetchone():
+                groups.append(found["doc"])
+            else:                                   # a work whose files had all gone: what is said of this file
+                db.execute("DELETE FROM docs WHERE id=?", (found["doc"],))     # starts it anew
         if groups:
             target = groups[0]
             for other in groups[1:]:                # said to be one work: one document
@@ -726,9 +734,8 @@ def by_word(db, row):
                 db.execute("UPDATE records SET doc=? WHERE doc=?", (target, other))
                 db.execute("UPDATE doc_keys SET doc=? WHERE doc=?", (target, other))
                 db.execute("DELETE FROM docs WHERE id=?", (other,))
-        elif own(db, here, file) and not has_pages(db, here):
+        elif mine:
             target = here
-            db.execute("DELETE FROM doc_keys WHERE doc=?", (here,))
         else:
             target = new_document(db, size, fmt)
     move(db, file, target)
@@ -779,10 +786,15 @@ def measure(db, file, measured, local=True):
     A reading outranks the storage, which never replaces what a reading found. What a source
     said of this very file, and that the measure contradicts, was said of other bytes: it is
     dropped. The sources that did not know the file are asked about it again, since they may
-    know it by its checksum."""
-    row = db.execute("SELECT sum FROM files WHERE id=?", (file,)).fetchone()
-    if row is None:
-        return False
+    know it by its checksum.
+
+    What a storage says of a file whose pages were read by an earlier version, and never tied
+    to bytes, is not taken: a storage that held other bytes under the size and the date of the
+    file would give those pages to every file that truly holds those bytes. Such a file is
+    measured by a reading in full, which ties its pages to what it holds."""
+    row = db.execute("SELECT f.sum,f.read,d.origin FROM files f JOIN docs d ON d.id=f.doc WHERE f.id=?", (file,)).fetchone()
+    if row is None or (not local and row["read"] and row["origin"] is None):
+        return False                                # see above: only a reading ties such pages to bytes
     known, new = sums(row["sum"]), sums(" ".join(measured))
     kept = {**known, **new} if local else {**new, **known}
     if kept == known:

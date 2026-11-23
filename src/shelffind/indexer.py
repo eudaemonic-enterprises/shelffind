@@ -166,28 +166,30 @@ def waiting(db, root, only=None, reading=False, thorough=False):
     """The files of a folder that a measure would place or prove, and of which none was taken.
 
     For the storage of the folder, which tells an MD5 without any reading: the files of the
-    size and format of another document, which may be that document; those that the pages of
-    their document were read from; and, with `thorough`, those of which a source gave a
-    checksum, which is then proved or refuted. For a reading in full (`reading`), which costs
-    one: in a folder without storage, the files of the size and format of a document known by a
-    checksum, and those that pages were read from; in a folder with a storage, only the latter,
-    the others waiting for the storage to answer."""
+    size and format of another document, which may be that document; and, with `thorough`,
+    those of which a source gave a checksum, which is then proved or refuted. For a reading in
+    full (`reading`), which costs one: the files whose pages were read by an earlier version
+    and never tied to bytes, which only a reading does; and, in a folder without storage, the
+    files of the size and format of a document known by a checksum. In a folder with a storage
+    the latter wait for the storage to answer."""
     lacking = "coalesce(f.sum,'')=''" if reading else "instr(coalesce(f.sum,''),'md5:')=0"
-    rows = db.execute(f"SELECT {FILE},f.doc,f.read,EXISTS (SELECT 1 FROM records r WHERE r.file=f.id AND r.keys!='') AS said "
-                      f"FROM files f WHERE f.root=? AND {lacking} ORDER BY f.id", (root["id"],)).fetchall()
+    rows = db.execute(f"SELECT {FILE},f.doc,f.read AND d.origin IS NULL AS untied,"
+                      "EXISTS (SELECT 1 FROM records r WHERE r.file=f.id AND r.keys!='') AS said "
+                      f"FROM files f JOIN docs d ON d.id=f.doc WHERE f.root=? AND {lacking} ORDER BY f.id", (root["id"],)).fetchall()
     rows = [row for row in rows if only is None or row["rel"] in only]
     if not rows:
         return []
     if reading:
         if root.get("remote"):
-            return [row for row in rows if row["read"]]
+            return [row for row in rows if row["untied"]]
         alike = {}                                  # size and format -> the documents known by a checksum
         for doc in db.execute("SELECT d.id,d.size,d.format FROM docs d WHERE EXISTS (SELECT 1 FROM doc_keys k WHERE k.doc=d.id)"):
             alike.setdefault((doc["size"], doc["format"]), set()).add(doc["id"])
-        return [row for row in rows if row["read"] or alike.get((row["size"], row["format"]), set()) - {row["doc"]}]
+        return [row for row in rows if row["untied"] or alike.get((row["size"], row["format"]), set()) - {row["doc"]}]
     several = {(doc["size"], doc["format"]) for doc in
                db.execute("SELECT size,format FROM docs GROUP BY size,format HAVING count(*)>1")}
-    return [row for row in rows if row["read"] or (row["size"], row["format"]) in several or (thorough and row["said"])]
+    return [row for row in rows if not row["untied"]
+            and ((row["size"], row["format"]) in several or (thorough and row["said"]))]
 
 
 def ask_storage(db, root, rows, progress):
