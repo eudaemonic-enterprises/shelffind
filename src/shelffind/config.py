@@ -55,6 +55,7 @@ TABLES = {
     "open": "Viewer per format: \"default\", or a command with {path}, {page} and {phrase}.",
     "theme": "Colours by role, one table per theme.",
     "sources": "Outside sources: [sources.NAME] command = [\"program\", \"argument\"].",
+    "roots": "Document folders: [roots.NAME] path = \"~/Books\", and remote = \"cloud:Books\" for its rclone twin.",
 }
 VARIABLE = re.compile(r"\$(?:\{(\w+)\}|(\w+))")
 
@@ -179,7 +180,10 @@ class Settings:
                     words = isinstance(content, list) and content and all(isinstance(w, str) for w in content)
                     sound = {"theme": isinstance(content, dict) and all(isinstance(v, str) for v in content.values()),
                              "open": content == "default" or words,
-                             "sources": isinstance(content, dict)}[name]
+                             "sources": isinstance(content, dict),
+                             "roots": isinstance(content, dict) and isinstance(content.get("path"), str)
+                             and content["path"] and all(isinstance(v, str) for v in content.values())
+                             and set(content) <= {"path", "remote"}}[name]
                     if not sound:
                         raise ConfigError(f"{origin}: [{name}] {inner} = {content!r} is not valid")
                     self.tables[name][inner] = content

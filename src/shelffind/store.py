@@ -22,6 +22,7 @@ import zlib
 from pathlib import Path
 
 from . import fuzzy
+from .config import expand
 from .extract import SUPPORTED, file_format
 
 INDEX, EARLIER = "index2.sqlite3", "index.sqlite3"
@@ -203,10 +204,56 @@ def mount_point(path):
     return "/"
 
 
+# The folders named in the settings, as name -> {"path": the address as written, "remote": its
+# rclone twin or None}. The command line fills this once the settings are read.
+declared = {}
+
+
+def declare(tables):
+    """Take the [roots.NAME] tables of the settings."""
+    declared.clear()
+    for name, table in tables.items():
+        declared[name] = {"path": table["path"], "remote": table.get("remote")}
+
+
 def root_row(row):
     """A registered folder with its address expanded for this machine."""
     return {"id": row["id"], "name": row["name"], "path": to_home(row["path"]), "stored": row["path"],
-            "mount": to_home(row["mount"]), "scanned": row["scanned"], "problem": row["problem"]}
+            "mount": to_home(row["mount"]), "scanned": row["scanned"], "problem": row["problem"],
+            "remote": declared.get(row["name"], {}).get("remote")}
+
+
+def adopt_declared(db, directory, progress=lambda text: None):
+    """Register the folders that the settings name and the index does not know yet. A folder
+    registered under another name takes the name of the settings; a folder whose address
+    changed in the settings follows it, and its files keep their documents. A folder that
+    cannot be reached now is left for another time."""
+    for name, wanted in declared.items():
+        try:
+            path = Path(expand(wanted["path"])).resolve()
+        except ValueError as fault:
+            progress(f"[roots.{name}] {fault}")
+            continue
+        known = {root["name"]: root for root in roots(db)}
+        if name in known and Path(known[name]["path"]) == path:
+            continue
+        if not path.is_dir():
+            progress(f"The folder {name} of the settings cannot be reached now: {path}")
+            continue
+        try:
+            if name in known:
+                with db:
+                    db.execute("UPDATE roots SET path=?,mount=? WHERE id=?",
+                               (from_home(path), from_home(mount_point(path)), known[name]["id"]))
+                continue
+            same = next((root for root in known.values() if Path(root["path"]) == path), None)
+            if same:
+                with db:
+                    db.execute("UPDATE roots SET name=? WHERE id=?", (name, same["id"]))
+            else:
+                add_root(db, path, directory, name=name)
+        except (ValueError, sqlite3.IntegrityError) as fault:
+            progress(f"[roots.{name}] {fault}")
 
 
 def free_name(db, wanted):

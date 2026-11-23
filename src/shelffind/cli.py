@@ -241,6 +241,7 @@ def execute(args, db, directory, settings):
         else:
             sources.configure(directory, args.name, args.program if args.action == "add" else None)
     elif args.command == "index":
+        store.adopt_declared(db, directory, say)        # the folders the settings name
         roots = store.roots(db, args.root)
         if not roots:
             raise ValueError("Register a document folder with shelffind roots add FOLDER")
@@ -308,6 +309,7 @@ def configuration(args, directory, explicit):
         return 0
     settings = config.load(directory, explicit)
     sources.declare(settings.tables["sources"])
+    store.declare(settings.tables["roots"])
     settings.keymap()
     for name, roles in settings.tables["theme"].items():
         for role, spec in roles.items():
@@ -359,6 +361,7 @@ def main(argv=None):
             try:
                 settings = config.load(directory, explicit)
                 sources.declare(settings.tables["sources"])
+                store.declare(settings.tables["roots"])
             except ValueError as fault:
                 if args.command in ("search", "pick"):
                     raise

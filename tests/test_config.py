@@ -4,8 +4,10 @@ import json
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
-from shelffind import config, sources
+from shelffind import config, sources, store
+from shelffind.search import search
 
 from support import Shelf
 
@@ -107,6 +109,34 @@ class Commands(Shelf):
         self.assertIn("catalogue  /bin/echo []", out)
         self.assertEqual(sources.registered(self.data)["catalogue"], ["/bin/echo", "[]"])
         sources.declare({})
+
+    def test_folders_named_in_the_settings_are_registered_and_followed(self):
+        self.addCleanup(store.declare, {})
+        annex, moved = self.base / "Annex", self.base / "Moved"
+        annex.mkdir()
+        (annex / "lantern.txt").write_text("Copper lantern on the quay.")
+        settings = self.data / "config.toml"
+        settings.write_text(f'[roots.Lamps]\npath = "{annex}"\nremote = "cloud:Lamps"\n'
+                            f'[roots.Absent]\npath = "{self.base}/nowhere"\n'
+                            f'[roots.Room]\npath = "{self.root}"\n')
+        code, _, err = self.run_cli("index")
+        self.assertEqual(code, 0, err)
+        self.assertIn("The folder Absent of the settings cannot be reached now", err)
+        found = {root["name"]: root for root in store.roots(self.db)}
+        self.assertEqual(sorted(found), ["Lamps", "Room"])          # the folder known as Reading Room took its name
+        self.assertEqual((found["Lamps"]["path"], found["Lamps"]["remote"]), (str(annex), "cloud:Lamps"))
+        self.assertIsNone(found["Room"]["remote"])
+        self.assertEqual(search(self.db, "lantern")[0]["path"], str(annex / "lantern.txt"))
+        # The folder moves, the settings follow, and its document is not read again.
+        annex.rename(moved)
+        settings.write_text(f'[roots.Lamps]\npath = "{moved}"\n')
+        with patch("shelffind.extract.passages", side_effect=AssertionError("read again")):
+            self.assertEqual(self.run_cli("index")[0], 0)
+        self.assertEqual(search(self.db, "copper lantern")[0]["path"], str(moved / "lantern.txt"))
+        for text in ('[roots.Lamps]\nremote = "cloud:x"\n', '[roots.Lamps]\npath = 3\n',
+                     '[roots.Lamps]\npath = "/a"\ncolour = "red"\n', '[roots]\nLamps = "/a"\n'):
+            settings.write_text(text)
+            self.assertEqual(self.run_cli("config", "check")[0], 1, text)
 
     def test_check_reports_faults_and_other_commands_go_on_with_the_defaults(self):
         self.assertEqual(self.run_cli("config", "check")[0], 0)
