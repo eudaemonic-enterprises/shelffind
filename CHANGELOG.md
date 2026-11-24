@@ -33,6 +33,17 @@ shared place. A document takes pages only when its files still have the size and
 the inventory saw, and the sources that answer for texts are looked at anew after each round of
 questions. A machine whose journals are not shared writes no card in the shared place.
 
+Only a reading that this version made from the bytes it measured, or took whole, is given:
+pages that versions 0.2 and 0.3 read stay on their machine, whenever they were read. A file
+changed in any way since a run began, or made a link, takes no pages in that run and is read
+there; a copy no longer there holds nothing back. A parcel of its own found changed is read
+twice before it is doubted, and one missing or changed stays named for seven days and fifty
+exchanges while its documents are given again; nothing is deleted. Through rclone, only its
+exit codes 3 and 4 mean that something is not there, and a list of files that cannot be read
+stops the exchange. The comparison of readings rests on a mixing that tells apart readings that
+differ only by which pages are recognised, and each document takes first the reading that
+leaves the fewest pages to recognise. Parcels found whole are kept for the later rounds of a run.
+
 When a file read by version 0.2 joins a document read since, the two readings are joined page by
 page when they have the same pages, and otherwise the one that recognised more pages is kept: a
 page recognised by the earlier version is no longer lost to a shorter reading. In an index

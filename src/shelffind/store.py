@@ -24,8 +24,10 @@ same pass, and `docs.origin` keeps those checksums: no other bytes complete them
 Pages that an earlier version read, when checksums were not kept, stay with the file they were
 read from (`files.read`) and with it alone, until a reading in full of that file ties them to
 its bytes; neither a storage nor a source can do that. Tied so, on the word of the inventory
-that the file did not change, they are marked as such (INHERITED, in `docs.origin`), and are not
-given to other machines.
+that the file did not change, they are marked as such (INHERITED, in `docs.origin`). Only pages
+that this version read from the very bytes it measured, or took whole from another machine, are
+marked as sealed (SEALED), and only those are given to other machines: what an earlier version
+wrote in an index, whenever it wrote it, is never given.
 
 What a source says is believed of a file for as long as no measure refutes it: it is dropped
 when the checksums it gives contradict those of the file, or are those of a document that the
@@ -57,8 +59,8 @@ RETIRED = 101           # the format number of an earlier index once it has been
 KEEP = 30 * 86400       # seconds a document keeps its text after its last file has gone
 SUMS = ("md5:", "sha256:")      # the checksums of a whole file that documents are known by
 INHERITED = "earlier"           # in docs.origin: pages read by an earlier version, tied to bytes measured afterwards
+SEALED = "sealed"               # in docs.origin: pages that this version read from the bytes measured, or took whole
 CONVERTED = "converted_from"    # in the meta of an index converted from version 0.2 (see `migrate`)
-MARKED = "earlier_marked"       # in the meta: the readings that version 0.3 tied are marked (see `mark_earlier`)
 SUM = re.compile(r"(?:md5:[0-9a-f]{32}|sha256:[0-9a-f]{64})\Z")
 
 SCHEMA = """
@@ -649,20 +651,6 @@ def hand_over(db, old, new):
     return came
 
 
-def mark_earlier(db):
-    """Mark, once, the readings of an index converted from version 0.2 that version 0.3 tied to
-    bytes: 0.3 tied them as `by_measure` does, without the mark INHERITED. Nothing in such an index
-    tells them apart from a reading that 0.3 made itself, which is marked as well and is kept
-    from other machines until it is read again. Called before anything else that a run or an
-    exchange does, so that every reading of this version comes after it."""
-    if db.execute("SELECT 1 FROM meta WHERE key=?", (MARKED,)).fetchone():
-        return
-    with db:
-        if db.execute("SELECT 1 FROM meta WHERE key=?", (CONVERTED,)).fetchone():
-            db.execute(f"UPDATE docs SET origin=origin||' {INHERITED}' WHERE origin IS NOT NULL AND instr(origin,?)=0", (INHERITED,))
-        db.execute("INSERT OR REPLACE INTO meta(key,value) VALUES(?,'1')", (MARKED,))
-
-
 def cards(db, doc):
     """Of what the sources said of files of a document that are gone, the latest word of each
     source is the one kept."""
@@ -919,7 +907,8 @@ def take_pages(db, doc, keys, pages, holding=()):
         left = len([row for row in ours if row["needs_ocr"]]) - len(filled)
         state = "indexed" if not left else ("ocr-error" if told["state"] == "ocr-error" else "needs-ocr")
     db.execute("UPDATE docs SET state=?,error=CASE WHEN ?='ocr-error' THEN error END,"
-               "origin=CASE WHEN origin IS NULL THEN ? ELSE origin END WHERE id=?", (state, state, " ".join(sorted(keys)), doc))
+               "origin=CASE WHEN origin IS NULL THEN ? ELSE origin END WHERE id=?",
+               (state, state, " ".join(sorted(keys)) + f" {SEALED}", doc))
     return True
 
 

@@ -35,6 +35,9 @@ MONTH = re.compile(r"\d{4}-\d{2}\Z")
 MONTHS = 3              # journals of this many months are taken from the other machines
 
 
+ABSENT = (3, 4)         # the exit codes by which rclone says that a folder or a file is not there; any other is a failure
+
+
 class Oversized(ValueError):
     """A file of the shared place larger than it should be: refused before it is read."""
 
@@ -118,9 +121,9 @@ class Rclone:
 
     def names(self, folder):
         code, out, err = self.run("lsf", "--files-only", f"{self.remote}/{folder}", seconds=300)
+        if code in ABSENT:
+            return []
         if code:
-            if "not found" in err:
-                return []
             raise ValueError(self.fault(err))
         return sorted(line for line in out.decode("utf-8", "replace").splitlines() if line)
 
@@ -128,25 +131,30 @@ class Rclone:
         """The files of a folder of the shared place, each with what changes when it is
         written: its size and the time of its last change, as the remote tells them."""
         code, out, err = self.run("lsjson", "--files-only", f"{self.remote}/{folder}", seconds=300)
+        if code in ABSENT:
+            return {}
         if code:
-            if "not found" in err:
-                return {}
             raise ValueError(self.fault(err))
         try:
-            listed = json.loads(out or b"[]")
+            listed = json.loads(out)
         except (ValueError, RecursionError):
-            raise ValueError("rclone gave a list of files that cannot be read") from None
-        return {item["Name"]: f"{item.get('Size')}:{item.get('ModTime')}" for item in listed if isinstance(listed, list)
-                and isinstance(item, dict) and isinstance(item.get("Name"), str) and not item.get("IsDir")}
+            listed = None
+        # A list that is not one, or names a file without its size or its date, says nothing of what is
+        # there: it stops the exchange, so that nothing is taken for withdrawn.
+        if not isinstance(listed, list) or not all(isinstance(item, dict) and isinstance(item.get("Name"), str)
+                                                   and type(item.get("Size")) is int and isinstance(item.get("ModTime"), str)
+                                                   for item in listed):
+            raise ValueError("rclone gave a list of files that cannot be read")
+        return {item["Name"]: f"{item['Size']}:{item['ModTime']}" for item in listed if not item.get("IsDir")}
 
     def get(self, name, limit=None):
         """The bytes of a file of the shared place, None when there is none; with `limit`, no
         more than one byte beyond it is read, so that a file larger than that is refused."""
         bound = ["--count", str(limit + 1)] if limit is not None else []
         code, out, err = self.run("cat", *bound, f"{self.remote}/{name}", seconds=600)
+        if code in ABSENT:
+            return None
         if code:
-            if "not found" in err:
-                return None
             raise ValueError(self.fault(err))
         if limit is not None and len(out) > limit:
             raise Oversized(f"{name} is larger than it should be")
@@ -154,7 +162,7 @@ class Rclone:
 
     def delete(self, name):
         code, _, err = self.run("deletefile", f"{self.remote}/{name}", seconds=120)
-        if code and "not found" not in err:
+        if code and code not in ABSENT:
             raise ValueError(self.fault(err))
 
     def put(self, name, data):
@@ -277,12 +285,14 @@ def sync(directory, place, name=None, now=None, journals=True):
         checksum = hashlib.sha256(body).hexdigest()
         # A month already given is given again only when it has grown: the journal of this
         # machine drops its oldest lines when it is full, and what was shared stays shared.
-        if known.get("sha256") == checksum or known.get("lines", 0) > lines:
+        if known.get("sha256") == checksum or (known.get("lines") if type(known.get("lines")) is int else 0) > lines:
             continue
+        check_format(place)                     # a newer ShelfFind may have marked the shared place meanwhile
         place.put(f"history/{me['id']}/{month}.jsonl", body)
         given[month] = {"lines": lines, "sha256": checksum}
         sent += 1
     if journals and (sent or listed.get("name") != me["name"]):
+        check_format(place)
         put_card(place, me["id"], {**listed, "id": me["id"], "name": me["name"],
                                    "updated": int(time.time() if now is None else now), "journals": given})
     # What the others give.

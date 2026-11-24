@@ -24,20 +24,24 @@ if "--count" in rest:                       # rclone cat --count N prints the fi
     del rest[at:at + 2]
 place = [word for word in rest if not word.startswith("--")][0]
 path = os.path.join(os.environ["PRETENDED_REMOTE"], place.split(":", 1)[1])
+def absent(code=3):                         # rclone says that something is not there by its exit code
+    sys.stderr.write("NOTICE: Failed with 2 errors: last error was: directory not found\\n")
+    sys.exit(code)
 if verb == "lsf":
     if not os.path.isdir(path):
-        sys.exit("ERROR : error listing: directory not found")
+        absent()
     print("\\n".join(sorted(n for n in os.listdir(path) if os.path.isfile(os.path.join(path, n)))))
 elif verb == "lsjson":
     if not os.path.isdir(path):
-        sys.exit("ERROR : error listing: directory not found")
+        sys.stdout.write("[\\n")
+        absent()
     import json
     names = sorted(n for n in os.listdir(path) if os.path.isfile(os.path.join(path, n)))
     print(json.dumps([{"Path": n, "Name": n, "Size": os.path.getsize(os.path.join(path, n)), "IsDir": False,
                        "ModTime": str(os.stat(os.path.join(path, n)).st_mtime_ns)} for n in names]))
 elif verb == "cat":
     if not os.path.isfile(path):
-        sys.exit("ERROR : error listing: directory not found")
+        absent()
     with open(path, "rb") as source:
         sys.stdout.buffer.write(source.read(count))
 elif verb == "rcat":
@@ -52,8 +56,9 @@ elif verb == "moveto":
     target = [word for word in rest if not word.startswith("--")][1]
     os.replace(path, os.path.join(os.environ["PRETENDED_REMOTE"], target.split(":", 1)[1]))
 elif verb == "deletefile":
-    if os.path.isfile(path):
-        os.remove(path)
+    if not os.path.isfile(path):
+        absent(4)
+    os.remove(path)
 else:
     sys.exit("unknown command " + verb)
 """

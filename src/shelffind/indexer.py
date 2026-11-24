@@ -507,7 +507,8 @@ def update_text(db, root, row, ocr, languages, wanted=None, hold=None, offered=N
                 fuzzy.remember_text(db, (p.text for p in pages))
                 db.executemany("INSERT INTO pages(doc,page,section,ztext,needs_ocr) VALUES(?,?,?,?,?)",
                                [(doc, p.page, p.section, store.deflate(p.text), p.needs_ocr) for p in pages])
-                db.execute("UPDATE docs SET state=?,error=NULL,origin=? WHERE id=?", (state, " ".join(measured), doc))
+                db.execute("UPDATE docs SET state=?,error=NULL,origin=? WHERE id=?",
+                           (state, " ".join(measured) + f" {store.SEALED}", doc))
                 db.execute("UPDATE files SET read=0 WHERE doc=?", (doc,))
                 db.execute("UPDATE files SET read=1 WHERE id=?", (file["id"],))
     return True
@@ -541,7 +542,6 @@ def build(db, directory, selected, *, names_only=False, ocr=False, languages="en
     done = failures = 0
     ready = []
     with store.index_lock(directory):
-        store.mark_earlier(db)                  # what version 0.3 tied stays on this machine
         if callable(selected):
             selected = selected()
         for root in selected:
