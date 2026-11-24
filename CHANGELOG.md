@@ -62,7 +62,8 @@ is read since wait for their text from the next inventory on, and the documents 
 no longer read, a converter removed from the settings, go back to their names.
 
 Machines. The line of `status` on the machines also says when this data folder last exchanged
-texts, apart from the journals. The settings can name the machines by label, `[machines] LABEL = "office"`, so that
+texts, apart from the journals, and a reading that begins again remembers how long the last
+exchange took, so that it does not begin with another at once. The settings can name the machines by label, `[machines] LABEL = "office"`, so that
 one shared file names them all although they call themselves by one hostname; the line of
 `status` and the command `machine` show that name.
 

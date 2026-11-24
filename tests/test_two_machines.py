@@ -1646,6 +1646,25 @@ class Turns(Two):
         (machine_["data"] / parcels.TEXTS).write_text("{")
         self.assertIsNone(sharing.texts_last(machine_["data"]))
 
+    def test_a_run_that_begins_again_remembers_how_long_the_last_exchange_took(self):
+        self.shelf()
+        machine_ = self.machines["office"]
+        with self.at("office"):
+            first = parcels.Exchange(machine_["data"], machine_["db"], sharing.Folder(self.shared))
+        self.assertEqual(first.took, 0.0)
+        now = [time.monotonic()]
+        with patch("shelffind.parcels.time.monotonic", side_effect=lambda: now[0]), \
+                patch.object(first, "receive", side_effect=lambda: now.__setitem__(0, now[0] + 90)):
+            self.assertTrue(first.run("receive"))
+        with self.at("office"):
+            second = parcels.Exchange(machine_["data"], machine_["db"], sharing.Folder(self.shared))
+        self.assertEqual(round(second.took), 90)
+        for bad in ("{", '{"took": "long"}', '{"took": -5}', '{"took": 99999}'):
+            (machine_["data"] / parcels.TEXTS).write_text(bad)
+            with self.at("office"):
+                again = parcels.Exchange(machine_["data"], machine_["db"], sharing.Folder(self.shared))
+            self.assertEqual(again.took, 600.0 if "99999" in bad else 0.0)
+
     def test_a_long_exchange_leaves_most_of_the_time_to_reading(self):
         self.shelf()
         machine_ = self.machines["office"]

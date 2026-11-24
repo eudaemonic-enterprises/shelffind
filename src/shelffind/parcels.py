@@ -307,7 +307,7 @@ class Exchange:
         self.directory.mkdir(mode=0o700, parents=True, exist_ok=True)
         me = machine.identity(self.directory, name)
         self.label, self.writer, self.name = me["id"], me["writer"], me["name"]
-        self.last, self.took = time.monotonic(), 0.0
+        self.last, self.took = time.monotonic(), self.remembered()
         self.counts = dict.fromkeys(("sent", "received", "damaged", "newer", "skipped"), 0)
         self.learnt = 0                         # documents that pages offered made known by more checksums
         self.sources = None
@@ -373,6 +373,16 @@ class Exchange:
         finally:
             self.db.execute("DETACH DATABASE exchange")
 
+    def remembered(self):
+        """How long the last exchange of this data folder took, from the run before, so that a run
+        that begins again does not exchange at once: at most ten minutes are believed."""
+        try:
+            told = json.loads((self.directory / TEXTS).read_text())
+            took = told.get("took") if isinstance(told, dict) else None
+            return min(float(took), 600.0) if type(took) in (int, float) and took > 0 else 0.0
+        except (OSError, ValueError):
+            return 0.0
+
     def due(self):
         """True when the last exchange is old enough for another during a reading: EVERY seconds
         after its end, or SHARE times as long as it took when that is longer, since an exchange
@@ -417,7 +427,7 @@ class Exchange:
         self.took = time.monotonic() - began
         self.last = time.monotonic()
         try:
-            machine.write(self.directory, {"at": int(time.time())}, TEXTS)    # what `status` says of the last exchange
+            machine.write(self.directory, {"at": int(time.time()), "took": round(self.took, 1)}, TEXTS)   # for `status`, and the next run
         except OSError:
             pass
         return True
