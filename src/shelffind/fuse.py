@@ -22,34 +22,44 @@ def document(db, name, row, only=None):
 
     The checksums of the result come first, all of them together and whatever their order:
     they are those of the bytes the source holds now, while its reference may have been given
-    to a file of the folders that held other bytes. The reference serves when no checksum is
-    known here. The same work, or the same bytes, may be kept under several formats, each a
-    document of its own: the one of the format of the result is preferred, then one known by a
-    measure, then one that has a file. With `only`, the format the search is limited to, no
-    document of another format stands for the result."""
+    to a file of the folders that held other bytes. They are taken as a statement of a source
+    is (`store.checksums`): well formed, and one of each kind at most. The reference serves
+    when no checksum is known here.
+
+    No document stands for a result that describes other bytes: one of another size, when the
+    result gives a size; one that is known, by a measure or on the word of a source, by another
+    checksum of a kind the result gives; and, by the reference, one of which the source gave
+    other checksums when it named it. The result is then shown as what the source holds, with
+    no file of the folders.
+
+    The same work, or the same bytes, may be kept under several formats, each a document of its
+    own: the one of the format of the result is preferred, then one known by a measure, then
+    one that has a file. With `only`, the format the search is limited to, no document of
+    another format stands for the result."""
     wanted = str(row.get("format") or "").lower().lstrip(".")
     only = str(only).lower().lstrip(".") if only else None
+    size = row.get("size") if type(row.get("size")) is int else None
+    keys = store.checksums(row.get("keys"))
     filed = "EXISTS (SELECT 1 FROM files f WHERE f.doc=d.id) AS filed"
 
     def best(found):
-        found = [one for one in found if only is None or one["format"] == only]
-        if not found:
+        fitting = [one for one in found if (only is None or one["format"] == only)
+                   and (size is None or one["size"] == size)
+                   and not store.against(keys, store.keys_of(db, one["doc"]))
+                   and not store.against(keys, (one["said"] or "").split())]
+        if not fitting:
             return None
-        return min(found, key=lambda one: (one["format"] != wanted, not one["measured"], not one["filed"], one["doc"]))["doc"]
+        return min(fitting, key=lambda one: (one["format"] != wanted, not one["measured"], not one["filed"], one["doc"]))["doc"]
 
-    keys = [str(key) for key in row.get("keys") or ()]
     found = []
     for key in keys:
-        found += db.execute(f"SELECT k.doc,d.format,k.basis='content' AS measured,{filed} FROM doc_keys k "
+        found += db.execute(f"SELECT k.doc,d.format,d.size,k.basis='content' AS measured,NULL AS said,{filed} FROM doc_keys k "
                             "JOIN docs d ON d.id=k.doc WHERE k.key=?", (key,)).fetchall()
     known = best(found)
     if known is None:
-        # By its reference, unless the checksums of the result are measured not to be those of
-        # the document that the reference was given to: the work has changed at the source.
-        known = best([one for one in db.execute(
-            f"SELECT r.doc,d.format,0 AS measured,{filed} FROM records r JOIN docs d ON d.id=r.doc "
-            "WHERE r.source=? AND r.ref=?", (name, row["id"])).fetchall()
-            if not store.against(keys, store.keys_of(db, one["doc"], "content"))])
+        known = best(db.execute(
+            f"SELECT r.doc,d.format,d.size,0 AS measured,r.keys AS said,{filed} FROM records r JOIN docs d ON d.id=r.doc "
+            "WHERE r.source=? AND r.ref=?", (name, row["id"])).fetchall())
     return known
 
 

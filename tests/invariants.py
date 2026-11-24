@@ -8,6 +8,9 @@ agree only when the placing of the files does not depend on the order of the eve
 
 The rules are written here on their own, without the functions of the program under test. The
 histories they are used on never give two different files one MD5."""
+import sqlite3
+
+READABLE = {"pdf", "djvu", "ps", "ps.gz", "epub", "txt", "md", "rst", "tex"}     # the formats a reading is tried on
 
 
 def kinds(keys):
@@ -83,6 +86,17 @@ def structure(db):
 
     for broken in db.execute("PRAGMA foreign_key_check").fetchall():
         found.append(f"a reference to nothing: {tuple(broken)}")
+    # What a search finds is what the pages and the names hold: SQLite compares the two itself.
+    busy = db.in_transaction
+    for table in ("passages", "names"):
+        try:
+            db.execute(f"INSERT INTO {table}({table},rank) VALUES('integrity-check',1)")
+        except sqlite3.DatabaseError as fault:
+            found.append(f"the search index {table} does not hold what its table holds: {fault}")
+    if not busy:
+        db.rollback()
+    for row in db.execute("SELECT key FROM meta WHERE key LIKE 'copies:%'"):
+        found.append(f"a folder of copies is still named once the run has ended: {row['key']}")
     for doc, held in keys.items():
         if doc not in docs:
             found.append(f"keys of a document that is not there: {doc}")
@@ -132,11 +146,18 @@ def structure(db):
                 found.append(f"document {doc} is {told['state']} and has no pages")
             if told["origin"] is not None:
                 found.append(f"document {doc} has no pages and keeps the checksums of some")
+        if (told["state"] == "name-only") != (told["format"] not in READABLE):
+            found.append(f"document {doc}, of the format {told['format']}, is {told['state']}")
         if not inside:
             if not (count or db.execute("SELECT 1 FROM records WHERE doc=? LIMIT 1", (doc,)).fetchone()):
                 found.append(f"document {doc} has no file, no pages and no record")
             if told["gone"] is None:
                 found.append(f"document {doc} has no file and is not marked as gone")
+            if source(doc):
+                found.append(f"document {doc} has no file and is known on the word of a source")
+        several = db.execute("SELECT source FROM records WHERE doc=? AND file IS NULL GROUP BY source HAVING count(*)>1", (doc,)).fetchone()
+        if several:
+            found.append(f"document {doc} keeps two words of {several['source']} about files that are gone")
         best = db.execute("SELECT title,byline,year FROM records WHERE doc=? AND coalesce(title,'')!='' "
                           "ORDER BY text DESC,source,id LIMIT 1", (doc,)).fetchone()
         if (told["title"], told["byline"], told["year"]) != (tuple(best) if best else (None, None, None)):
@@ -175,8 +196,8 @@ def structure(db):
             found.append(f"record {record['id']} keeps its checksums in the order they came")
         if record["file"] is None:
             told = docs[record["doc"]]
-            if not keys.get(record["doc"]):
-                found.append(f"record {record['id']} of a file that is gone stays with a document known by nothing")
+            if not set(given) & set(content(record["doc"])):
+                found.append(f"record {record['id']} of a file that is gone is kept although no measure proved it")
             elif refuted(db, told["size"], told["format"], sorted({*given, *content(record["doc"])}))[0]:
                 found.append(f"record {record['id']} of a file that is gone is kept although a measure refutes it")
             continue

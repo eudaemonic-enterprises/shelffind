@@ -11,7 +11,6 @@ What a source says is its word, and is taken as such (see `store`): it places a 
 never measured, and nothing else. A word that a measure refutes is not kept.
 """
 import json
-import re
 import time
 from pathlib import Path
 
@@ -24,15 +23,13 @@ WAITING = ("pending", "error", "needs-ocr", "ocr-error")
 # own pages say of it.
 RESTORED = ("CASE WHEN EXISTS (SELECT 1 FROM pages p WHERE p.doc=docs.id AND p.needs_ocr=1) THEN 'needs-ocr' "
             "WHEN EXISTS (SELECT 1 FROM pages p WHERE p.doc=docs.id) THEN 'indexed' ELSE 'pending' END")
-SUM = re.compile(r"(?:md5:[0-9a-f]{32}|sha256:[0-9a-f]{64})\Z")
 ASKED = "instr(' '||asked||' ',?)"      # with ' NAME ' for parameter: whether the source NAME was asked about a file
 
 
 def checksums(record):
     """The checksums a record gives, when they are well formed and one of each kind at most:
     two checksums of one kind in one record describe no file."""
-    given = sorted({key for key in record.get("keys") or () if isinstance(key, str) and SUM.match(key)})
-    return given if len({key.split(":", 1)[0] for key in given}) == len(given) else []
+    return store.checksums(record.get("keys"))
 
 
 def say(db, file, name, record, known=None):

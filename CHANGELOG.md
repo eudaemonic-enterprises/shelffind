@@ -24,12 +24,14 @@ by the checksum of its storage or by one reading; a statement without checksum o
 
 A document is read from a copy of its file made on this machine in one pass, during which the
 checksums are computed: the pages kept are those of the very bytes the checksums describe, and
-only a file measured to hold these bytes completes them. The copies are made in the data folder of
-ShelfFind and removed after use. A copy that contradicts the checksum
-of the storage is made a second time. A failed reading is the fault of the document that the
+only a file measured to hold these bytes completes them. The copies are made in a folder that
+each run makes for itself in the data folder of ShelfFind, which the index names and which is
+removed after use; nothing is removed that the index does not name. A copy that contradicts the
+checksum of the storage is made a second time. A failed reading is the fault of the document that the
 file holds, and a file that cannot be copied leaves the document to its other files. An
 inventory alone opens no file. A document whose last file has gone keeps its text for a month,
-with what the sources said of its bytes.
+with what the sources said of its bytes as far as a measure had proved it; anything else that
+was said of a file goes with it.
 
 Sources speak a second, richer version of their exchange, described in `docs/sources.md`, with
 a helper of one file for writing one and `shelffind sources check NAME` for trying one. A

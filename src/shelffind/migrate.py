@@ -32,24 +32,57 @@ from . import __version__, fuzzy, history, store
 
 RETIRED = store.RETIRED         # the format number an old index receives once it has been converted
 ORIGIN = "converted_from"       # in the new index: the print of the old index it was made from
-# What an index of versions 0.1 and 0.2 holds, and nothing else: its tables with their columns,
-# the tables that SQLite keeps beside the three tables of words, its indexes and its triggers.
-# What is not in this layout would be neither converted nor counted in the print of the index.
-LAYOUT = {
-    "roots": ("id", "path", "mount", "scanned", "problem"),
-    "files": ("id", "root", "rel", "name", "folded", "format", "size", "mtime", "state", "error"),
-    "pages": ("id", "file", "page", "section", "text", "needs_ocr"),
-    "history": ("query", "used"),
-    "words": ("term",),
-    "names": ("name", "folder"),
-    "passages": ("text",),
-    "spelling": ("grams",),
-}
-BESIDE = {"names_config", "names_content", "names_data", "names_docsize", "names_idx",
-          "passages_config", "passages_data", "passages_docsize", "passages_idx",
-          "spelling_config", "spelling_data", "spelling_docsize", "spelling_idx"}
-OTHERS = {"index:files_state", "index:pages_file", "trigger:files_ad", "trigger:pages_ad", "trigger:pages_ai",
-          "trigger:pages_au", "trigger:words_ai"}
+# What versions 0.1 and 0.2 declared when they created their index, word for word. An earlier
+# index is converted, and later deleted, only when it declares exactly this: what an index
+# declared beyond it would be neither converted nor kept.
+EARLIER = """
+CREATE TABLE roots (
+    id INTEGER PRIMARY KEY, path TEXT NOT NULL UNIQUE, mount TEXT NOT NULL,
+    scanned TEXT, problem TEXT
+);
+CREATE TABLE files (
+    id INTEGER PRIMARY KEY, root INTEGER NOT NULL REFERENCES roots ON DELETE CASCADE,
+    rel TEXT NOT NULL, name TEXT NOT NULL, folded TEXT NOT NULL, format TEXT NOT NULL, size INTEGER NOT NULL,
+    mtime INTEGER NOT NULL, state TEXT NOT NULL, error TEXT, UNIQUE(root, rel)
+);
+CREATE INDEX files_state ON files(state, id);
+CREATE VIRTUAL TABLE names USING fts5(name, folder, tokenize='unicode61 remove_diacritics 2');
+CREATE TRIGGER files_ad AFTER DELETE ON files BEGIN
+    DELETE FROM names WHERE rowid=old.id;
+END;
+CREATE TABLE pages (
+    id INTEGER PRIMARY KEY, file INTEGER NOT NULL REFERENCES files ON DELETE CASCADE,
+    page INTEGER, section TEXT, text TEXT NOT NULL, needs_ocr INTEGER NOT NULL
+);
+CREATE INDEX pages_file ON pages(file);
+CREATE VIRTUAL TABLE passages USING fts5(text, content='pages', content_rowid='id',
+    tokenize='unicode61 remove_diacritics 2');
+CREATE TRIGGER pages_ai AFTER INSERT ON pages BEGIN
+    INSERT INTO passages(rowid,text) VALUES(new.id,new.text);
+END;
+CREATE TRIGGER pages_ad AFTER DELETE ON pages BEGIN
+    INSERT INTO passages(passages,rowid,text) VALUES('delete',old.id,old.text);
+END;
+CREATE TRIGGER pages_au AFTER UPDATE OF text ON pages BEGIN
+    INSERT INTO passages(passages,rowid,text) VALUES('delete',old.id,old.text);
+    INSERT INTO passages(rowid,text) VALUES(new.id,new.text);
+END;
+CREATE TABLE words (term TEXT NOT NULL UNIQUE);
+CREATE VIRTUAL TABLE spelling USING fts5(grams,content='');
+CREATE TRIGGER words_ai AFTER INSERT ON words BEGIN
+    INSERT INTO spelling(rowid,grams) VALUES(new.rowid,word_grams(new.term));
+END;
+CREATE TABLE history (query TEXT PRIMARY KEY, used INTEGER NOT NULL);
+"""
+# The tables that SQLite keeps beside the three tables of words, with their columns. Their
+# definitions are SQLite's own and may be worded differently from one of its versions to
+# another: they are known by their columns.
+BESIDE = {f"{table}_{part}": columns
+          for table, parts in (("names", "config content data docsize idx"), ("passages", "config data docsize idx"),
+                               ("spelling", "config data docsize idx"))
+          for part, columns in (("config", ("k", "v")), ("content", ("id", "c0", "c1")), ("data", ("id", "block")),
+                                ("docsize", ("id", "sz")), ("idx", ("segid", "term", "pgno"))) if part in parts.split()}
+DECLARED = {}           # (kind, name) -> definition, from EARLIER, worked out at the first question
 
 
 def refuse_development(directory):
@@ -70,13 +103,24 @@ def rows(old, question):
         cursor.close()
 
 
+def plain(sql):
+    """A definition without what does not change its meaning: spaces, line breaks, capitals."""
+    return "".join((sql or "").split()).casefold()
+
+
 def print_of(old):
-    """A print of everything an old index holds: its folders, its files, every page with its
-    place and its text, and the searches it remembers. It is the same as long as nothing is
-    added to the old index, taken from it or changed in it."""
+    """A print of everything an old index holds: every row of every table, in the order of its
+    key, those that SQLite keeps beside the tables of words included. It is the same as long as
+    nothing is added to the old index, taken from it or changed in it, wherever it is kept."""
     told = hashlib.sha256()
-    for question in ("SELECT * FROM roots ORDER BY id", "SELECT * FROM files ORDER BY id",
-                     "SELECT * FROM pages ORDER BY id", "SELECT * FROM history ORDER BY query,used"):
+    with rows(old, "SELECT name,sql FROM sqlite_master WHERE type='table' ORDER BY name") as tables:
+        names = [row[0] for row in tables if not row[0].startswith("sqlite_") and not plain(row[1]).startswith("createvirtualtable")]
+    for name in names:
+        quoted = '"' + name.replace('"', '""') + '"'
+        with rows(old, f"PRAGMA table_xinfo({quoted})") as columns:
+            key = [row[1] for row in sorted((row for row in columns if row[5]), key=lambda row: row[5])]
+        order = ",".join('"' + column.replace('"', '""') + '"' for column in key) or "rowid"
+        question = f"SELECT * FROM {quoted} ORDER BY {order}"
         told.update(question.encode())
         with rows(old, question) as found:
             for row in found:
@@ -111,31 +155,55 @@ def exclusively(old):
     version = old.execute("PRAGMA user_version").fetchone()[0]
     unknown = strangers(old)
     if version not in (1, RETIRED) or unknown:
-        what = f"is not laid out as versions 0.1 and 0.2 make it ({', '.join(unknown[:6])})" if unknown else f"has the format {version}"
+        what = f"is not laid out as versions 0.1 and 0.2 made it ({', '.join(unknown[:6])})" if unknown else f"has the format {version}"
         raise ValueError(f"The earlier index {what}: it is not an index that this version can convert, "
                          "and it is left as it is")
 
 
 def strangers(old):
-    """What an old index holds beyond, or short of, the layout of versions 0.1 and 0.2: a table,
-    a column, an index, a trigger or a view of its own, or one that is missing. Such an index
-    is not converted, since what the layout does not name would be lost, and it is not deleted."""
+    """How an old index differs from what versions 0.1 and 0.2 made: a table, a column, an
+    index, a trigger or a view of its own; one that is missing; one that is not defined as
+    those versions defined it. Such an index is not converted, since what it holds beyond
+    their layout would be lost, and it is not deleted."""
+    if not DECLARED:
+        model = sqlite3.connect(":memory:")
+        try:
+            model.create_function("word_grams", 1, fuzzy.grams, deterministic=True)
+            model.executescript(EARLIER)
+            DECLARED.update({(row[0], row[1]): plain(row[2]) for row in model.execute("SELECT type,name,sql FROM sqlite_master")
+                             if not row[1].startswith("sqlite_") and row[1] not in BESIDE})
+        finally:
+            model.close()
     found, seen = [], set()
-    with rows(old, "SELECT type,name FROM sqlite_master ORDER BY type,name") as objects:
-        listed = [(row[0], row[1]) for row in objects]
-    for kind, name in listed:
+    with rows(old, "SELECT type,name,sql FROM sqlite_master ORDER BY type,name") as objects:
+        listed = [(row[0], row[1], row[2]) for row in objects]
+    for kind, name, sql in listed:
         if name.startswith("sqlite_"):
             continue                                # kept by SQLite itself
-        if kind == "table" and name in LAYOUT:
-            seen.add(name)
-            with rows(old, f"PRAGMA table_info({name})") as columns:
-                held = tuple(row[1] for row in columns)
-            if held != LAYOUT[name]:
-                found.append(f"the columns of {name}")
-        elif not ((kind == "table" and name in BESIDE) or f"{kind}:{name}" in OTHERS):
+        if kind == "table" and name in BESIDE:
+            seen.add((kind, name))
+            with rows(old, f"PRAGMA table_xinfo({name})") as columns:
+                if tuple(row[1] for row in columns) != BESIDE[name]:
+                    found.append(f"the columns of {name}")
+        elif (kind, name) not in DECLARED:
             found.append(f"the {kind} {name}")
-    found += [f"no table {name}" for name in sorted(set(LAYOUT) - seen)]
+        else:
+            seen.add((kind, name))
+            if plain(sql) != DECLARED[(kind, name)]:
+                found.append(f"the definition of the {kind} {name}")
+    wanted = set(DECLARED) | {("table", name) for name in BESIDE}
+    found += [f"no {kind} {name}" for kind, name in sorted(wanted - seen)]
     return found
+
+
+def beyond(old):
+    """What an old index holds that a conversion does not carry over, though it is laid out as
+    versions 0.1 and 0.2 laid it out: names that belong to no file. The lists of names and of
+    words are made anew from the files and the pages, so an entry of theirs that has no file
+    would be nowhere in the new index."""
+    with rows(old, "SELECT count(*) FROM names_content WHERE id NOT IN (SELECT id FROM files)") as found:
+        stray = found.fetchone()[0]
+    return [f"{stray:,} names that belong to no file"] if stray else []
 
 
 def searches(old):
@@ -204,20 +272,21 @@ def origin(directory):
 
 
 def usable(target):
-    """Raise unless the new index is one that this version can use. An index made by a trial
-    of this version is not: the earlier index kept beside it is then the only one from which
-    this version can start again, and must not be taken for a leftover."""
+    """Raise unless the new index is one that this version can use: of its format, and laid out
+    as it lays its index out. An index made by a trial of this version is not: the earlier
+    index kept beside it is then the only one from which this version can start again, and
+    must not be taken for a leftover."""
     try:
         new = sqlite3.connect(target.as_uri() + "?mode=ro", uri=True, timeout=30)
         try:
             version = new.execute("PRAGMA user_version").fetchone()[0]
+            fits = store.suits(new)
         finally:
             new.close()
     except sqlite3.Error as fault:
         raise ValueError(f"The new index cannot be read ({fault}): {target}") from None
-    if version != store.FORMAT:
-        raise ValueError(f"{target} was not made by this version (format {version}) and cannot be used: move it away; "
-                         "the earlier index kept beside it, if any, is then converted again")
+    if not fits:
+        raise store.unusable(target, version)
 
 
 def upgrade(directory, progress=lambda text: None, wait=20.0):
@@ -340,6 +409,10 @@ def discard_old(directory, wait=5.0):
             if not same:
                 raise ValueError("The earlier index holds something the new one was not made from: it is kept. "
                                  "Move the file away yourself once you are sure it is no longer wanted")
+            left = beyond(old)
+            if left:
+                raise ValueError(f"The earlier index holds what a conversion does not carry over ({', '.join(left)}): "
+                                 "it is kept. Move the file away yourself once you are sure it is no longer wanted")
             # The journal may have been lost since the conversion, with a folder restored in
             # part: the searches go into it once more, which changes nothing when they are there.
             if not history.absorb(directory, asked):

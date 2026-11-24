@@ -2,6 +2,7 @@
 """A text is attached to a file only on the evidence of its content: the cases in which a
 likeness of name, size or date could mislead, and those in which two kinds of evidence meet."""
 import fcntl
+import json
 import os
 import shutil
 import time
@@ -771,10 +772,11 @@ class Reading2(Evidence):
     def test_a_reading_in_full_that_fails_is_said_and_tried_again(self):
         old = self.write("old.txt")
         self.build(names_only=True)
-        with self.db:                                       # a source described the work by its checksum
+        with self.db:                                       # the file was measured, and a source described the work by its checksum
             row = self.db.execute("SELECT size,mtime FROM files").fetchone()
-            link.say(self.db, self.ids()["old.txt"], "library",
-                        {"id": "W1", "keys": [indexer.whole_checksums(old, row)[1]], "title": "Archived Work"}, set())
+            measured = indexer.whole_checksums(old, row)
+            indexer.joined(self.db, self.ids()["old.txt"], measured)
+            link.say(self.db, self.ids()["old.txt"], "library", {"id": "W1", "keys": [measured[1]], "title": "Archived Work"}, set())
         target = self.root / "refiled.txt"
         shutil.copyfile(old, target)                        # the same bytes under a new name and date
         old.unlink()
@@ -899,6 +901,24 @@ class Storage(Evidence):
         with patch.dict(os.environ, {"PATH": f"{folder}{os.pathsep}{os.environ['PATH']}"}):
             self.assertEqual(indexer.stored_checksums("twin:", [row]), {})      # the checksum is of the later file
         self.assertEqual(len(count.read_text().split()), 2)
+
+    def test_an_answer_is_read_line_by_line_whatever_an_address_holds(self):
+        # A line of the answer ends with a line feed, and with nothing else: an address may
+        # hold a character that some programs take for the end of a line.
+        long = "plain.txt\u2028second.txt"
+        rows = [{"rel": rel, "size": 9, "mtime": 1_700_000_000 * 10**9}
+                for rel in ("plain.txt", long, "next\u0085line.txt", "form\x0cfeed.txt", "tab\x0bbed.txt")]
+        sums = {row["rel"]: f"{number:032x}" for number, row in enumerate(rows, 1)}
+        listing = json.dumps([{"Path": row["rel"], "Size": 9, "ModTime": "2023-11-14T22:13:20Z"} for row in rows], ensure_ascii=False)
+        with self.rclone(listing, "\n".join(f"{sums[row['rel']]}  {row['rel']}" for row in rows)):
+            self.assertEqual(indexer.stored_checksums("twin:", rows), {rel: "md5:" + word for rel, word in sums.items()})
+
+    def test_an_address_answered_for_twice_is_not_answered_for(self):
+        rows = [{"rel": rel, "size": 9, "mtime": 1_700_000_000 * 10**9} for rel in ("a.txt", "b.txt")]
+        listing = json.dumps([{"Path": row["rel"], "Size": 9, "ModTime": "2023-11-14T22:13:20Z"} for row in rows])
+        told = "\n".join((f"{1:032x}  a.txt", f"{2:032x}  b.txt", f"{3:032x}  a.txt"))
+        with self.rclone(listing, told):
+            self.assertEqual(indexer.stored_checksums("twin:", rows), {"b.txt": f"md5:{2:032x}"})
 
     def test_a_storage_that_gives_no_answer_is_not_taken_for_one_that_knows_nothing(self):
         row = {"rel": "a/book.txt", "size": 9, "mtime": 1_700_000_000 * 10**9}

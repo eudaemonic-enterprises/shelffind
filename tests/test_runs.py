@@ -3,6 +3,7 @@
 is removed, what stops a run and what is counted, and what a run must not leave for the next."""
 import errno
 import os
+import shutil
 import tempfile
 import unittest
 from pathlib import Path
@@ -33,28 +34,110 @@ class Copies(Placing):
         self.assertEqual((mine / "notes.txt").read_text(), OTHER)
         self.assertEqual(len(search(self.db, "southern capes")), 1)
 
-    def test_the_copies_are_made_in_the_data_folder_and_removed_with_what_an_earlier_run_left(self):
-        left = self.data / "copies" / "copy-left-behind"
-        left.mkdir(parents=True)
-        (left / "book.pdf").write_text("left by a run that was cut short")
+    def named(self, name):
+        """A folder that the index names as one in which a run made its copies."""
+        (self.data / name).mkdir()
+        with self.db:
+            self.db.execute("INSERT INTO meta(key,value) VALUES(?,?)", (f"copies:{name}", name))
+        return self.data / name
+
+    def test_the_copies_are_made_in_a_folder_of_the_run_and_what_an_earlier_run_left_is_removed(self):
+        left = self.named("copies-leftover")                # as a run that was cut short left it
+        (left / "copy-left-behind").mkdir()
+        (left / "copy-left-behind" / "book.pdf").write_text("left by a run that was cut short")
+        mine = self.data / "copies"                         # a folder of the reader's own, which the index does not name
+        mine.mkdir()
+        (mine / "notes.txt").write_text("mine")
         self.write("book.txt")
         real, held = indexer.private_copy, []
 
         def watching(path, row, hold, known=None):
-            held.append((hold.parent, left.exists()))
+            held.append((hold.parent.parent, hold.parent.name.startswith("copies-"), left.exists()))
             return real(path, row, hold, known)
 
         with patch("shelffind.indexer.private_copy", side_effect=watching):
             self.assertEqual(self.build(), (1, 0))
-        self.assertEqual(held, [(self.data / "copies", False)])     # made there, after the leftover was removed
-        self.assertFalse((self.data / "copies").exists())           # and nothing is left of this run
+        self.assertEqual(held, [(self.data, True, False)])  # in the data folder, after the leftover was removed
+        self.assertEqual(sorted(path.name for path in self.data.glob("copies*")), ["copies"])      # nothing is left of this run
+        self.assertEqual((mine / "notes.txt").read_text(), "mine")
+        self.assertEqual(self.db.execute("SELECT count(*) FROM meta WHERE key LIKE 'copies:%'").fetchone()[0], 0)
 
     def test_an_inventory_makes_no_copy_and_removes_none(self):
-        left = self.data / "copies" / "copy-of-a-run-at-work"
-        left.mkdir(parents=True)
+        left = self.named("copies-at-work")
         self.write("book.txt")
         self.assertEqual(self.build(names_only=True), (0, 0))
         self.assertTrue(left.exists())
+
+    def test_nothing_is_removed_that_is_not_a_folder_of_copies_in_the_data_folder(self):
+        outside = self.base / "kept"
+        outside.mkdir()
+        (outside / "note.txt").write_text("mine")
+        (self.data / "copies-link").symlink_to(outside)     # a link that leads out of the data folder
+        papers = self.data / "papers"
+        papers.mkdir()
+        (papers / "note.txt").write_text("mine")
+        with self.db:                                       # an index that names what no run made
+            self.db.executemany("INSERT INTO meta(key,value) VALUES(?,?)",
+                                [("copies:copies-link", "copies-link"), ("copies:../kept", "../kept"),
+                                 ("copies:papers", "papers"), ("copies:copies-x", "papers")])
+        self.write("book.txt")
+        self.assertEqual(self.build(), (1, 0))
+        self.assertEqual(((outside / "note.txt").read_text(), (papers / "note.txt").read_text()), ("mine", "mine"))
+        self.assertTrue((self.data / "copies-link").is_symlink())
+
+    def test_copies_that_cannot_be_removed_are_said_and_removed_by_a_later_run(self):
+        self.write("book.txt")
+        said = []
+        with patch("shelffind.indexer.shutil.rmtree", side_effect=lambda *args, **kwargs: None):
+            done = indexer.build(self.db, self.data, store.roots(self.db), progress=said.append)
+        self.assertEqual((done, sum("could not be removed" in line for line in said)), ((1, 1), 1))
+        self.assertEqual(self.db.execute("SELECT state FROM docs").fetchone()[0], "indexed")       # the document is read all the same
+        self.assertEqual(len(list(self.data.glob("copies-*"))), 1)
+        self.assertEqual(self.build(), (0, 0))
+        self.assertEqual(list(self.data.glob("copies-*")), [])
+
+    def test_a_copy_that_cannot_be_closed_stops_the_reading_and_no_document_is_said_to_have_failed(self):
+        self.write("book.txt")
+        real = open
+
+        class Full:
+            """A copy whose last bytes find no room when it is closed."""
+
+            def __init__(self, target):
+                self.target = target
+
+            def write(self, block):
+                return self.target.write(block)
+
+            def close(self):
+                self.target.close()
+                raise OSError(errno.ENOSPC, "No space left on device")
+
+        with patch("shelffind.indexer.open", create=True, side_effect=lambda path, mode, buffering: Full(real(path, mode, buffering=buffering))):
+            self.assertEqual(self.build(), (0, 1))
+        self.assertEqual(self.db.execute("SELECT state FROM docs").fetchone()[0], "pending")
+        self.assertEqual(self.build(), (1, 0))              # with room again, an ordinary run reads it
+
+    def test_a_folder_cannot_be_moved_through_the_settings_into_the_data_folder_or_into_another_folder(self):
+        self.write("chapter.txt")
+        self.build()
+        inside = self.data / "copies-mine"
+        inside.mkdir()
+        (inside / "chapter.txt").write_text(OTHER)
+        annex = self.base / "Annex"
+        (annex / "shelf").mkdir(parents=True)
+        self.run_cli("roots", "add", str(annex))
+        self.addCleanup(store.declare, {})
+        for target, reason in ((inside, "Choose a document directory"), (annex / "shelf", "Overlapping root")):
+            store.declare({"Reading Room": {"path": str(target)}})
+            said = []
+            store.adopt_declared(self.db, self.data, said.append)
+            self.assertTrue(any(reason in line for line in said), said)
+            self.assertEqual(store.roots(self.db, "Reading Room")[0]["path"], str(self.root))
+        store.declare({})
+        self.assertEqual(self.build(), (0, 0))
+        self.assertEqual((inside / "chapter.txt").read_text(), OTHER)
+        self.assertEqual(names(self.db, "northern harbours"), ["Reading Room/chapter.txt"])
 
     def test_without_room_for_a_copy_the_reading_stops_and_no_document_is_said_to_have_failed(self):
         self.write("a/book.txt")
@@ -158,6 +241,44 @@ class Passes(Placing):
                 patch("shelffind.indexer.settle", side_effect=settling):
             self.assertEqual(self.build(names_only=True), (0, 0))
         self.assertEqual(len(settled), 7)
+
+    def test_a_file_only_measured_by_a_pass_is_read_by_the_same_run_when_its_document_comes_to_wait(self):
+        elsewhere = self.base / "elsewhere"
+        elsewhere.mkdir()
+        self.twin(elsewhere)                                # a storage that answers, and holds none of the files
+        one = self.write("a/book.txt")
+        self.build(names_only=True)
+        self.measure("a/book.txt")
+        told = {"a/book.txt": {"id": "W1", "keys": self.sums(one), "title": "Held Elsewhere", "text": True}}
+        self.sources(lambda name, path: next((record for rel, record in told.items() if path.endswith(rel)), None))
+        self.assertEqual(self.build(), (0, 0))              # the library answers for its text: nothing is read
+        self.assertEqual(self.state("a/book.txt"), "covered")
+        one.unlink()                                        # the file is filed elsewhere,
+        self.write("b/book.txt", when=1_800_000_000)
+        told.clear()                                        # and the library no longer knows the work
+        self.read.clear()
+        # Nothing tells what the new file holds before it is copied for its reading: it is then
+        # measured, found to be the document left to the library, and not read. The library,
+        # asked about it afterwards, knows nothing of it: the document waits from that moment,
+        # and the same run reads it.
+        self.assertEqual((self.build(), self.read), ((1, 0), ["book.txt"]))
+        self.assertEqual(names(self.db, "northern harbours"), ["b/book.txt"])
+        self.assertEqual(self.build(), (0, 0))
+        self.sound()
+
+    def test_the_last_page_recognised_and_the_state_of_the_document_are_kept_together(self):
+        self.write("scan.txt")
+        self.build()
+        self.blank()
+        seen = []
+        self.db.set_trace_callback(seen.append)
+        self.addCleanup(self.db.set_trace_callback, None)
+        with self.recognising():
+            self.assertEqual(self.build(ocr=True), (1, 0))
+        self.db.set_trace_callback(None)
+        last = max(number for number, line in enumerate(seen) if line.startswith("UPDATE pages SET ztext"))
+        after = [line for line in seen[last:] if line.startswith(("COMMIT", "UPDATE docs SET state='indexed'"))]
+        self.assertEqual([line.split()[0] for line in after[:2]], ["UPDATE", "COMMIT"])
 
     def test_a_document_left_waiting_by_what_the_run_reads_is_read_in_the_same_run(self):
         self.write("a/book.txt")

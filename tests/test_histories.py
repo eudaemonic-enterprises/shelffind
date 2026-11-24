@@ -5,17 +5,22 @@ A small world is driven at random: files are written, changed, copied, moved and
 three folders, one of which has a storage that tells checksums and may lag behind, hold other
 bytes under the same size and second, or fall silent; two sources recognise files, by their
 address, rightly or wrongly, or by their checksum, and give one checksum or two, in one order
-or the other; one work in four is a scan, whose second page is recognised by a later run, and
-one in seven cannot be read at all; some names end oddly or hold a line break; the index is
-brought up to date now and then, by an inventory, in full, for one file, or for the
-recognition; a folder is forgotten and registered again, and a month passes. Since the test
-knows what every file holds, it can tell after each step whether a file shows a text that is
-not its own, page by page, whether anything read or recognised was lost or done twice, and
-whether the documents are those that the facts name, whatever the order of the events.
+or the other, now and then the MD5 of one work with the SHA-256 of another; one work in four
+is a scan, whose second page is recognised by a later run, and one in seven cannot be read at
+all; some names end oddly, hold a line break, or hold a character that some programs take for
+one; the index is brought up to date now and then, by an inventory, in full, for one file, or
+for the recognition; a folder is forgotten and registered again, and a month passes. The
+storage answers as rclone does, in lines that the program has to read. Since the test knows
+what every file holds, it can tell after each step whether a file shows a text that is not its
+own, page by page, whether a checksum kept is that of the bytes, whether anything read or
+recognised was lost or done twice, whether a run did what it reports, and whether the
+documents are those that the facts name, whatever the order of the events.
 
 The number of histories is 40, or what SHELFFIND_HISTORIES says; SHELFFIND_HISTORY replays the
 one of a given number."""
+import datetime
 import hashlib
+import json
 import os
 import random
 import shutil
@@ -108,20 +113,25 @@ class World:
         self.liars.discard(path)
 
     # ---- the storage and the sources ------------------------------------------------------
-    def stored(self, remote, rows):
+    def storage(self, arguments, listing, remote, seconds):
+        """What rclone would print about the files listed, from what the storage holds: their
+        sizes and dates as JSON, or their MD5, one line for each file."""
         if self.silent:
             return None
-        told = {}
-        for row in rows:
-            path = self.rooms["Vault"] / row["rel"]
-            held = self.twin.get(path)
-            if "\n" not in row["rel"] and held and held[1] == row["size"] and held[2] == row["mtime"] // 10**9:
-                told[row["rel"]] = self.sums(held[0])[0]
-        return told
+        asked = [rel for rel in Path(listing).read_bytes().decode().split("\n") if rel]
+        held = {rel: self.twin[self.rooms["Vault"] / rel] for rel in asked if self.rooms["Vault"] / rel in self.twin}
+        if arguments[0] == "lsjson":
+            stamp = lambda second: datetime.datetime.fromtimestamp(second, datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+            return json.dumps([{"Path": rel, "Size": size, "ModTime": stamp(second)} for rel, (work, size, second) in held.items()],
+                              ensure_ascii=False)
+        return "".join(f"{self.sums(work)[0][4:]}  {rel}\n" for rel, (work, size, second) in held.items())
 
     def record(self, name, number, work):
         md5, sha = self.sums(work)
-        keys = ([md5, sha], [sha, md5], [md5], [sha])[(work + self.styles[name] + len(name)) % 4]
+        style = work + self.styles[name] + len(name)
+        keys = ([md5, sha], [sha, md5], [md5], [sha])[style % 4]
+        if style % 9 == 4:                                  # the MD5 of the work with the SHA-256 of another
+            keys = [md5, self.sums(sorted(self.works)[style % len(self.works)])[1]]
         return {"n": number, "id": f"W{work}", "keys": keys,
                 "title": f"Title{work:04d} of {name}", "text": name == "library" and work % 3 == 0}
 
@@ -143,7 +153,9 @@ class World:
     def fresh_address(self):
         room = self.rooms[self.dice.choice(sorted(self.rooms))]
         folder = self.dice.choice(("", "a", "b"))
-        odd = "\nx" if self.dice.random() < 0.04 else ""    # a line break in a name, which no storage is asked about
+        # A line break in a name, which no storage is asked about, or a character that is none
+        # and that some programs take for one.
+        odd = self.dice.choice(("\nx", "\u2028x", "\x85x", "\x0bx", "\x0cx")) if self.dice.random() < 0.06 else ""
         return room / folder / f"f{self.dice.randrange(10**6):06d}{odd}.{self.dice.choice(FORMATS)}"
 
     def step(self):
@@ -314,7 +326,7 @@ class Histories(unittest.TestCase):
             try:
                 with patch("shelffind.extract.passages", side_effect=reading), \
                         patch("shelffind.extract.recognize", side_effect=recognising), \
-                        patch("shelffind.indexer.stored_checksums", side_effect=world.stored), \
+                        patch("shelffind.indexer.storage", side_effect=world.storage), \
                         patch("shelffind.sources.question", side_effect=world.question), \
                         patch("shelffind.sources.policy", side_effect=policy), \
                         patch("shelffind.link.usable", side_effect=usable):
@@ -334,10 +346,13 @@ class Histories(unittest.TestCase):
         for row in db.execute("SELECT doc,page,ztext,needs_ocr FROM pages ORDER BY doc,id"):
             rows.setdefault(row["doc"], []).append((row["page"], store.inflate(row["ztext"]), row["needs_ocr"]))
         found = {}
+        sealed = dict(db.execute("SELECT id,origin FROM docs"))
         for doc, pages in rows.items():
             first = pages[0][1]
             self.assertTrue(first.startswith("work") and first[8:13] == "token", f"{where}: document {doc} begins with no work")
             work = int(first[4:8])
+            # The pages are tied to the bytes of the work they hold, and to no other, with or without a file.
+            self.assertIn(sealed[doc], (None, " ".join(world.sums(work))), f"{where}: document {doc} holds work {work} under other checksums")
             allowed = world.pages_of(work)
             self.assertEqual(sorted(str(page) for page, _, _ in pages), sorted(str(page) for page in allowed),
                              f"{where}: document {doc} does not have the pages of work {work}")
@@ -372,6 +387,10 @@ class Histories(unittest.TestCase):
         self.assertEqual((failures, len(set(failed))), (len(failed), len(failed)), where)
         self.assertEqual(invariants.structure(db), [], where)
         self.assertEqual(invariants.actual(db), invariants.canonical(db), where)
+        self.assertEqual(sorted(path.name for path in world.data.glob("copies*")), [], f"{where}: copies are left")
+        # The run did what it reports: one reading for each document read, recognised or found unreadable.
+        works = {(work, fmt) for work, fmt, _ in world.recognised[recognised:]}
+        self.assertEqual(done, len(works) if kind == "recognise" else len(extracted) + len(failed), f"{where}: the run reports {done}")
         # Nothing is read twice, in one run or while the text read from its bytes is kept; and
         # no page is recognised twice.
         self.assertEqual(len(extracted), len(set(extracted)), f"{where}: read twice in one run")
@@ -390,8 +409,8 @@ class Histories(unittest.TestCase):
             work = world.holds[path]
             if path in world.liars:
                 continue
-            if file["sum"]:
-                self.assertIn(world.sums(work)[0], file["sum"].split(), f"{where}: a wrong measure of {file['rel']!r}")
+            if file["sum"]:                                 # each checksum kept is that of the bytes
+                self.assertLessEqual(set(file["sum"].split()), set(world.sums(work)), f"{where}: a wrong measure of {file['rel']!r}")
             if file["doc"] in shown and shown[file["doc"]][0] != work:
                 known = {row["key"] for row in db.execute("SELECT key FROM doc_keys WHERE doc=? AND basis='content'", (file["doc"],))}
                 words = any(known & set(record["keys"].split()) for record in db.execute("SELECT keys FROM records WHERE file=?", (file["id"],)))
@@ -399,17 +418,34 @@ class Histories(unittest.TestCase):
             # What it showed of its own, it still shows.
             for page, text in own.get((file["root"], file["rel"], file["size"], file["mtime"]), {}).items():
                 self.assertEqual(shown.get(file["doc"], (None, {}))[1].get(page), text, f"{where}: {file['rel']!r} lost its page {page}")
+        # Files that hold the same bytes, both measured, are one document.
+        seen = {}
+        for file in db.execute("SELECT * FROM files WHERE coalesce(sum,'')!=''").fetchall():
+            if address(file) not in world.liars:
+                work = world.holds[address(file)]
+                self.assertEqual(seen.setdefault((work, file["format"]), file["doc"]), file["doc"], f"{where}: two documents for work {work}")
+        if kind not in ("full", "recognise"):
+            return
+        # A complete run leaves nothing waiting, whatever the storage does.
+        states = "'needs-ocr','ocr-error'" if kind == "recognise" else "'pending'"
+        waiting = db.execute(f"SELECT f.rel FROM files f JOIN docs d ON d.id=f.doc WHERE d.state IN ({states})").fetchall()
+        self.assertEqual([row["rel"] for row in waiting], [], where)
+        # In the folders without storage, every statement that gives a checksum is proved by
+        # then: its file was measured by a checksum of a kind it gives.
+        vault = next(root["id"] for root in store.roots(db) if root["name"] == "Vault")
+        proofs = db.execute("SELECT r.keys,f.rel,f.sum,f.root FROM records r JOIN files f ON f.id=r.file WHERE r.keys!=''").fetchall()
+        for record in proofs:
+            if record["root"] != vault:
+                self.assertTrue(set(invariants.kinds(record["keys"].split())) & set(invariants.kinds((record["sum"] or "").split())),
+                                f"{where}: what is said of {record['rel']!r} was not proved")
         liars = {path for path in world.liars if path in world.holds}
-        if kind not in ("full", "recognise") or world.silent or liars:
+        if world.silent or liars:
             return
         current = {path: (work, path.stat().st_size, path.stat().st_mtime_ns // 10**9)
                    for path, work in world.holds.items() if path.is_relative_to(world.rooms["Vault"])}
         if current != {path: held for path, held in world.twin.items() if path in world.holds}:
             return
-        # A complete run with a storage that is up to date leaves nothing waiting, and a second run nothing to do.
-        states = "'needs-ocr','ocr-error'" if kind == "recognise" else "'pending'"
-        waiting = db.execute(f"SELECT f.rel FROM files f JOIN docs d ON d.id=f.doc WHERE d.state IN ({states})").fetchall()
-        self.assertEqual([row["rel"] for row in waiting], [], where)
+        # With a storage that is up to date, the same holds of its folder, and a second run finds nothing to do.
         # A document is left as failed only when it holds a work that cannot be read, and every
         # measured file of such a work is in a document that failed or was left to a source.
         for file in db.execute("SELECT f.*,d.state FROM files f JOIN docs d ON d.id=f.doc").fetchall():
@@ -421,9 +457,14 @@ class Histories(unittest.TestCase):
                 self.assertIn(file["state"], ("covered",), f"{where}: {file['rel']!r} cannot be read and is {file['state']}")
         # Every statement that gives a checksum is proved: its file was measured by a checksum
         # of a kind it gives, and a source answers for a text only by such a statement.
-        for record in db.execute("SELECT r.keys,f.rel,f.sum FROM records r JOIN files f ON f.id=r.file WHERE r.keys!=''").fetchall():
+        for record in proofs:
             self.assertTrue(set(invariants.kinds(record["keys"].split())) & set(invariants.kinds((record["sum"] or "").split())),
                             f"{where}: what is said of {record['rel']!r} was not proved")
+        # Two statements kept with one document never give two checksums of one kind: a reading settled it.
+        for doc in db.execute("SELECT DISTINCT doc FROM records WHERE keys!=''").fetchall():
+            given = [key for record in db.execute("SELECT keys FROM records WHERE doc=?", (doc["doc"],)) for key in record["keys"].split()]
+            self.assertTrue(all(len(found) == 1 for found in invariants.kinds(given).values()),
+                            f"{where}: document {doc['doc']} keeps statements that contradict one another")
         for doc in db.execute("SELECT id FROM docs d WHERE state='covered' AND EXISTS (SELECT 1 FROM files f WHERE f.doc=d.id)").fetchall():
             self.assertTrue(db.execute("SELECT 1 FROM records WHERE doc=? AND text=1 AND keys!='' AND source='library'", (doc["id"],)).fetchone(),
                             f"{where}: document {doc['id']} is left to a source that gave no checksum for it")
@@ -438,11 +479,6 @@ class Histories(unittest.TestCase):
         self.assertEqual((done, failures, extracted, world.questions - questions, len(world.stumbled), len(world.recognised)),
                          (0, 0, [], 0, *seen), f"{where}, a second run")
         self.assertEqual([[tuple(row) for row in rows] for rows in snapshot()], before, f"{where}, a second run")
-        # Files that hold the same bytes, both measured, are one document.
-        seen = {}
-        for file in db.execute("SELECT * FROM files WHERE coalesce(sum,'')!=''").fetchall():
-            work = world.holds[address(file)]
-            self.assertEqual(seen.setdefault((work, file["format"]), file["doc"]), file["doc"], f"{where}: two documents for work {work}")
 
     def test_random_histories_never_show_a_text_that_is_not_the_file_s_own(self):
         only = os.environ.get("SHELFFIND_HISTORY")

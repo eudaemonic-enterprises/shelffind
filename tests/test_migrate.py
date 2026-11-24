@@ -14,7 +14,7 @@ from shelffind.search import search
 
 from support import run_main
 
-# The index of version 0.2, as that version created it.
+# The index of version 0.2, word for word as that version created it.
 EARLIER = """
 CREATE TABLE roots (
     id INTEGER PRIMARY KEY, path TEXT NOT NULL UNIQUE, mount TEXT NOT NULL,
@@ -38,6 +38,13 @@ CREATE INDEX pages_file ON pages(file);
 CREATE VIRTUAL TABLE passages USING fts5(text, content='pages', content_rowid='id',
     tokenize='unicode61 remove_diacritics 2');
 CREATE TRIGGER pages_ai AFTER INSERT ON pages BEGIN
+    INSERT INTO passages(rowid,text) VALUES(new.id,new.text);
+END;
+CREATE TRIGGER pages_ad AFTER DELETE ON pages BEGIN
+    INSERT INTO passages(passages,rowid,text) VALUES('delete',old.id,old.text);
+END;
+CREATE TRIGGER pages_au AFTER UPDATE OF text ON pages BEGIN
+    INSERT INTO passages(passages,rowid,text) VALUES('delete',old.id,old.text);
     INSERT INTO passages(rowid,text) VALUES(new.id,new.text);
 END;
 CREATE TABLE words (term TEXT NOT NULL UNIQUE);

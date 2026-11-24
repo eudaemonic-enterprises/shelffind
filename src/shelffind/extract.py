@@ -115,11 +115,14 @@ def in_several_files(path):
 
 
 @contextmanager
-def document(path, fmt):
+def document(path, fmt, hold=None):
+    """A document ready to be read, as (file, format, folder for what the reading writes).
+    That folder is made in `hold`, or among the temporary files of the system, and is removed
+    afterwards; that it cannot be removed is not a fault of the document."""
     if fmt == "djvu" and in_several_files(path):
         # Its text is read from a copy of the one file, which the others would not follow.
         raise ValueError("A DjVu document kept in several files is not read: make one file of it with `djvmcvt -b`")
-    with tempfile.TemporaryDirectory(prefix="shelffind-read-") as tmp:
+    with tempfile.TemporaryDirectory(prefix="shelffind-read-", dir=hold, ignore_cleanup_errors=True) as tmp:
         work = Path(tmp)
         if fmt in {"ps", "ps.gz"}:
             if fmt == "ps.gz":

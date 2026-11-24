@@ -9,7 +9,9 @@ both. Each is made once for a file as it is; `files.sum` keeps the result.
 
 A document is read from a copy of its file made on this machine in one pass, during which the
 checksums are computed: the pages kept are those of the very bytes the checksums describe. The
-copies are made in a folder of the data folder of ShelfFind, and nowhere else.
+copies, and what their reading writes, are kept in a folder that the run makes for itself in
+the data folder of ShelfFind, and nowhere else; the index names that folder for as long as it
+exists, and nothing is ever removed that the index does not name.
 """
 import contextlib
 import datetime
@@ -17,6 +19,7 @@ import hashlib
 import json
 import math
 import os
+import re
 import shutil
 import sqlite3
 import subprocess
@@ -26,6 +29,7 @@ from pathlib import Path
 from . import extract, fuzzy, link, store
 
 ASKED = 400             # files in one question to the storage of a folder
+COPIES = "copies"       # in the index: the folders of the data folder in which runs made their copies
 CHANGED = "File changed during indexing; run index again"
 FILE = "f.id,f.rel,f.size,f.mtime,f.format"
 
@@ -49,38 +53,60 @@ def check_stamp(path, row, same=None):
     return itself
 
 
+def put(target, block):
+    """Write the whole of a block into the copy of a file; Unplaced when it cannot be."""
+    try:
+        left = memoryview(block)
+        while left:
+            left = left[target.write(left):]
+    except OSError as fault:
+        raise Unplaced(str(fault)) from None
+
+
 def whole_checksums(path, row, copy=None):
     """The MD5 and the SHA-256 of a file read in full, once, through one opening of it. The
     file opened is the one the inventory saw, and it stayed so while it was read: its address,
     its size, its date and the file itself are checked before and after, on the address and on
     what was opened, and so is the time of the last change of the file, which a writer that
     puts the date back cannot put back. With `copy`, the bytes read are written there: the
-    checksums are then those of that copy, whatever happens to the file afterwards. Unplaced
-    is raised when the copy cannot be written."""
+    checksums are then those of that copy, whatever happens to the file afterwards. The copy
+    is written without a buffer and closed here, so that a fault of the place where it is made
+    shows as what it is: Unplaced is raised when the copy cannot be made, written or closed,
+    and nothing is then said against the file."""
     same = check_stamp(path, row)
     found = hashlib.md5(), hashlib.sha256()
+    target = None
+    if copy is not None:
+        try:
+            target = open(copy, "wb", buffering=0)
+        except OSError as fault:
+            raise Unplaced(str(fault)) from None
     try:
-        kept = copy.open("wb") if copy is not None else contextlib.nullcontext()
-    except OSError as fault:
-        raise Unplaced(str(fault)) from None
-    with path.open("rb") as source, kept as target:
-        opened = os.fstat(source.fileno())
-        if (opened.st_dev, opened.st_ino) != same or (opened.st_size, opened.st_mtime_ns) != (row["size"], row["mtime"]):
-            raise ValueError(CHANGED)
-        taken = 0
-        while block := source.read(1 << 20):
-            taken += len(block)
-            for one in found:
-                one.update(block)
-            if target is not None:
-                try:
-                    target.write(block)
-                except OSError as fault:
-                    raise Unplaced(str(fault)) from None
-        closed = os.fstat(source.fileno())
-        if taken != row["size"] or (closed.st_size, closed.st_mtime_ns, closed.st_ctime_ns) != \
-                (opened.st_size, opened.st_mtime_ns, opened.st_ctime_ns):
-            raise ValueError(CHANGED)
+        with path.open("rb") as source:
+            opened = os.fstat(source.fileno())
+            if (opened.st_dev, opened.st_ino) != same or (opened.st_size, opened.st_mtime_ns) != (row["size"], row["mtime"]):
+                raise ValueError(CHANGED)
+            taken = 0
+            while block := source.read(1 << 20):
+                taken += len(block)
+                for one in found:
+                    one.update(block)
+                if target is not None:
+                    put(target, block)
+            closed = os.fstat(source.fileno())
+            if taken != row["size"] or (closed.st_size, closed.st_mtime_ns, closed.st_ctime_ns) != \
+                    (opened.st_size, opened.st_mtime_ns, opened.st_ctime_ns):
+                raise ValueError(CHANGED)
+        if target is not None:
+            written, target = target, None
+            try:
+                written.close()
+            except OSError as fault:
+                raise Unplaced(str(fault)) from None
+    finally:
+        if target is not None:
+            with contextlib.suppress(OSError):
+                target.close()
     check_stamp(path, row, same)
     return [f"md5:{found[0].hexdigest()}", f"sha256:{found[1].hexdigest()}"]
 
@@ -105,13 +131,14 @@ def private_copy(path, row, hold, known=None):
 
 
 def storage(arguments, listing, remote, seconds):
-    """What rclone prints about the files named in `listing`, or None when it gave no answer."""
+    """What rclone prints about the files named in `listing`, or None when it gave no answer.
+    The answer is taken as the bytes it was written in: no line ending is rewritten."""
     try:
         done = subprocess.run(["rclone", *arguments, "--retries", "1", "--files-from-raw", str(listing), remote],
-                              capture_output=True, text=True, timeout=seconds)
+                              capture_output=True, timeout=seconds)
     except (OSError, subprocess.TimeoutExpired):
         return None
-    return done.stdout if done.returncode == 0 else None
+    return done.stdout.decode("utf-8", "replace") if done.returncode == 0 else None
 
 
 def listed(remote, listing, wanted):
@@ -138,38 +165,47 @@ def listed(remote, listing, wanted):
     return agreeing
 
 
+def askable(rel):
+    """Whether an address can be put to a storage: the list of the files asked about, and the
+    answer, have one address on each line."""
+    return "\n" not in rel and "\r" not in rel
+
+
 def stored_checksums(remote, rows):
     """The MD5 that the storage of a folder gives for some of its files, as address -> key,
     without any of them being read; None when the storage gives no answer at all. A file is
     answered for only when the storage holds it with the size and the instant the inventory
     saw, before the checksum is asked and after it was given: a twin that lags behind the
-    folder, runs ahead of it, or changes meanwhile says nothing of the file. The storage is
-    believed beyond that: a twin that held other bytes under the same size and the same second
-    would not be noticed."""
-    wanted = {row["rel"]: row for row in rows if "\n" not in row["rel"] and "\r" not in row["rel"]}
+    folder, runs ahead of it, or changes meanwhile says nothing of the file. The answer is
+    read as it is written, one line for each file and the line feed alone between two lines,
+    whatever other character an address holds; an address that the answer gives two different
+    checksums for is not answered for. The storage is believed beyond that: a twin that held
+    other bytes under the same size and the same second would not be noticed."""
+    wanted = {row["rel"]: row for row in rows if askable(row["rel"])}
     if not wanted:
         return {}
     with tempfile.TemporaryDirectory(prefix="shelffind-") as work:
         listing = Path(work) / "files"
-        listing.write_text("".join(rel + "\n" for rel in wanted), encoding="utf-8")
+        listing.write_text("".join(rel + "\n" for rel in wanted), encoding="utf-8", newline="")
         before = listed(remote, listing, wanted)
         if before is None:
             return None
         if not before:
             return {}
-        listing.write_text("".join(rel + "\n" for rel in before), encoding="utf-8")
+        listing.write_text("".join(rel + "\n" for rel in before), encoding="utf-8", newline="")
         told = storage(["hashsum", "md5"], listing, remote, 1800)
         after = listed(remote, listing, wanted) if told is not None else None
     if told is None or after is None:
         return None
-    found = {}
-    for line in told.splitlines():
+    found, twice = {}, set()
+    for line in told.split("\n"):
         word, _, rel = line.partition("  ")
         word = word.strip().lower()
         if rel in before and after.get(rel) == before[rel] and len(word) == 32 \
                 and all(char in "0123456789abcdef" for char in word):
-            found[rel] = f"md5:{word}"
-    return found
+            if found.setdefault(rel, f"md5:{word}") != f"md5:{word}":
+                twice.add(rel)
+    return {rel: key for rel, key in found.items() if rel not in twice}
 
 
 def joined(db, file, measured, local=True):
@@ -193,7 +229,9 @@ def waiting(db, root, only=None, reading=False, thorough=False, absent=frozenset
     file of which a source gave a checksum, and the files of the size and format of a document
     known by a checksum are read as well. In a folder with a storage, a file waits for the
     storage to answer, unless the storage answered and did not hold the file (`absent`), or
-    gave a checksum of another kind than the source."""
+    gave a checksum of another kind than the source. In either kind of folder, the files of a
+    document of which the statements kept contradict one another, giving two checksums of one
+    kind, are read as well: one of the statements is false, and the reading tells which."""
     lacking = "instr(coalesce(f.sum,''),'sha256:')=0" if reading else "instr(coalesce(f.sum,''),'md5:')=0"
     rows = db.execute(f"SELECT {FILE},f.doc,f.sum,f.read AND d.origin IS NULL AS untied FROM files f JOIN docs d ON d.id=f.doc "
                       f"WHERE f.root=? AND {lacking} ORDER BY f.id", (root["id"],)).fetchall()
@@ -215,22 +253,32 @@ def waiting(db, root, only=None, reading=False, thorough=False, absent=frozenset
         measured = set(store.kinds((row["sum"] or "").split()))
         return any(not kinds & measured for kinds in told.get(row["id"], ()))
 
+    given = {}                                      # document -> kind -> the checksums that the statements kept with it give
+    for record in db.execute("SELECT doc,keys FROM records WHERE keys!='' AND doc IN (SELECT doc FROM files WHERE root=?)",
+                             (root["id"],)):
+        for kind, found in store.kinds(record["keys"].split()).items():
+            given.setdefault(record["doc"], {}).setdefault(kind, set()).update(found)
+    disputed = {doc for doc, found in given.items() if any(len(keys) > 1 for keys in found.values())}
     if root.get("remote"):
-        return [row for row in rows if row["untied"] or (unproved(row) and (row["sum"] or row["id"] in absent))]
+        return [row for row in rows if row["untied"]
+                or ((unproved(row) or row["doc"] in disputed) and (row["sum"] or row["id"] in absent))]
     alike = {}                                      # size and format -> the document known by a checksum, or -1 for several
     for doc in db.execute("SELECT d.id,d.size,d.format FROM docs d WHERE EXISTS (SELECT 1 FROM doc_keys k WHERE k.doc=d.id)"):
         alike[(doc["size"], doc["format"])] = -1 if (doc["size"], doc["format"]) in alike else doc["id"]
     other = lambda row: alike.get((row["size"], row["format"]), row["doc"]) != row["doc"]
-    return [row for row in rows if row["untied"] or unproved(row) or (not row["sum"] and other(row))]
+    return [row for row in rows if row["untied"] or unproved(row) or row["doc"] in disputed or (not row["sum"] and other(row))]
 
 
-def ask_storage(db, root, rows, progress, absent=None):
+def ask_storage(db, root, rows, progress, absent=None, failed=None):
     """Keep what the storage of a folder says of the files `rows`, and let each join the
     document known by its checksum. No file is read. Returns the number of files of which
-    something was learnt, and whether the storage stopped answering; `absent` collects the
-    files of which a storage that answered said nothing, since it does not hold them as they
-    are."""
-    learnt = 0
+    something was learnt, whether the storage stopped answering, and the number of files that
+    were no longer what the inventory saw when the answer came, which `failed` collects;
+    `absent` collects the files of which a storage that answered said nothing, since it does
+    not hold them as they are, and those whose address cannot be put to it."""
+    learnt = failures = 0
+    absent = set() if absent is None else absent
+    absent.update(row["id"] for row in rows if not askable(row["rel"]))
     for start in range(0, len(rows), ASKED):
         batch = rows[start:start + ASKED]
         if len(rows) > ASKED:
@@ -239,12 +287,11 @@ def ask_storage(db, root, rows, progress, absent=None):
         if told is None:
             progress(f"The storage of {root['name']} gives no answer ({root['remote']}): "
                      "its files will be compared when it does")
-            return learnt, True
+            return learnt, True, failures
         for row in batch:
             given = told.get(row["rel"])
             if not given:
-                if absent is not None:
-                    absent.add(row["id"])
+                absent.add(row["id"])
                 continue
             try:                                # the file itself is still what the inventory saw
                 check_stamp(Path(root["path"]) / row["rel"], row)
@@ -252,12 +299,16 @@ def ask_storage(db, root, rows, progress, absent=None):
                 progress(f"Changed since the inventory: {row['rel']}; run index again")
                 with db:
                     store.afresh(db, row["id"])
+            except OSError as fault:
+                progress(f"Could not compare {row['rel']}: {fault}")
+            else:
+                with db:
+                    learnt += joined(db, row["id"], [given], local=False)
                 continue
-            except OSError:
-                continue
-            with db:
-                learnt += joined(db, row["id"], [given], local=False)
-    return learnt, False
+            failures += 1                       # nothing was learnt of the file, and the run says so
+            if failed is not None:
+                failed.add(row["id"])
+    return learnt, False, failures
 
 
 def read_in_full(db, root, rows, progress, failed):
@@ -291,9 +342,9 @@ def settle(db, roots, chosen, progress, reads=True, failed=None, asked=None, tho
     reading can measure are read in full, once each. What a reading teaches may make a file of
     another folder worth reading: the folders are gone through again for as long as something
     is learnt. `chosen` limits the work, per folder, to some addresses. Returns the number of
-    files that could not be read; `failed` collects them, `asked` the files of which the
-    storage was asked and `absent` those it did not hold, so that one run says a failure once
-    and asks a question once."""
+    files that could not be compared, being unreadable or no longer what the inventory saw;
+    `failed` collects them, `asked` the files of which the storage was asked and `absent` those
+    it did not hold, so that one run says a failure once and asks a question once."""
     failures = 0
     failed = set() if failed is None else failed
     asked = set() if asked is None else asked
@@ -306,8 +357,9 @@ def settle(db, roots, chosen, progress, reads=True, failed=None, asked=None, tho
                 continue
             rows = [row for row in waiting(db, root, chosen[root["id"]], thorough=thorough) if row["id"] not in asked]
             asked.update(row["id"] for row in rows)
-            found, stopped = ask_storage(db, root, rows, progress, absent) if rows else (0, False)
+            found, stopped, missed = ask_storage(db, root, rows, progress, absent, failed) if rows else (0, False, 0)
             learnt += found
+            failures += missed
             if stopped:
                 silent.add(root["id"])
         for root in roots if reads else ():
@@ -317,6 +369,46 @@ def settle(db, roots, chosen, progress, reads=True, failed=None, asked=None, tho
             failures += missed
         if not learnt:
             return failures
+
+
+def copies_folder(db, directory):
+    """A folder of its own for the copies of the documents that a run reads, made in the data
+    folder under a name drawn at random; the index keeps that name from before the first copy
+    until the folder is removed. Unplaced is raised when it cannot be made."""
+    try:
+        hold = Path(tempfile.mkdtemp(prefix="copies-", dir=directory))
+    except OSError as fault:
+        raise Unplaced(str(fault)) from None
+    with db:
+        db.execute("INSERT OR REPLACE INTO meta(key,value) VALUES(?,?)", (f"{COPIES}:{hold.name}", hold.name))
+    return hold
+
+
+def forget_copies(db, directory, progress):
+    """Remove the folders in which runs made their copies: those that the index names, and
+    nothing else. A run that was cut short leaves its folder behind, and no other run is at
+    work, since the one that asks holds the lock. Nothing is removed on the strength of a name
+    or of a place: such a folder was made by ShelfFind itself, empty, inside its own data
+    folder, where no folder of documents can be registered, and the index kept its name before
+    any copy was made in it. Returns the number of folders that could not be removed, which
+    the index goes on naming."""
+    problems = 0
+    for row in db.execute("SELECT key,value FROM meta WHERE key LIKE ?", (COPIES + ":%",)).fetchall():
+        folder = Path(directory) / row["value"]
+        if re.fullmatch(r"copies-[A-Za-z0-9_]+", row["value"]) and row["key"] == f"{COPIES}:{row['value']}" \
+                and folder.is_dir() and not folder.is_symlink():
+            if any(Path(root["path"]).is_relative_to(folder.resolve()) for root in store.roots(db)):
+                progress(f"A folder of documents lies in {folder}, where copies were made: nothing is removed there")
+                problems += 1
+                continue
+            shutil.rmtree(folder, ignore_errors=True)
+            if folder.exists():
+                progress(f"The copies left in {folder} could not be removed: remove that folder")
+                problems += 1
+                continue
+        with db:
+            db.execute("DELETE FROM meta WHERE key=?", (row["key"],))
+    return problems
 
 
 def update_text(db, root, row, ocr, languages, wanted=None, hold=None):
@@ -330,15 +422,16 @@ def update_text(db, root, row, ocr, languages, wanted=None, hold=None):
     for its recognition with `ocr`. The pages are read from the copy, so they are those of the
     bytes that the checksums describe. A file that cannot be copied as the inventory saw it
     raises Unreadable, a copy that cannot be written raises Unplaced, and any other failure is
-    that of what the file holds."""
+    that of what the file holds. Once the pages are kept, nothing that happens to the copy or
+    to its folder is a failure of the document."""
     path = Path(root["path"]) / row["rel"]
     file = db.execute("SELECT id,sum FROM files WHERE id=? AND root=? AND rel=?", (row["id"], root["id"], row["rel"])).fetchone()
     if file is None:
         return False
     if row["format"] in extract.PLAIN and row["size"] > extract.MAX_TEXT:
         raise ValueError("Plain text exceeds 64 MiB")       # said before a copy of that size is made
-    try:
-        folder = tempfile.TemporaryDirectory(prefix="copy-", dir=hold)
+    try:                                            # what cannot be removed afterwards goes with the folder of the run
+        folder = tempfile.TemporaryDirectory(prefix="copy-", dir=hold, ignore_cleanup_errors=True)
     except OSError as fault:
         raise Unplaced(str(fault)) from None
     with folder as held:
@@ -361,8 +454,11 @@ def update_text(db, root, row, ocr, languages, wanted=None, hold=None):
             wanted = lambda doc, state: state == ("needs-ocr" if ocr else "pending")
         if not wanted(doc, told["state"]):
             return False
-        with extract.document(copy, row["format"]) as (source, fmt, work):
+        with extract.document(copy, row["format"], held) as (source, fmt, work):
             if ocr:
+                # The pages are recognised from the copy, whose bytes are those the document is
+                # known by: each is kept as soon as it is recognised, and the last one together
+                # with the state of the document, so that a run cut there leaves nothing to mend.
                 blanks = db.execute("SELECT id,page FROM pages WHERE doc=? AND needs_ocr=1 "
                                     "ORDER BY page", (doc,)).fetchall()
                 for page in blanks:
@@ -370,9 +466,11 @@ def update_text(db, root, row, ocr, languages, wanted=None, hold=None):
                     with db:
                         db.execute("UPDATE pages SET ztext=?,needs_ocr=0 WHERE id=?", (store.deflate(text), page["id"]))
                         fuzzy.remember_more(db, (text,))
-                with db:
-                    db.execute("UPDATE docs SET state='indexed',error=NULL WHERE id=?", (doc,))
-                still()
+                        if page is blanks[-1]:
+                            db.execute("UPDATE docs SET state='indexed',error=NULL WHERE id=?", (doc,))
+                if not blanks:
+                    with db:
+                        db.execute("UPDATE docs SET state='indexed',error=NULL WHERE id=?", (doc,))
                 return True
             pages = list(extract.passages(source, fmt, work))
             if not pages:
@@ -443,11 +541,10 @@ def build(db, directory, selected, *, names_only=False, ocr=False, languages="en
         failures += acquaint(not names_only, not names_only, relink)
         if names_only:
             return done, failures
-        # The copies are made in a folder of ShelfFind's own, which no folder of documents can
-        # be registered in. What a run that was cut short left there is removed: no other run
-        # is at work, since this one holds the lock.
-        hold = Path(directory) / "copies"
-        shutil.rmtree(hold, ignore_errors=True)
+        # The copies are made in a folder that the run makes for itself in the data folder,
+        # when the first is needed. What a run that was cut short left behind is removed first.
+        failures += forget_copies(db, directory, progress)
+        hold = None
         states = ["needs-ocr"] if ocr else ["pending"]
         if retry:
             states.append("ocr-error" if ocr else "error")
@@ -461,8 +558,10 @@ def build(db, directory, selected, *, names_only=False, ocr=False, languages="en
             while not halted and (limit is None or done < limit):
                 # A pass takes a snapshot of its queue. One document may be read through any
                 # of its files: the others are tried when one fails, or turns out to hold
-                # something else. What a pass reads may leave other documents waiting, which
-                # the next pass takes up; no file is taken twice in one run.
+                # something else. What a pass reads, and what the sources say afterwards, may
+                # leave other documents waiting, which the next pass takes up. No reading is
+                # tried twice through one file in a run; a file that a pass only measured,
+                # its document needing no reading then, may be read by a later pass.
                 candidates = {}
                 for root in ready:
                     if root["id"] in offline:
@@ -481,7 +580,13 @@ def build(db, directory, selected, *, names_only=False, ocr=False, languages="en
                             candidates.setdefault(row["doc"], []).append((root, row))
                 if not candidates:
                     break
-                hold.mkdir(mode=0o700, exist_ok=True)
+                if hold is None:
+                    try:
+                        hold = copies_folder(db, directory)
+                    except Unplaced as exc:
+                        progress(f"No folder for the copies of the documents could be made in {directory}: {exc}")
+                        failures += 1
+                        break
                 total, taken = len(candidates), False
                 for seen, (doc, copies) in enumerate(candidates.items()):
                     if halted or (limit is not None and done >= limit):
@@ -505,15 +610,18 @@ def build(db, directory, selected, *, names_only=False, ocr=False, languages="en
                             continue
                         try:
                             taken = True
-                            tried.add(row["id"])
-                            done += update_text(db, root, row, ocr, languages, wanted, hold)
+                            if update_text(db, root, row, ocr, languages, wanted, hold):
+                                done += 1
+                                tried.add(row["id"])
                         except sqlite3.Error:
                             raise
                         except Unplaced as exc:     # no room for the copy: nothing is wrong with the documents
+                            tried.add(row["id"])
                             progress(f"No copy of {row['rel']} could be made in {hold}: {exc}; the reading stops here")
                             failures += 1
                             halted = True
                         except Exception as exc:    # one unreadable file must not stop the others
+                            tried.add(row["id"])
                             if not store.available(root):
                                 progress(f"Disconnected: {root['path']}; saved completed work")
                                 offline.add(root["id"])
@@ -568,5 +676,5 @@ def build(db, directory, selected, *, names_only=False, ocr=False, languages="en
                 # nothing left to do.
                 failures += acquaint(True, True)
         finally:
-            shutil.rmtree(hold, ignore_errors=True)
+            failures += forget_copies(db, directory, progress)
     return done, failures
