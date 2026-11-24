@@ -1,5 +1,6 @@
 # Copyright 2026 Eudaemonic Enterprises Inc.
 """Rank filename, folder, abbreviated name, and full-text matches. One result per document."""
+import itertools
 import re
 from pathlib import Path
 
@@ -10,6 +11,10 @@ from . import fuzzy, store
 # index are ranked instead.
 SAMPLE = 20_000
 SPREAD = 2_000          # the number of pages such a sample aims at
+# A query whose words are shared between the name of a document and its text is answered from the
+# documents that the names give: at most this many are looked into for each way of sharing.
+SHARED = 300
+SHARES = 5              # beyond this many words, only one word, or all but one, goes to the name
 # In the text only the last word of a query may be the beginning of a longer one, and only
 # from this many letters: completing every short word of a large collection costs seconds.
 PREFIX = 4
@@ -42,15 +47,31 @@ def open_ended(parts, index, exact, text):
     return not text or (index == len(parts) - 1 and len(term.split()[-1]) >= PREFIX)
 
 
+def clause(parts, close, index, exact, text=False):
+    """The full-text expression of one part of a query: the part itself, or a word close to it."""
+    group = [f'"{parts[index][0]}"' + ("*" if open_ended(parts, index, exact, text) else "")]
+    group.extend(f'"{other}"' for other in close[index])
+    return "(" + " OR ".join(group) + ")"
+
+
 def expression(parts, close, exact, text=False):
     """The full-text expression of a query: every part must be met, by itself or by one of the
     words close to it. `text` chooses the rule of the passages for unfinished words."""
-    clauses = []
-    for index, ((term, _), others) in enumerate(zip(parts, close)):
-        group = [f'"{term}"' + ("*" if open_ended(parts, index, exact, text) else "")]
-        group.extend(f'"{other}"' for other in others)
-        clauses.append("(" + " OR ".join(group) + ")")
-    return " AND ".join(clauses)
+    return " AND ".join(clause(parts, close, index, exact, text) for index in range(len(parts)))
+
+
+def shares(count):
+    """The ways of sharing the parts of a query, numbered from 0, between the name of a document
+    (the parts of the first set) and its text (the others): both sets are never empty, and the
+    ways that give the name more parts come first."""
+    if count < 2:
+        return []
+    indexes = range(count)
+    if count <= SHARES:
+        names = [chosen for size in range(count - 1, 0, -1) for chosen in itertools.combinations(indexes, size)]
+    else:
+        names = [(index,) for index in indexes] + [tuple(other for other in indexes if other != index) for index in indexes]
+    return [(chosen, tuple(index for index in indexes if index not in chosen)) for chosen in names]
 
 
 def targets(parts, close, exact):
@@ -390,6 +411,38 @@ def search(db, query, *, root=None, fmt=None, limit=25, exact=False, where="all"
                 if len(seen) >= limit:
                     return
 
+    def by_both(close, approximate):
+        """Add the documents whose name, folder, title or author holds some words of the query
+        and whose text holds the others (`whitham dispersion`: one in the name, one in the page).
+        They come before the documents found by their text alone, and after those found by
+        their names, and the page shown is the one that holds the words asked of the text."""
+        crossed, aimed = set(), targets(parts, close, exact)
+        for chosen, rest in shares(len(parts)):
+            if len(crossed) >= limit:
+                break
+            names_expr = " AND ".join(clause(parts, close, index, exact) for index in chosen)
+            text_expr = " AND ".join(clause(parts, close, index, exact, True) for index in rest)
+            sql = (f"SELECT {COLUMNS} FROM names JOIN files f ON f.id=names.rowid JOIN docs d ON d.id=f.doc "
+                   "WHERE names MATCH ?" + filters + " ORDER BY bm25(names,10.0,3.0,6.0,3.0) LIMIT ?")
+            for row in db.execute(sql, (names_expr, *bindings, SHARED)).fetchall():
+                if row["doc"] in crossed or len(crossed) >= limit:
+                    continue
+                first, last = db.execute("SELECT min(id),max(id) FROM pages WHERE doc=?", (row["doc"],)).fetchone()
+                if first is None:
+                    continue
+                page = db.execute("SELECT rowid FROM passages WHERE passages MATCH ? AND rowid BETWEEN ? AND ? "
+                                  "ORDER BY bm25(passages) LIMIT 1", (text_expr, first, last)).fetchone()
+                if page is None:
+                    continue
+                crossed.add(row["doc"])
+                # Below one thousandth, so that they stay ahead of every document found by its text alone.
+                item = add(row, "fuzzy name and passage" if approximate else "name and passage",
+                           (4 if approximate else 2) + len(crossed) / (2 * limit + 1) / 1000)
+                if row["doc"] not in spots:
+                    found_page = db.execute("SELECT page,section FROM pages WHERE id=?", (page[0],)).fetchone()
+                    spots[row["doc"]] = (page[0], [aimed[index] for index in rest])
+                    item.update(page=found_page["page"], section=found_page["section"])
+
     def ranked():
         """The results so far, the best first, with their copies and their passages."""
         def order(entry):
@@ -436,6 +489,8 @@ def search(db, query, *, root=None, fmt=None, limit=25, exact=False, where="all"
                 interim(ranked())
         if where != "name":
             by_text(expression(parts, close, exact, text=True), targets(parts, close, exact), approximate)
+        if where == "all":
+            by_both(close, approximate)
     if not exact and len(found) < limit and where != "text" and len(parts) == 1 and not parts[0][1] \
             and 2 <= len(parts[0][0]) <= 24:
         term = parts[0][0].replace(" ", "")

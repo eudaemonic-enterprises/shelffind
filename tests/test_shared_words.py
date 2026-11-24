@@ -1,0 +1,84 @@
+# Copyright 2026 Eudaemonic Enterprises Inc.
+"""A query whose words are shared between the name of a document and its text."""
+import json
+import unittest
+
+from shelffind import search
+
+from support import Shelf
+
+
+class Shared(Shelf):
+    def setUp(self):
+        super().setUp()
+        (self.root / "Whitham-LinearAndNonlinearWaves.txt").write_text(
+            "A first page about rivers.\fThe dispersion relation gives the group velocity of waves.")
+        (self.root / "Whitham-Notes.txt").write_text("Nothing here but harbours and tides.")
+        (self.root / "Dispersion.txt").write_text("Only a name that holds the other word.")
+        (self.root / "Other.txt").write_text("The dispersion relation of an unrelated medium.")
+        (self.root / "Together.txt").write_text("Whitham wrote on dispersion in this very sentence.")
+        self.assertEqual(self.build(), (5, 0))
+
+    def names(self, query, **opts):
+        return [(row["name"], row["match"]) for row in search.search(self.db, query, **opts)]
+
+    def test_one_word_in_the_name_and_the_other_in_the_text(self):
+        found = self.names("whitham dispersion")
+        self.assertIn(("Whitham-LinearAndNonlinearWaves.txt", "name and passage"), found)
+        self.assertNotIn("Whitham-Notes.txt", [name for name, _ in found])     # its text lacks the word
+        self.assertNotIn("Other.txt", [name for name, _ in found])             # its name lacks the other
+        self.assertNotIn("Dispersion.txt", [name for name, _ in found])
+
+    def test_such_a_document_comes_before_a_document_found_by_its_text_alone(self):
+        found = self.names("whitham dispersion")
+        order = [name for name, _ in found]
+        self.assertLess(order.index("Whitham-LinearAndNonlinearWaves.txt"), order.index("Together.txt"))
+        self.assertEqual(dict(found)["Together.txt"], "passage")
+
+    def test_the_passage_shown_is_the_one_that_holds_the_words_of_the_text(self):
+        row = next(r for r in search.search(self.db, "whitham dispersion") if r["name"].startswith("Whitham-Linear"))
+        self.assertIn("dispersion relation", row["snippet"])
+        self.assertTrue(row["marks"])
+        shown = row["snippet"][row["marks"][0][0]:row["marks"][0][1]]
+        self.assertEqual(shown.lower(), "dispersion")
+
+    def test_three_words_shared_in_either_way(self):
+        found = self.names("whitham dispersion relation")
+        self.assertIn(("Whitham-LinearAndNonlinearWaves.txt", "name and passage"), found)
+        found = self.names("linear whitham velocity")
+        self.assertIn(("Whitham-LinearAndNonlinearWaves.txt", "name and passage"), found)
+
+    def test_the_filters_and_the_scope_still_hold(self):
+        self.assertFalse([n for n, _ in self.names("whitham dispersion", without=("linear",))
+                          if n.startswith("Whitham-Linear")])
+        self.assertFalse(self.names("whitham dispersion", fmt="pdf"))
+        self.assertFalse([m for _, m in self.names("whitham dispersion", where="name") if "passage" in m])
+        self.assertIn("name and passage", [m for _, m in self.names("whitham dispersion", where="all")])
+
+    def test_a_misspelt_word_is_helped_in_the_same_way(self):
+        found = dict(self.names("whitam dispersion"))
+        self.assertIn(found.get("Whitham-LinearAndNonlinearWaves.txt"), ("fuzzy name and passage", "name and passage"))
+
+    def test_exact_search_keeps_the_words_as_typed(self):
+        self.assertFalse(self.names("whitam dispersion", exact=True))
+        self.assertIn("Whitham-LinearAndNonlinearWaves.txt", [n for n, _ in self.names("whitham dispersion", exact=True)])
+
+    def test_the_command_line_gives_it_too(self):
+        code, out, _ = self.run_cli("search", "--json", "--source", "files", "whitham dispersion")
+        self.assertEqual(code, 0)
+        rows = {row["name"]: row for row in json.loads(out)}
+        self.assertEqual(rows["Whitham-LinearAndNonlinearWaves.txt"]["match"], "name and passage")
+
+    def test_how_the_words_are_shared(self):
+        self.assertEqual(search.shares(1), [])
+        self.assertEqual(search.shares(2), [((0,), (1,)), ((1,), (0,))])
+        three = search.shares(3)
+        self.assertEqual(three[:3], [((0, 1), (2,)), ((0, 2), (1,)), ((1, 2), (0,))])
+        self.assertEqual(len(three), 6)
+        for chosen, rest in search.shares(8):
+            self.assertTrue(chosen and rest and not set(chosen) & set(rest) and len(chosen) + len(rest) == 8)
+        self.assertEqual(len(search.shares(8)), 16)
+
+
+if __name__ == "__main__":
+    unittest.main()
