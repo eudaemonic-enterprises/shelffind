@@ -91,6 +91,9 @@ def structure(db):
     for table in ("passages", "names"):
         try:
             db.execute(f"INSERT INTO {table}({table},rank) VALUES('integrity-check',1)")
+        except sqlite3.OperationalError as fault:
+            if "readonly" not in str(fault):        # on an index opened to be read only, the check cannot run
+                found.append(f"the search index {table} cannot be checked: {fault}")
         except sqlite3.DatabaseError as fault:
             found.append(f"the search index {table} does not hold what its table holds: {fault}")
     if not busy:
