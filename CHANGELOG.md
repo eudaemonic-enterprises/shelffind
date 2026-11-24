@@ -6,6 +6,51 @@ ShelfFind follows semantic versioning. Before version 1.0 a minor version may ch
 JSON keys and the exit codes that other programs rely on are kept from one version to the next and
 are covered by tests.
 
+## 0.5.0
+
+A reading waits for the folder, not for the computer, and the search finds more.
+
+Reading. A folder on a network answers each request after a wait of about a second, and a long
+reading spent most of its time waiting. The files of the documents that come next are now
+copied, four at a time by default (`index.workers`, from 1 to 16), while a document is read; each
+copy is checked as before, against the checksum of the storage and against the file as the
+inventory saw it, and the index that results is the one of a reading that copies one file at a
+time, which the tests verify on the same shelves and on random histories. The pages of a
+scanned document are recognised several at once and kept in the order of the pages, so that an
+interruption keeps all those before it, and the DjVu pages that must be asked for one by one are
+read at once. Programs are limited by `prlimit` where it exists, which lets several run at
+once, and Tesseract is held to one thread each. During a long reading, the next exchange with
+the shared place begins two minutes after the last one ended, or four times as long after as it
+took when that is longer, so that reading keeps most of the time; before, an exchange of more
+than two minutes with a distant place was followed by another at once. A reading whose output is
+a log writes one line a minute, with the time.
+
+A folder on a network whose program has died answers with the error "Transport endpoint is not
+connected". Python 3.13 raised it from the test of whether a folder exists, which stopped
+`status` and would have stopped a reading at the first drop. Such a folder is now unavailable
+like any other: `status` says so, and the reading goes on with the other folders and ends with
+its work kept.
+
+Search. A query whose words are shared between the name of a document (its name, folder, title
+or author) and its text finds the document: `whitham dispersion` where one word is in the name
+and the other only in a page. The words are shared in every way that leaves each side
+something, the ways that give the name more words first; such a document is listed after those
+found by their names and before those found by their text alone, at the page that holds the
+words asked of the text. Among matches of the same kind, documents come before the programs,
+pictures and data that some folders hold, and a program whose name is the query is no longer
+put before the documents that have it in their names.
+
+Formats. HTML, Word (`docx`), OpenDocument (`odt`), FB2, Typst and BibTeX documents are read.
+A document without pages is cut into passages of about six thousand characters made of whole
+paragraphs, each named after its section, and an archive that unpacks to more than 64 MB is
+refused. Any other format is read through a program named in the settings, `[convert.FORMAT]
+command = ["program", "{path}"]`, which prints the text. Files already listed in a format that
+is read since wait for their text from the next inventory on.
+
+Machines. The settings can name the machines by label, `[machines] LABEL = "office"`, so that
+one shared file names them all although they call themselves by one hostname; the line of
+`status` and the command `machine` show that name.
+
 ## 0.4.0
 
 The text that one machine reads travels to the others. With `share.texts`, each data folder puts
