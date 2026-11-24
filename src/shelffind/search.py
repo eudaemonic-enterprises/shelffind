@@ -2,6 +2,7 @@
 """Rank filename, folder, abbreviated name, and full-text matches. One result per document."""
 import itertools
 import re
+import time
 from pathlib import Path
 
 from . import extract, fuzzy, store
@@ -17,6 +18,9 @@ SPREAD = 2_000          # the number of pages such a sample aims at
 SHARED = 120
 # What the names give for one way of sharing is read to this many documents at most.
 LISTED = 300
+# And the look into the text does not go on beyond this many seconds, whatever the size of the index: the
+# ways with the fewest candidates come first, so that what is lost is the tail of the broadest way.
+BOTH_SECONDS = 0.06
 # What is a document, as against the programs, pictures and data that some folders hold: among
 # matches of the same kind, documents are listed first.
 DOCUMENTS = frozenset("pdf djvu ps ps.gz epub txt md rst tex bib typ doc docx odt rtf html htm fb2 mobi azw3 chm "
@@ -429,8 +433,10 @@ def search(db, query, *, root=None, fmt=None, limit=25, exact=False, where="all"
         what the others left, so that a word that is in many names cannot take all of it."""
         if len(parts) > MOST:
             return
-        crossed, aimed, ways = set(), targets(parts, close, exact), []
+        crossed, aimed, ways, began = set(), targets(parts, close, exact), [], time.perf_counter()
         for chosen, rest in shares(len(parts)):
+            if time.perf_counter() - began > 0.6 * BOTH_SECONDS:
+                break                           # the ways that give the names most words come first, and are the quick ones
             names_expr = " AND ".join(clause(parts, close, index, exact) for index in chosen)
             text_expr = " AND ".join(clause(parts, close, index, exact, True) for index in rest)
             sql = (f"SELECT {COLUMNS} FROM names JOIN files f ON f.id=names.rowid JOIN docs d ON d.id=f.doc "
@@ -448,7 +454,7 @@ def search(db, query, *, root=None, fmt=None, limit=25, exact=False, where="all"
             for row in rows:
                 if row["doc"] in crossed or len(crossed) >= limit:
                     continue
-                if spent >= allowance:
+                if spent >= allowance or time.perf_counter() - began > BOTH_SECONDS:
                     break
                 spent += 1
                 first, last = db.execute("SELECT min(id),max(id) FROM pages WHERE doc=?", (row["doc"],)).fetchone()

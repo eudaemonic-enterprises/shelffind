@@ -55,7 +55,7 @@ def parser():
     mode.add_argument("--names-only", action="store_true",
                       help="Update the list of files and ask the sources and the storage about them; open no file")
     mode.add_argument("--ocr", action="store_true", help="Recognize pages missing embedded text")
-    ix.add_argument("--lang", default="eng", help="Installed Tesseract languages, e.g. eng+fra")
+    ix.add_argument("--lang", help="Installed Tesseract languages, e.g. eng+fra (the setting index.ocr; eng)")
     ix.add_argument("--retry", action="store_true", help="Include previous extraction or OCR failures")
     ix.add_argument("--order", choices=("random", "smallest", "largest"),
                     help="Order of reading: the smallest documents first brings the most text in the least time "
@@ -362,7 +362,7 @@ def execute(args, db, directory, settings):
         place = sharing.carrier(settings) if settings["share.texts"] else None
         try:
             count, failures = indexer.build(
-                db, directory, roots, names_only=args.names_only, ocr=args.ocr, languages=args.lang,
+                db, directory, roots, names_only=args.names_only, ocr=args.ocr, languages=args.lang or settings["index.ocr"],
                 retry=args.retry, limit=args.limit, paths=files, relink=args.relink, progress=said,
                 on_document=step, workers=max(1, min(16, settings["index.workers"])),
                 order=args.order or settings["index.order"],

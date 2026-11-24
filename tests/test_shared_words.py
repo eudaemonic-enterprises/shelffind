@@ -3,6 +3,7 @@
 import json
 import re
 import unittest
+from unittest.mock import patch
 
 from shelffind import search
 
@@ -71,6 +72,9 @@ class Shared(Shelf):
         self.assertEqual(rows["Whitham-LinearAndNonlinearWaves.txt"]["match"], "name and passage")
 
     def test_the_look_into_the_text_of_the_documents_that_the_names_give_is_bounded(self):
+        patcher = patch.object(search, "BOTH_SECONDS", 3600)         # the count is tried here, not the clock
+        patcher.start()
+        self.addCleanup(patcher.stop)
         for n in range(search.SHARED * 3):
             (self.root / f"Alpha{n:04d}.txt").write_text(f"beta number {n} " * 5)
         self.build()
@@ -101,6 +105,17 @@ class Shared(Shelf):
         for query in ("waves whitham", "whitham waves"):
             found = [(r["name"], r["match"]) for r in search.search(self.db, query, where="all")]
             self.assertIn(("Whitham-Notes.txt", "name and passage"), found, query)
+
+    def test_the_look_into_the_text_stops_when_its_seconds_are_spent(self):
+        for n in range(200):
+            (self.root / f"Alpha{n:04d}.txt").write_text(f"beta number {n} " * 5)
+        self.build()
+        probes = []
+        self.db.set_trace_callback(lambda sql: probes.append(sql) if re.search(r"AND rowid BETWEEN \d+ AND \d+", sql) else None)
+        with patch.object(search, "BOTH_SECONDS", 0.0):
+            self.assertEqual(search.search(self.db, "alpha gamma", where="all"), [])
+        self.assertLessEqual(len(probes), 1)
+        self.db.set_trace_callback(None)
 
     def test_how_the_words_are_shared(self):
         self.assertEqual(search.shares(1), [])

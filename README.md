@@ -97,6 +97,7 @@ path = "~/Documents/Books"                      # a folder named here is registe
 [index]
 workers = 4                                     # files copied at once while a document is read, 1 to 16
 order   = "random"                              # or "smallest" first, or "largest" first
+ocr     = "eng+fra+rus"                         # the languages of Tesseract for scanned pages (--lang wins)
 
 [convert.doc]
 command = ["antiword", "{path}"]                # a format read by a program that prints its text

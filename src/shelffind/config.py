@@ -51,6 +51,8 @@ SETTINGS = {
     "search.exact": (bool, False, "Whether the panel opens on exact search: the words as typed, with no "
                                   "completion, no spelling help and no letters in order."),
     "index.refresh": (int, 60, "Minutes after which opening the panel refreshes the list of files; 0 never."),
+    "index.ocr": (str, "eng", "Languages of Tesseract for the recognition of scanned pages, such as eng+fra+rus; the flag "
+                              "--lang of index wins."),
     "index.order": (("random", "smallest", "largest"), "random",
                     "Order of reading: the smallest documents first, which brings the most text in the least time "
                     "over a slow line, the largest first, or random, an order of each machine's own."),

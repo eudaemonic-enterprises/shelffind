@@ -6,6 +6,16 @@ ShelfFind follows semantic versioning. Before version 1.0 a minor version may ch
 JSON keys and the exit codes that other programs rely on are kept from one version to the next and
 are covered by tests.
 
+## 0.5.1
+
+The languages of the recognition of scanned pages are a setting, `index.ocr` (`eng` by default, for
+instance `eng+fra+rus`), which the flag `--lang` of `index` overrides; the five languages of Dr
+Dutykh's shelves cost about 5 percent more than English alone. The look into the text for the
+words of a query that are shared between the name and the text keeps to 60 milliseconds, the
+ways that give the names most words being tried first: on an index of 270 000 pages a query of
+three common words took 330 milliseconds with the shared words and 15 without, and takes 80 now,
+and a query of five common words, 385 milliseconds, takes 125.
+
 ## 0.5.0
 
 A reading waits for the folder, not for the computer, and the search finds more.

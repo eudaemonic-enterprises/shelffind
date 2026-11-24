@@ -256,6 +256,24 @@ class Pages(Shelf):
         self.assertEqual([" ".join(text.split()).lower() for text in self.texts()], [w.lower() for w in words])
         self.assertEqual(self.db.execute("SELECT state FROM docs").fetchone()[0], "indexed")
 
+    def test_the_recognition_takes_its_languages_from_the_setting_or_the_flag(self):
+        self.scan(2)
+        used = []
+
+        def recognise(path, fmt, work, number, languages):
+            used.append(languages)
+            return f"page {number}"
+        for text, argv, wanted in (("", [], "eng"), ('[index]\nocr = "eng+fra"\n', [], "eng+fra"),
+                                   ('[index]\nocr = "eng+fra"\n', ["--lang", "deu"], "deu")):
+            self.db.execute("UPDATE pages SET needs_ocr=1,ztext=?", (store.deflate(""),))
+            self.db.execute("UPDATE docs SET state='needs-ocr'")
+            self.db.commit()
+            (self.data / "config.toml").write_text(text)
+            del used[:]
+            with patch("shelffind.extract.recognize", side_effect=recognise):
+                code, _, _ = self.run_cli("index", "--ocr", *argv)
+            self.assertEqual((code, set(used)), (0, {wanted}))
+
     def test_djvu_pages_asked_for_one_by_one_come_back_in_order(self):
         live, widest, lock = [0], [0], threading.Lock()
 

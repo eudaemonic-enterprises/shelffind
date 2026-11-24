@@ -53,6 +53,10 @@ class Layers(unittest.TestCase):
                          ("bottom", "command line"))
         self.assertEqual(settings.height(10), 9)
 
+    def test_the_languages_of_the_recognition_are_a_setting_and_the_flag_wins(self):
+        self.assertEqual(self.load()["index.ocr"], "eng")
+        self.assertEqual(self.load('[index]\nocr = "eng+fra+rus"\n')["index.ocr"], "eng+fra+rus")
+
     def test_machines_are_named_by_label_in_the_settings(self):
         label = "0123456789abcdef"
         settings = self.load(f'[machines]\n{label} = "home"\n')
