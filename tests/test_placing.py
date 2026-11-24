@@ -509,6 +509,59 @@ class Sixth(Placing):
         self.sound()
 
 
+class Handed(Placing):
+    """Pages that go with their file to the document it is measured to be."""
+
+    def pages(self, doc, rows, state):
+        self.db.executemany("INSERT INTO pages(doc,page,section,ztext,needs_ocr) VALUES(?,?,NULL,?,?)",
+                            [(doc, page, store.deflate(text), int(not text)) for page, text in rows])
+        self.db.execute("UPDATE docs SET state=?,error=? WHERE id=?", (state, "the recogniser stumbled" if state == "ocr-error" else None, doc))
+
+    def test_the_pages_of_the_document_are_kept_when_they_went_further_than_those_that_come(self):
+        with self.db:
+            old, new = store.new_document(self.db, 9, "pdf"), store.new_document(self.db, 9, "pdf")
+            self.pages(old, [(1, "first page"), (2, "")], "needs-ocr")
+            self.pages(new, [(1, "first page"), (2, "second page")], "indexed")
+            self.assertFalse(store.hand_over(self.db, old, new))
+        rows = [(row[0], store.inflate(row[1])) for row in self.db.execute("SELECT page,ztext FROM pages ORDER BY page")]
+        self.assertEqual(rows, [(1, "first page"), (2, "second page")])
+        self.assertEqual([tuple(row) for row in self.db.execute("SELECT id,state FROM docs ORDER BY id")],
+                         [(old, "pending"), (new, "indexed")])
+
+    def test_a_recognition_that_failed_is_still_known_to_have_failed_after_the_pages_are_handed_over(self):
+        with self.db:
+            old, new = store.new_document(self.db, 9, "pdf"), store.new_document(self.db, 9, "pdf")
+            self.pages(old, [(1, "first page"), (2, "")], "ocr-error")
+            self.assertTrue(store.hand_over(self.db, old, new))
+        self.assertEqual(self.db.execute("SELECT state,error FROM docs WHERE id=?", (new,)).fetchone()[:],
+                         ("ocr-error", "the recogniser stumbled"))
+
+    def test_a_file_measured_as_the_checksum_of_a_document_of_another_size_stays_apart(self):
+        one = self.write("a/book.txt")
+        self.write("b/short.txt", "A short note.")
+        self.build(names_only=True)
+        self.measure("a/book.txt")
+        with self.db:                                       # a storage that holds other bytes gives the MD5 of the first
+            self.assertTrue(indexer.joined(self.db, self.ids()["b/short.txt"], self.sums(one)[:1], local=False))
+        docs = self.docs()
+        self.assertNotEqual(docs["a/book.txt"], docs["b/short.txt"])
+        self.assertEqual(self.build(), (2, 0))              # read, each is known by what it holds
+        self.sound()
+
+    def test_a_lone_file_does_not_give_its_checksums_to_pages_tied_to_other_bytes(self):
+        path = self.write("book.txt")
+        self.build()
+        with self.db:                                       # the pages are tied to bytes that the document is no longer known by
+            self.db.execute("DELETE FROM doc_keys")
+            self.db.execute("UPDATE files SET sum=NULL,read=0")
+            self.db.execute("UPDATE docs SET origin=? WHERE origin IS NOT NULL", ("md5:" + "aa" * 16 + " sha256:" + "bb" * 32,))
+        self.measure("book.txt")
+        tied = self.db.execute("SELECT d.id FROM docs d WHERE EXISTS (SELECT 1 FROM pages p WHERE p.doc=d.id)").fetchone()[0]
+        self.assertNotEqual(self.docs()["book.txt"], tied)  # the file is a document of its own, without those pages
+        self.assertEqual(self.sums(path), [row["key"] for row in self.db.execute(
+            "SELECT key FROM doc_keys WHERE doc=? ORDER BY key", (self.docs()["book.txt"],))])
+
+
 class Proofs(Placing):
     """A complete run proves or refutes every statement, in a folder with a storage too."""
 
