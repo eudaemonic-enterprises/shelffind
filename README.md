@@ -102,7 +102,7 @@ order   = "random"                              # or "smallest" first, or "large
 command = ["antiword", "{path}"]                # a format read by a program that prints its text
 
 [machines]
-0123456789abcdef = "home"                       # a name for a machine by its label, shown by `shelffind machine`
+0123456789abcdef = "home"                       # a name for a machine by its label, which `shelffind machine` prints
 
 [theme.dusk]
 match    = "bold #e0af68"
