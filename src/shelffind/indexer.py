@@ -660,7 +660,7 @@ def update_text(db, root, row, ocr, languages, wanted=None, hold=None, offered=N
 
 def build(db, directory, selected, *, names_only=False, ocr=False, languages="eng",
           retry=False, limit=None, progress=print, paths=(), on_document=None, relink=False, exchange=None,
-          workers=1):
+          workers=1, order="random"):
     """Refresh the inventory, compare the files with the documents already known, ask the
     sources which files they know, then read the waiting documents. `selected` is the list of
     folders, or a function that gives it once no other build can change them.
@@ -684,6 +684,12 @@ def build(db, directory, selected, *, names_only=False, ocr=False, languages="en
     documents known by more checksums: the files are then compared and the sources asked
     again, for as long as that teaches something. The exchange concerns the whole index,
     whatever the folders or the files chosen.
+
+    The documents are read in the order that `order` gives: "smallest" or "largest" by the size
+    of their file, so that a reading limited by the speed of a network brings the most documents
+    in the least time, or the big ones that another machine is not taking first; and "random",
+    an order of this data folder's own when it exchanges texts, which two data folders reading
+    at once do not share. Each is the same from one run to the next.
 
     With `workers` above one, the files of the documents that come next are copied, that many
     at once, while a document is read, so that the waits of a network folder overlap (see
@@ -794,11 +800,16 @@ def build(db, directory, selected, *, names_only=False, ocr=False, languages="en
                             candidates.setdefault(row["doc"], []).append((root, row))
                 if not candidates:
                     break
-                if exchange is not None:
+                if exchange is not None or order != "random":
                     # An order of this data folder's own, the same from one run to the next.
-                    candidates = dict(sorted(candidates.items(), key=lambda item: hashlib.sha256(
-                        "\0".join((exchange.writer or exchange.label, item[1][0][0]["name"], item[1][0][1]["rel"])).encode(
-                            "utf-8", "surrogatepass")).digest()))
+                    seed = (exchange.writer or exchange.label) if exchange is not None else ""
+
+                    def sequence(item):
+                        root, row = item[1][0]
+                        mixed = hashlib.sha256("\0".join((seed, root["name"], row["rel"])).encode(
+                            "utf-8", "surrogatepass")).digest()
+                        return ((row["size"] if order == "smallest" else -row["size"]) if order != "random" else 0, mixed)
+                    candidates = dict(sorted(candidates.items(), key=sequence))
                 if hold is None:
                     try:
                         hold = copies_folder(db, directory)

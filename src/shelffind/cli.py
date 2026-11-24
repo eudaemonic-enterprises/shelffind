@@ -57,6 +57,9 @@ def parser():
     mode.add_argument("--ocr", action="store_true", help="Recognize pages missing embedded text")
     ix.add_argument("--lang", default="eng", help="Installed Tesseract languages, e.g. eng+fra")
     ix.add_argument("--retry", action="store_true", help="Include previous extraction or OCR failures")
+    ix.add_argument("--order", choices=("random", "smallest", "largest"),
+                    help="Order of reading: the smallest documents first brings the most text in the least time "
+                         "over a slow line (the setting index.order)")
     ix.add_argument("--limit", type=int, help="Maximum number of documents to read this pass")
     ix.add_argument("--root", help="Index one registered folder")
     ix.add_argument("--file", type=Path, action="append", default=[], help="Read text from selected files only (repeatable)")
@@ -361,6 +364,7 @@ def execute(args, db, directory, settings):
                 db, directory, roots, names_only=args.names_only, ocr=args.ocr, languages=args.lang,
                 retry=args.retry, limit=args.limit, paths=files, relink=args.relink, progress=said,
                 on_document=step, workers=max(1, min(16, settings["index.workers"])),
+                order=args.order or settings["index.order"],
                 exchange=parcels.Exchange(directory, db, place, said) if place is not None else None)
         finally:
             if live:
