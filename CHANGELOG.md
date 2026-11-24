@@ -20,10 +20,14 @@ scanned document are recognised several at once and kept in the order of the pag
 interruption keeps all those before it, and the DjVu pages that must be asked for one by one are
 read at once. Programs are limited by `prlimit` where it exists, which lets several run at
 once, and Tesseract is held to one thread each. During a long reading, the next exchange with
-the shared place begins two minutes after the last one ended, or four times as long after as it
+the shared place begins two minutes after the last one ended, or ten times as long after as it
 took when that is longer, so that reading keeps most of the time; before, an exchange of more
 than two minutes with a distant place was followed by another at once. A reading whose output is
-a log writes one line a minute, with the time.
+a log writes one line a minute, with the time. Over a slow line a reading is limited by the bytes
+it must take, and the smallest documents bring the most text for them: the order of reading is a
+setting, `index.order`, and a flag, `index --order`: `random` (an order of each data folder's own,
+as before), `smallest` or `largest` by the size of the file, which lets two machines read from the
+two ends of a shelf.
 
 A folder on a network whose program has died answers with the error "Transport endpoint is not
 connected". Python 3.13 raised it from the test of whether a folder exists, which stopped
