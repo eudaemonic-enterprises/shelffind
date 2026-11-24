@@ -22,7 +22,6 @@ import json
 import os
 import re
 import subprocess
-import tempfile
 import time
 from pathlib import Path
 
@@ -31,6 +30,10 @@ from . import history, machine, store
 FORMAT = 1
 MONTH = re.compile(r"\d{4}-\d{2}\Z")
 MONTHS = 3              # journals of this many months are taken from the other machines
+
+
+class Oversized(ValueError):
+    """A file of the shared place larger than it should be: refused before it is read."""
 
 
 class Folder:
@@ -52,19 +55,30 @@ class Folder:
         try:
             with (self.path / name).open("rb") as held:
                 if limit is not None and os.fstat(held.fileno()).st_size > limit:
-                    raise ValueError(f"{name} is larger than it should be")
+                    raise Oversized(f"{name} is larger than it should be")
                 return held.read()
         except FileNotFoundError:
             return None
 
+    def delete(self, name):
+        (self.path / name).unlink(missing_ok=True)
+
     def put(self, name, data):
+        """Write a file of the shared place under a passing name, NAME.arriving.PID, then move it
+        to its own, so that no one meets it half written; what a writing cut short leaves under
+        that name is its writer's alone to remove."""
         target = self.path / name
         target.parent.mkdir(parents=True, exist_ok=True)
-        with tempfile.NamedTemporaryFile(dir=target.parent, prefix=".arriving.", delete=False) as out:
-            out.write(data)
-            out.flush()
-            os.fsync(out.fileno())
-        os.replace(out.name, target)
+        passing = target.with_name(f"{target.name}.arriving.{os.getpid()}")
+        try:
+            with passing.open("wb") as out:
+                out.write(data)
+                out.flush()
+                os.fsync(out.fileno())
+            os.replace(passing, target)
+        except BaseException:
+            passing.unlink(missing_ok=True)
+            raise
 
 
 class Rclone:
@@ -84,8 +98,8 @@ class Rclone:
     @staticmethod
     def fault(err):
         """What rclone says went wrong: its last line, which follows its notices."""
-        lines = [line for line in err.splitlines() if line.strip()]
-        return f"rclone: {(lines[-1] if lines else 'no answer')[:300]}"
+        lines = [line for line in err.splitlines() if line.strip() and " NOTICE: " not in line]
+        return f"rclone: {(lines[-1] if lines else 'it stopped without saying why')[:300]}"
 
     def names(self, folder):
         code, out, err = self.run("lsf", "--files-only", f"{self.remote}/{folder}", seconds=300)
@@ -105,8 +119,13 @@ class Rclone:
                 return None
             raise ValueError(self.fault(err))
         if limit is not None and len(out) > limit:
-            raise ValueError(f"{name} is larger than it should be")
+            raise Oversized(f"{name} is larger than it should be")
         return out
+
+    def delete(self, name):
+        code, _, err = self.run("deletefile", f"{self.remote}/{name}", seconds=120)
+        if code and "not found" not in err:
+            raise ValueError(self.fault(err))
 
     def put(self, name, data):
         """Write a file of the shared place under a passing name, then move it to its own:

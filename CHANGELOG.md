@@ -9,19 +9,26 @@ are covered by tests.
 ## 0.4.0 (in preparation)
 
 The text that one machine reads travels to the others. With `share.texts`, each data folder puts
-the pages it read in the shared place of the journals, in parcels of at most 16 MB that are never
-changed once written, listed with their checksums under a name of its own; a parcel is written
-under a passing name, then given its own. Another machine takes a parcel only when its checksum
-agrees, so a parcel cut or changed on the way is taken another time. The pages are given only
-by a run of the index, once its files are listed and its sources asked, to the document known
-by a measure by the checksums of their bytes, when it waits for its text and no source holds
-its text; readings of the same pages add up page by page, and nothing recognised is replaced. A
+the pages it read in the shared place of the journals, in parcels of at most 16 MB that unpack to
+at most 256 MB, are never changed once written and never take a number twice, listed with their
+checksums under a name of the data folder's own; a parcel is written under a passing name, then
+given its own. Another machine takes a parcel only when its checksum and its number of documents
+agree, so a parcel cut or changed on the way is taken another time. The pages are given only by
+a run of the index, once its files are listed and its sources asked, to the document known by a
+measure by the checksums of their bytes, when it waits for its text and no source holds its
+text; readings of the same pages add up page by page, and nothing recognised is replaced. A
 complete run takes what the others read before it compares the files, reads in an order of the
-data folder's own, gives a copied file what another machine read of its bytes before extracting
-anything, and exchanges every two minutes while it reads, so that several machines can share one
-long reading. `shelffind sync` carries parcels both ways. What a data folder knows of the parcels
-is kept in `exchange.sqlite3`, bound to one shared place, checked at each exchange against the
-shared place, and may be deleted while nothing runs.
+data folder's own, leaves unread a copied file whose bytes another machine read, which takes
+those pages at the end of the pass once the sources were asked, and exchanges every two minutes
+while it reads, so that several machines can share one long reading. Pages read by version 0.2
+are not given to other machines. `shelffind sync` carries parcels both ways, with exit code 1
+when the shared place fails. What a data folder knows of the parcels is kept in
+`exchange.sqlite3`, bound to one shared place, checked at each exchange against the shared place,
+and may be deleted while nothing runs.
+
+When a file read by version 0.2 joins a document read since, the two readings are joined page by
+page when they have the same pages, and otherwise the one that recognised more pages is kept: a
+page recognised by the earlier version is no longer lost to a shorter reading.
 
 A file that a pass of a run copied without reading it may be read by a later pass of the same
 run, and is taken at most twice, so that a run always ends.

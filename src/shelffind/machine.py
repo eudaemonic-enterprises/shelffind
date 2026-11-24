@@ -5,6 +5,7 @@ A machine is known by a label of sixteen hexadecimal digits drawn from its syste
 with a key of ShelfFind's own, so that the identifier itself never leaves the machine, and by
 a name for people. Both are kept in the data folder.
 """
+import fcntl
 import hashlib
 import hmac
 import json
@@ -15,6 +16,8 @@ import tempfile
 from pathlib import Path
 
 NAME = "machine.json"
+WRITING = "writer.json"     # the name under which this data folder writes, apart from what 0.3 rewrites
+LOCK = "machine.lock"
 LABEL = re.compile(r"[0-9a-f]{16}\Z")
 SOURCES = ("/etc/machine-id", "/var/lib/dbus/machine-id")
 
@@ -31,11 +34,19 @@ def system_label():
     return None
 
 
-def write(directory, told):
+def write(directory, told, name=NAME):
     directory.mkdir(mode=0o700, parents=True, exist_ok=True)
-    with tempfile.NamedTemporaryFile(mode="w", dir=directory, prefix=NAME + ".", delete=False) as out:
+    with tempfile.NamedTemporaryFile(mode="w", dir=directory, prefix=name + ".", delete=False) as out:
         json.dump(told, out, indent=2)
-    os.replace(out.name, directory / NAME)
+    os.replace(out.name, directory / name)
+
+
+def read(path):
+    try:
+        told = json.loads(path.read_text())
+        return told if isinstance(told, dict) else {}
+    except (OSError, ValueError):
+        return {}
 
 
 def identity(directory, name=None):
@@ -44,37 +55,47 @@ def identity(directory, name=None):
     and kept; a data folder copied from another machine gets a label of its own. The writer is
     the data folder's own, so that two data folders of one machine never write the same file
     of the shared place: a folder copied, even on the same machine, gets a writer of its own,
-    since the folder that holds it is another one. `name` gives the machine a new name."""
+    since the folder that holds it is another one; a machine copied whole, with its system
+    identifier and its disk, keeps it, and its copy must be given another by removing the
+    file WRITING of its data folder. Two processes that start together agree on one writer.
+    `name` gives the machine a new name."""
     directory = Path(directory)
     try:
         directory.mkdir(mode=0o700, parents=True, exist_ok=True)     # the folder that holds the writer is this one
+        held = (directory / LOCK).open("a")
     except OSError:
-        pass
+        held = None
     try:
-        told = json.loads((directory / NAME).read_text())
-        told = told if isinstance(told, dict) else {}
-    except (OSError, ValueError):
-        told = {}
-    system = system_label()
-    label, known = told.get("id"), told.get("system")
-    fresh = not isinstance(label, str) or not LABEL.match(label) or known != (system is not None) \
-        or (system is not None and label != system)
-    if fresh:
-        label = system or os.urandom(8).hex()
-    try:
-        info = directory.stat()
-        here = f"{info.st_dev}:{info.st_ino}"
-    except OSError:
-        here = ""
-    writer = told.get("writer")
-    if fresh or not isinstance(writer, str) or not LABEL.match(writer) or told.get("folder") != here:
-        writer = os.urandom(8).hex()
-    shown = name or told.get("name") or socket.gethostname().split(".")[0] or "machine"
-    wanted = {"id": label, "name": " ".join(str(shown).split())[:40], "system": system is not None,
-              "writer": writer, "folder": here}
-    if wanted != told:
+        if held is not None:
+            fcntl.flock(held, fcntl.LOCK_EX)
+        told = read(directory / NAME)
+        system = system_label()
+        label, known = told.get("id"), told.get("system")
+        fresh = not isinstance(label, str) or not LABEL.match(label) or known != (system is not None) \
+            or (system is not None and label != system)
+        if fresh:
+            label = system or os.urandom(8).hex()
+        shown = name or told.get("name") or socket.gethostname().split(".")[0] or "machine"
+        wanted = {"id": label, "name": " ".join(str(shown).split())[:40], "system": system is not None}
+        if wanted != told:
+            try:
+                write(directory, wanted)
+            except OSError:
+                pass
         try:
-            write(directory, wanted)
+            info = directory.stat()
+            here = f"{info.st_dev}:{info.st_ino}"
         except OSError:
-            pass
-    return {"id": wanted["id"], "name": wanted["name"], "writer": wanted["writer"]}
+            here = ""
+        mine = read(directory / WRITING)
+        writer = mine.get("writer")
+        if not isinstance(writer, str) or not LABEL.match(writer) or mine.get("machine") != label or mine.get("folder") != here:
+            writer = os.urandom(8).hex()
+            try:
+                write(directory, {"writer": writer, "machine": label, "folder": here}, WRITING)
+            except OSError:
+                pass
+        return {"id": wanted["id"], "name": wanted["name"], "writer": writer}
+    finally:
+        if held is not None:
+            held.close()

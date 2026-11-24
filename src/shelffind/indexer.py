@@ -431,9 +431,10 @@ def update_text(db, root, row, ocr, languages, wanted=None, hold=None, offered=N
     bytes that the checksums describe. A file that cannot be copied as the inventory saw it
     raises Unreadable, a copy that cannot be written raises Unplaced, and any other failure is
     that of what the file holds. Once the pages are kept, nothing that happens to the copy or
-    to its folder is a failure of the document. `offered(document)` gives the document what
-    another machine read of these very bytes, once the copy has measured them and before
-    anything is extracted (see `parcels`): what it gave is not read again."""
+    to its folder is a failure of the document. `offered(document, file, unchanged)` tells,
+    once the copy has measured the bytes and before anything is extracted, whether the document
+    is to wait for what another data folder read of these very bytes (see `parcels.Exchange.offer`),
+    `unchanged()` saying later whether the file is still the one copied: it is then not read."""
     path = Path(root["path"]) / row["rel"]
     file = db.execute("SELECT id,sum FROM files WHERE id=? AND root=? AND rel=?", (row["id"], root["id"], row["rel"])).fetchone()
     if file is None:
@@ -464,10 +465,15 @@ def update_text(db, root, row, ocr, languages, wanted=None, hold=None, offered=N
             wanted = lambda doc, state: state == ("needs-ocr" if ocr else "pending")
         if not wanted(doc, told["state"]):
             return False
-        if offered is not None and offered(doc):
-            told = db.execute("SELECT d.id,d.state FROM docs d WHERE d.id=?", (doc,)).fetchone()
-            if not wanted(doc, told["state"]):
-                return False                    # what another machine read of these bytes is given: nothing to read
+        if offered is not None:
+            def unchanged():
+                try:
+                    check_stamp(path, row, same)
+                    return True
+                except (OSError, ValueError):
+                    return False
+            if offered(doc, file["id"], unchanged):
+                return False                    # what another read of these bytes is on its way: nothing to read
         with extract.document(copy, row["format"], held) as (source, fmt, work):
             if ocr:
                 # The pages are recognised from the copy, whose bytes are those the document is
@@ -520,11 +526,13 @@ def build(db, directory, selected, *, names_only=False, ocr=False, languages="en
     asked, so that a document read elsewhere is not read here and a document left to a source
     stays so; an inventory alone does this much. A complete run then reads the documents in an
     order of this data folder's own, so that two data folders reading at once begin with
-    different documents, gives a copied file what another read of its very bytes before
-    extracting anything, exchanges texts after a document read when the last exchange is more
-    than two minutes old, and gives what it read at the end. Pages given make documents known
-    by more checksums: the files are then compared and the sources asked again. The exchange
-    concerns the whole index, whatever the folders or the files chosen."""
+    different documents; a copied file of which another read the very bytes is not read, its
+    document taking those pages at the end of the pass, once the sources were asked about the
+    checksums just measured; the run exchanges texts after a document read when the last
+    exchange is more than two minutes old, and gives what it read at the end. Pages given make
+    documents known by more checksums: the files are then compared and the sources asked
+    again, for as long as that teaches something. The exchange concerns the whole index,
+    whatever the folders or the files chosen."""
     done = failures = 0
     ready = []
     with store.index_lock(directory):
@@ -568,18 +576,26 @@ def build(db, directory, selected, *, names_only=False, ocr=False, languages="en
             link.cover(db, directory)
             return missed
 
-        def exchanged(*steps):
-            """Exchange texts. Pages taken from another machine make a document known by more
-            checksums, which may refute what a source said of a file or show what other files
-            hold: the files are then compared and the sources asked again, so that the run
-            ends with nothing left for the next one. Returns the problems of that comparison."""
-            taken = exchange.counts["received"]
-            exchange.run(*steps)
-            return acquaint(not names_only, not names_only) if exchange.counts["received"] > taken else 0
+        def exchanged():
+            """Give the documents what was offered for them, the sources having just been asked.
+            Pages taken from another machine, or the checksums that come with them, make a
+            document known by more checksums, which may refute what a source said of a file or
+            show what other files hold: the files are then compared and the sources asked again,
+            and what is offered given again, for as long as that teaches something, so that the
+            run ends with nothing left for the next one. Returns the problems of the comparisons."""
+            missed = 0
+            for _ in range(4):
+                taken, learnt = exchange.counts["received"], exchange.learnt
+                exchange.settled()
+                exchange.run("apply")
+                if (exchange.counts["received"], exchange.learnt) == (taken, learnt):
+                    break
+                missed += acquaint(not names_only, not names_only)
+            return missed
 
         failures += acquaint(not names_only, not names_only, relink)
         if exchange is not None:                # the files compared may hold what was offered
-            failures += exchanged("apply")
+            failures += exchanged()
         if names_only:
             return done, failures
         # The copies are made in a folder that the run makes for itself in the data folder,
@@ -661,10 +677,13 @@ def build(db, directory, selected, *, names_only=False, ocr=False, languages="en
                                            exchange.offer if exchange is not None else None):
                                 done += 1
                                 tried.add(row["id"])
-                            elif row["id"] in measured:
-                                tried.add(row["id"])        # copied twice without a reading: not a third time
                             else:
-                                measured.add(row["id"])
+                                if row["id"] in measured:
+                                    tried.add(row["id"])    # copied twice without a reading: not a third time
+                                else:
+                                    measured.add(row["id"])
+                                if exchange is not None and row["id"] in exchange.held:
+                                    break                   # its text is on its way: no other file of it is copied
                         except sqlite3.Error:
                             raise
                         except Unplaced as exc:     # no room for the copy: nothing is wrong with the documents
@@ -733,7 +752,7 @@ def build(db, directory, selected, *, names_only=False, ocr=False, languages="en
                     offered = exchange.sizes()
                 failures += acquaint(True, True)
                 if exchange is not None:
-                    failures += exchanged("apply")
+                    failures += exchanged()
             if exchange is not None:
                 exchange.run("send", wait=True)
         finally:

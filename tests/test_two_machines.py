@@ -7,11 +7,13 @@ import contextlib
 import hashlib
 import json
 import os
+import sqlite3
 import tempfile
 import threading
 import time
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import patch
 
 import invariants
@@ -447,6 +449,139 @@ class Damage(Two):
         self.forbidden.add("office")
         self.assertEqual(self.build("office")[1], counts(received=4))
 
+    def test_a_list_that_names_a_parcel_wrongly_is_written_anew(self):
+        self.shelf()
+        self.build("home")
+        listing = self.shared / "texts" / f"{self.writer('home')}.json"
+        told = json.loads(listing.read_text())
+        true = told["parcels"][0]["sha256"]
+        told["parcels"][0]["sha256"] = "0" * 64
+        listing.write_text(json.dumps(told))
+        self.assertEqual(self.build("home")[1]["sent"], 0)
+        self.assertEqual(self.listed("home")["parcels"][0]["sha256"], true)
+        self.forbidden.add("office")
+        self.assertEqual(self.build("office")[1], counts(received=4))
+
+    def test_what_a_writing_cut_short_left_is_removed_by_its_writer_alone(self):
+        self.shelf()
+        self.build("home")
+        mine, theirs = self.writer("home"), "f" * 16
+        left = [self.shared / "texts" / f"{mine}.json.arriving.4242", self.shared / "texts" / mine / "000007.jsonl.gz.arriving.17",
+                self.shared / "texts" / f"{theirs}.json.arriving.99"]
+        for path in left:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_bytes(b"cut short")
+        self.build("home")
+        self.assertEqual([path.exists() for path in left], [False, False, True])
+
+    def test_a_parcel_late_to_arrive_keeps_its_number(self):
+        self.shelf()
+        self.build("home")
+        parcel = self.parcels_of("home")[0]
+        whole = parcel.read_bytes()
+        parcel.unlink()                                 # not yet carried back by a folder that synchronises,
+        for path in self.machines["home"]["data"].glob(parcels.KEEPING + "*"):
+            path.unlink()                               # and the bookkeeping lost
+        self.write("Waves/currents.txt", "Currents of the narrow straits. " * 300)
+        self.assertEqual(self.build("home")[1]["sent"], 5)
+        self.assertEqual([path.name for path in self.parcels_of("home")], ["000002.jsonl.gz"])
+        parcel.write_bytes(whole)                       # carried at last: its name kept its meaning
+        self.forbidden.add("office")
+        self.assertEqual(self.build("office")[1], counts(received=5))
+
+    def test_a_parcel_of_its_own_that_cannot_be_read_yet_stays_named(self):
+        self.shelf()
+        self.build("home")
+        before = self.listed("home")["parcels"]
+        parcel = self.parcels_of("home")[0]
+        whole = parcel.read_bytes()
+        parcel.write_bytes(whole[:-5])                  # still arriving when the bookkeeping was lost
+        for path in self.machines["home"]["data"].glob(parcels.KEEPING + "*"):
+            path.unlink()
+        self.assertTrue(self.exchange("home").run("receive"))
+        self.assertEqual(self.listed("home")["parcels"], before)
+        parcel.write_bytes(whole)
+        self.forbidden.add("office")
+        self.assertEqual(self.build("office")[1], counts(received=4))
+        self.assertEqual(self.build("home")[1], counts())  # taken back, and nothing given twice
+
+    def test_a_parcel_of_its_own_of_a_newer_format_stays_named(self):
+        self.shelf(on=("home",))
+        with patch.object(parcels, "FORMAT", 2):        # written by a newer ShelfFind of this data folder
+            self.gift(self.writer("home"), [self.line("Waves/tides.txt", [[None, None, TEXTS["Waves/tides.txt"], 0]])])
+        before = self.listed("home")["parcels"]
+        told = self.exchange("home")
+        self.assertTrue(told.run("receive"))
+        self.assertEqual((self.listed("home")["parcels"], told.counts["newer"]), (before, 1))
+
+    def test_a_list_of_its_own_written_by_a_newer_version_is_left_to_it(self):
+        self.shelf()
+        self.build("home")
+        listing = self.shared / "texts" / f"{self.writer('home')}.json"
+        told = json.loads(listing.read_text())
+        listing.write_text(json.dumps({**told, "format": 2}))
+        kept = listing.read_bytes()
+        self.write("Waves/currents.txt", "Currents of the narrow straits. " * 300)
+        said = []
+        machine_ = self.machines["home"]
+        with self.at("home"):
+            exchange = parcels.Exchange(machine_["data"], machine_["db"], self.place(), said.append)
+            indexer.build(machine_["db"], machine_["data"], store.roots(machine_["db"]), progress=lambda _: None, exchange=exchange)
+        self.assertEqual((listing.read_bytes(), len(self.parcels_of("home")), exchange.counts["sent"]), (kept, 1, 0))
+        self.assertTrue(any("newer ShelfFind" in line for line in said))
+        self.assertEqual(self.build("office", limit=0)[1], counts(newer=1))    # the others wait for that version too
+
+    def test_a_parcel_that_holds_other_documents_than_its_list_says_is_not_taken(self):
+        self.shelf()
+        self.build("home")
+        listing = self.shared / "texts" / f"{self.writer('home')}.json"
+        told = json.loads(listing.read_text())
+        told["parcels"][0]["documents"] = 5
+        listing.write_text(json.dumps(told))
+        self.assertEqual(self.build("office", limit=0)[1], counts(damaged=1))
+
+    def test_a_reading_held_back_for_an_offer_is_given_once_its_writer_withdraws_it(self):
+        self.shelf()
+        self.build("home")
+        office = self.machines["office"]
+        with self.at("office"):                         # the office reads for itself,
+            indexer.build(office["db"], office["data"], store.roots(office["db"]), progress=lambda _: None)
+        self.assertTrue(self.exchange("office").run("receive", "send"))
+        self.assertEqual(self.parcels_of("office"), [])  # and gives nothing that home offers already
+        for parcel in self.parcels_of("home"):
+            parcel.unlink()
+        (self.shared / "texts" / f"{self.writer('home')}.json").write_text(
+            json.dumps({"format": 1, "writer": self.writer("home"), "parcels": []}))     # home withdraws its texts
+        told = self.exchange("office")
+        self.assertTrue(told.run("receive", "send"))
+        self.assertEqual(told.counts["sent"], 4)
+        self.add("third")
+        self.shelf(on=("third",))
+        self.forbidden.add("third")
+        self.assertEqual(self.build("third")[1], counts(received=4))
+
+    def test_two_first_starts_of_one_data_folder_agree_on_its_writer(self):
+        data, found, real = self.base / "fresh-state", [], os.urandom
+
+        def slow(count):
+            time.sleep(0.05)                            # the moment at which two starts would part
+            return real(count)
+
+        with self.at("home"), patch("shelffind.machine.os.urandom", side_effect=slow):
+            starts = [threading.Thread(target=lambda: found.append(machine.identity(data)["writer"])) for _ in range(6)]
+            for start in starts:
+                start.start()
+            for start in starts:
+                start.join()
+        self.assertEqual((len(found), len(set(found))), (6, 1))
+
+    def test_the_writer_outlives_an_earlier_version_that_rewrites_the_machine(self):
+        writer = self.writer("home")
+        path = self.machines["home"]["data"] / machine.NAME
+        told = json.loads(path.read_text())
+        path.write_text(json.dumps({key: told[key] for key in ("id", "name", "system")}))     # as version 0.3 writes it
+        self.assertEqual(self.writer("home"), writer)
+
     def test_another_shared_place_receives_everything_again(self):
         self.shelf()
         self.build("home")
@@ -466,7 +601,7 @@ class Damage(Two):
                             "not a parcel", {"name": told["parcels"][0]["name"], "size": 1 << 62, "sha256": "0" * 64}]
         listing.write_text(json.dumps(told))
         self.forbidden.add("office")
-        self.assertEqual(self.build("office")[1], counts(received=4))
+        self.assertEqual(self.build("office")[1], counts(received=4, damaged=4))   # each entry left aside is said
 
     def test_what_cannot_be_read_is_left_aside_and_the_rest_taken(self):
         self.shelf(on=("office",))
@@ -496,24 +631,41 @@ class Damage(Two):
         self.assertEqual((self.found("office", "northern harbours"), self.found("office", "southern capes")),
                          (["tides.txt"], ["winds.txt"]))
 
-    def test_a_parcel_put_and_never_named_is_never_overwritten(self):
+    def test_a_parcel_put_whose_list_could_not_be_written_is_named_by_the_next_exchange(self):
         self.shelf()
-        real = parcels.Exchange.publish
-        failing = [True]
+        real, failing = sharing.Folder.put, [True]
 
-        def publish(exchange, found):
-            if failing:
+        def put(place, name, data):
+            if name.endswith(".json") and failing:
                 failing.pop()
                 raise OSError("the shared place gives no answer")
-            return real(exchange, found)
+            return real(place, name, data)
 
-        with patch.object(parcels.Exchange, "publish", publish):
+        with patch.object(sharing.Folder, "put", put):
             self.assertEqual(self.build("home")[1]["sent"], 0)
         stray = self.parcels_of("home")[0]
         kept = stray.read_bytes()
+        self.assertEqual(self.build("home")[1]["sent"], 4)      # named now, and not sent again
+        self.assertEqual((stray.read_bytes(), [path.name for path in self.parcels_of("home")]), (kept, ["000001.jsonl.gz"]))
+        self.assertEqual([parcel["name"][-15:] for parcel in self.listed("home")["parcels"]], ["000001.jsonl.gz"])
+        self.forbidden.add("office")
+        self.assertEqual(self.build("office")[1]["received"], 4)
+
+    def test_a_parcel_whose_writing_failed_is_given_again_under_another_number(self):
+        self.shelf()
+        real, failing = sharing.Folder.put, [True]
+
+        def put(place, name, data):
+            if name.endswith(".jsonl.gz") and failing:
+                failing.pop()
+                raise OSError("the shared place gives no answer")
+            return real(place, name, data)
+
+        with patch.object(sharing.Folder, "put", put):
+            self.assertEqual(self.build("home")[1]["sent"], 0)
+        self.assertEqual(self.parcels_of("home"), [])
         self.assertEqual(self.build("home")[1]["sent"], 4)
-        self.assertEqual(stray.read_bytes(), kept)
-        self.assertEqual([parcel["name"][-15:] for parcel in self.listed("home")["parcels"]], ["000002.jsonl.gz"])
+        self.assertEqual([path.name for path in self.parcels_of("home")], ["000002.jsonl.gz"])   # the first number is not given again
         self.forbidden.add("office")
         self.assertEqual(self.build("office")[1]["received"], 4)
 
@@ -528,6 +680,24 @@ class Damage(Two):
                                            progress=lambda _: None, exchange=told), (4, 0))
         self.assertFalse((self.shared / "texts").exists())
         self.assertTrue(any("newer ShelfFind" in line for line in said))
+
+
+class Earlier(Two):
+    def test_pages_that_an_earlier_version_read_stay_on_their_machine(self):
+        self.shelf()
+        home = self.machines["home"]
+        with self.at("home"):                           # read, and nothing shared
+            indexer.build(home["db"], home["data"], store.roots(home["db"]), progress=lambda _: None)
+        with home["db"]:                                # as an earlier version left them: tied to no bytes
+            home["db"].execute("DELETE FROM doc_keys")
+            home["db"].execute("UPDATE files SET sum=NULL,read=1")
+            home["db"].execute("UPDATE docs SET origin=NULL")
+        self.read["home"].clear()
+        self.assertEqual(self.build("home"), ((0, 0), counts()))     # measured, tied to the bytes, and not given
+        origins = [row[0] for row in home["db"].execute("SELECT origin FROM docs")]
+        self.assertTrue(origins and all(origin.split()[-1] == store.EARLIER for origin in origins), origins)
+        self.assertEqual((self.read["home"], self.parcels_of("home")), ([], []))
+        self.sound("home")
 
 
 class Counting(sharing.Folder):
@@ -562,6 +732,23 @@ class Turns(Two):
         for _ in range(3):
             told.run("receive", "apply", "send")
         self.assertEqual((place.fetched, told.counts["received"]), (1, 0))
+
+    def test_a_names_only_run_goes_on_while_another_process_holds_the_exchange(self):
+        self.shelf()
+        self.build("home")
+        self.build("office", limit=0)                   # the office knows what is offered
+        office = self.machines["office"]
+        holder = sqlite3.connect(office["data"] / parcels.KEEPING)
+        holder.execute("BEGIN IMMEDIATE")               # another process writes in the bookkeeping,
+        try:
+            with sharing.alone(office["data"]) as free, patch.object(parcels, "WAIT", 0):
+                self.assertTrue(free)                   # and holds the exchange
+                began = time.monotonic()
+                self.assertEqual(self.build("office", names_only=True)[0], (0, 0))
+                self.assertLess(time.monotonic() - began, 10)
+        finally:
+            holder.rollback()
+            holder.close()
 
     def test_a_run_waits_for_an_exchange_under_way_before_it_reads(self):
         self.shelf()
@@ -616,15 +803,97 @@ class Turns(Two):
     def test_a_file_copied_for_its_reading_takes_what_another_read_of_its_bytes(self):
         self.shelf()
         self.build("home")
-        office = self.machines["office"]
         self.forbidden.add("office")
+        place = Counting(self.shared)
         # The offers are taken, but the office compares no file before its pass: each file is
-        # copied for its reading, and the copy finds what home read of those very bytes.
+        # copied for its reading, and is not read, its document taking what home read of those
+        # very bytes at the end of the pass; the parcel is fetched once to take it, once to give.
         with patch.object(parcels.Exchange, "sizes", return_value=frozenset()):
-            self.assertEqual(self.build("office"), ((0, 0), counts(received=4)))
-        self.assertEqual(self.waiting("office"), 0)
+            self.assertEqual(self.build("office", place), ((0, 0), counts(received=4)))
+        self.assertEqual((self.waiting("office"), place.fetched), (0, 2))
         self.assertEqual(self.found("office", "eastern skies"), ["stars.txt"])
         self.sound("office")
+
+    def test_a_copied_file_that_changes_before_its_pages_come_takes_none(self):
+        self.shelf()
+        self.build("home")
+        office = self.machines["office"]
+        self.forbidden.add("office")
+        real = parcels.Exchange.offer
+
+        def offer(exchange, doc, file=None, still=None):
+            held = real(exchange, doc, file, still)
+            rel = office["db"].execute("SELECT rel FROM files WHERE id=?", (file,)).fetchone()[0]
+            if rel == "Waves/tides.txt":
+                os.utime(office["shelf"] / rel, (WHEN + 5, WHEN + 5))    # another file stands there now
+            return held
+
+        with patch.object(parcels.Exchange, "sizes", return_value=frozenset()), patch.object(parcels.Exchange, "offer", offer):
+            self.assertEqual(self.build("office")[1], counts(received=3))
+        self.assertEqual(self.pages("office", "Waves/tides.txt"), [])
+        self.assertEqual(self.build("office")[1], counts(received=1))   # measured anew by the next run, it takes them
+        self.sound("office")
+
+    def test_a_shared_place_that_fails_before_a_copied_file_takes_its_pages_is_no_fault_of_the_document(self):
+        self.shelf()
+        self.build("home")
+        real, real_offer, held = sharing.Folder.get, parcels.Exchange.offer, []
+
+        def get(place, name, limit=None):
+            if name.endswith(".jsonl.gz") and held:     # once the files wait for their pages
+                raise OSError("Input/output error")
+            return real(place, name, limit)
+
+        def offer(exchange, doc, file=None, still=None):
+            held.append(real_offer(exchange, doc, file, still))
+            return held[-1]
+
+        with patch.object(parcels.Exchange, "sizes", return_value=frozenset()), patch.object(parcels.Exchange, "offer", offer), \
+                patch.object(sharing.Folder, "get", get):
+            self.assertEqual(self.build("office")[0], (4, 0))       # read here, once the shared place failed
+        states = {row[0] for row in self.machines["office"]["db"].execute("SELECT state FROM docs")}
+        self.assertEqual((states, held[:4]), ({"indexed"}, [True] * 4))
+        self.sound("office")
+
+    def test_a_shared_place_marked_by_a_newer_version_during_a_run_gets_nothing_more(self):
+        self.shelf()
+        marker = self.shared / ".shelffind-shared"
+        self.assertEqual(self.build("home", on_document=lambda *_: marker.write_text('{"format": 2}'))[0], (4, 0))
+        self.assertEqual(self.parcels_of("home"), [])
+
+    def test_offers_from_a_shared_place_that_a_newer_version_marked_are_not_taken(self):
+        self.shelf()
+        self.build("home")
+        self.assertTrue(self.exchange("office").run("receive"))     # the offers are known,
+        (self.shared / ".shelffind-shared").write_text('{"format": 2}')
+        with patch.object(parcels.Exchange, "sizes", return_value=frozenset()):
+            self.assertEqual(self.build("office"), ((4, 0), counts()))   # and nothing is taken from them
+
+    def test_offers_of_one_reading_in_three_parcels_fetch_one_to_give_it(self):
+        self.shelf(on=("office",))
+        self.measure("office")
+        line = self.line("Waves/tides.txt", [[None, None, TEXTS["Waves/tides.txt"], 0]])
+        for writer in ("a" * 16, "b" * 16, "c" * 16):
+            self.gift(writer, [line])
+        place = Counting(self.shared)
+        self.forbidden.add("office")
+        self.assertEqual(self.build("office", place, limit=0)[1], counts(received=1))
+        self.assertEqual(place.fetched, 4)              # three to take them, one to give
+
+    def test_a_reading_that_changes_with_as_many_pages_is_compared_again(self):
+        self.shelf()
+        self.build("home")
+        office = self.machines["office"]
+        with self.at("office"):
+            indexer.build(office["db"], office["data"], store.roots(office["db"]), progress=lambda _: None)
+        told = self.exchange("office")
+        self.assertTrue(told.run("receive", "send"))
+        self.assertEqual(told.counts["sent"], 0)        # home offers all of it
+        with office["db"]:                              # another reading of the same bytes numbers its page
+            office["db"].execute("UPDATE pages SET page=1 WHERE doc=(SELECT doc FROM files WHERE rel='Waves/tides.txt')")
+        told = self.exchange("office")
+        self.assertTrue(told.run("receive", "send"))
+        self.assertEqual(told.counts["sent"], 1)
 
     def test_a_data_folder_takes_back_its_own_texts_once_lost(self):
         self.shelf(on=("home",))
@@ -691,6 +960,27 @@ class Settled(Two):
             patching.start()
             self.addCleanup(patching.stop)
 
+    def test_checksums_that_come_with_an_offer_are_followed_by_another_question(self):
+        self.write("Waves/tides.txt")
+        self.build("home")
+        office = self.machines["office"]
+        self.write("Waves/copy.txt", TEXTS["Waves/tides.txt"], on=("office",))
+        body = (office["shelf"] / "Waves/tides.txt").read_bytes()
+        md5, sha = f"md5:{hashlib.md5(body).hexdigest()}", f"sha256:{hashlib.sha256(body).hexdigest()}"
+        self.library(lambda path: {"id": "W1", "keys": [sha], "title": "Tide Tables", "text": True}
+                     if path.endswith("copy.txt") else None)
+        with self.at("office"):
+            indexer.build(office["db"], office["data"], store.roots(office["db"]), names_only=True, progress=lambda _: None)
+            with office["db"]:                          # the storage of its folder gives the MD5 of the tides
+                file = office["db"].execute("SELECT id FROM files WHERE rel='Waves/tides.txt'").fetchone()[0]
+                indexer.joined(office["db"], file, [md5], local=False)
+        self.forbidden.add("office")
+        # The SHA-256 offered shows the copy that the library holds to be the tides: both are left to it at once.
+        self.assertEqual(self.build("office", names_only=True), ((0, 0), counts()))
+        states = [row[0] for row in office["db"].execute("SELECT d.state FROM files f JOIN docs d ON d.id=f.doc ORDER BY f.rel")]
+        self.assertEqual(states, ["covered", "covered"])
+        self.sound("office")
+
     def test_a_document_that_the_library_answers_for_takes_no_pages_whatever_came_first(self):
         self.write("Waves/tides.txt")
         self.build("home")
@@ -710,15 +1000,71 @@ class Carriage(Two):
         self.shelf()
         with patch.object(parcels, "LIMIT", limit), patch.object(parcels, "UNPACKED", unpacked):
             self.build("home")
-            self.assertEqual(len(self.parcels_of("home")), 4)       # a document alone in its parcel
+            made = self.parcels_of("home")
+            self.assertEqual(len(made), 4)                          # one document in each
+            for parcel in made:
+                self.assertLessEqual(parcel.stat().st_size, limit)
+                self.assertLessEqual(sum(len(line) + 1 for line in parcels.unpack(parcel.read_bytes())), unpacked)
             self.forbidden.add("office")
             self.assertEqual(self.build("office")[1], counts(received=4))
 
     def test_parcels_stay_within_their_size(self):
-        self.sized(1, parcels.UNPACKED)
+        self.sized(400, parcels.UNPACKED)                       # one document fits, two do not
 
     def test_parcels_stay_within_what_they_unpack_to(self):
         self.sized(parcels.LIMIT, 30_000)
+
+    def test_the_first_line_of_a_parcel_counts_in_what_it_unpacks_to(self):
+        raw = json.dumps(self.line("Waves/tides.txt", [[None, None, TEXTS["Waves/tides.txt"], 0]])).encode() + b"\n"
+        with patch.object(parcels, "UNPACKED", len(raw)):
+            self.assertFalse(parcels.Packer("0" * 16).add(raw))
+        with patch.object(parcels, "UNPACKED", len(raw) + 100):
+            self.assertTrue(parcels.Packer("0" * 16).add(raw))
+
+    def given(self, **limits):
+        """Home reads and gives under the limits `limits`: (what it said, its exchange)."""
+        said, machine_ = [], self.machines["home"]
+        with self.at("home"), contextlib.ExitStack() as stack:
+            for name, value in limits.items():
+                stack.enter_context(patch.object(parcels, name, value))
+            exchange = parcels.Exchange(machine_["data"], machine_["db"], self.place(), said.append)
+            indexer.build(machine_["db"], machine_["data"], store.roots(machine_["db"]), progress=lambda _: None, exchange=exchange)
+        return said, exchange
+
+    def test_a_list_that_would_grow_beyond_what_a_reader_takes_stays_as_it_was(self):
+        self.shelf()
+        writer = self.writer("home")
+        two = {name: {"name": name, "size": 300, "sha256": "0" * 64, "documents": 1}
+               for name in (f"texts/{writer}/{number:06d}.jsonl.gz" for number in (1, 2))}
+        said, exchange = self.given(LIMIT=400, LISTED=len(parcels.Exchange.listing(SimpleNamespace(writer=writer), two, 2)))
+        self.assertEqual((exchange.counts["sent"], len(self.listed("home")["parcels"])), (2, 2))
+        self.assertTrue(any("is full" in line for line in said))
+        self.assertEqual(self.build("office")[1]["received"], 2)
+
+    def test_a_data_folder_that_gave_its_last_number_gives_nothing_more(self):
+        self.shelf()
+        said, exchange = self.given(LIMIT=400, LAST=2)
+        self.assertEqual([path.name for path in self.parcels_of("home")], ["000001.jsonl.gz", "000002.jsonl.gz"])
+        self.assertEqual(exchange.counts["sent"], 2)
+        self.assertTrue(any("last parcel" in line for line in said))
+
+    def test_a_document_too_large_for_a_parcel_of_its_own_is_not_given_until_the_limits_allow_it(self):
+        self.shelf()
+        with patch.object(parcels, "LIMIT", 200):
+            self.assertEqual(self.build("home")[1]["sent"], 0)
+            self.assertEqual(self.parcels_of("home"), [])
+            self.assertEqual(self.exchange("home").run("send"), True)
+            self.assertEqual(self.parcels_of("home"), [])
+        self.assertEqual(self.build("home")[1]["sent"], 4)      # compared again under the limits of now
+
+    def test_a_parcel_beyond_the_size_of_any_parcel_is_left_aside(self):
+        self.shelf()
+        self.build("home")
+        listing = self.shared / "texts" / f"{self.writer('home')}.json"
+        told = json.loads(listing.read_text())
+        told["parcels"][0]["size"] = parcels.LIMIT + 1
+        listing.write_text(json.dumps(told))
+        self.assertEqual(self.build("office", limit=0)[1], counts(damaged=1))
 
     def test_a_document_of_more_pages_than_a_reader_takes_is_not_given(self):
         self.shelf()
@@ -814,6 +1160,24 @@ class Carriage(Two):
                 code, _, err = run_main(data, "sync")
         self.assertEqual(code, 1)
         self.assertIn("could not be exchanged", err)
+
+    def test_a_sync_whose_parcel_cannot_be_fetched_says_so_in_its_exit_code(self):
+        tools = self.base / "bin"
+        tools.mkdir()
+        (tools / "rclone-itself").write_text(RCLONE)
+        (tools / "rclone-itself").chmod(0o700)
+        (tools / "rclone").write_text(f'#!/bin/sh\ncase "$*" in *cat*.jsonl.gz*) echo "ERROR : read: input/output error" >&2; exit 1;; esac\n'
+                                      f'exec "{tools / "rclone-itself"}" "$@"\n')
+        (tools / "rclone").chmod(0o700)
+        self.shelf()
+        self.build("home")
+        data = self.machines["office"]["data"]
+        (data / "config.toml").write_text('[share]\ntexts = true\nremote = "pretend:shared"\n')
+        with self.at("office"), patch.dict(os.environ, {"PATH": f"{tools}{os.pathsep}{os.environ['PATH']}",
+                                                        "PRETENDED_REMOTE": str(self.base)}):
+            code, _, err = run_main(data, "sync")
+        self.assertEqual(code, 1)
+        self.assertIn("input/output error", err)
 
     def test_the_lock_of_an_exchange_makes_its_data_folder(self):
         fresh = self.base / "fresh-state"

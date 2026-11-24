@@ -23,7 +23,9 @@ Pages belong to bytes. They are read from a copy of a file whose checksums are c
 same pass, and `docs.origin` keeps those checksums: no other bytes complete them or take them.
 Pages that an earlier version read, when checksums were not kept, stay with the file they were
 read from (`files.read`) and with it alone, until a reading in full of that file ties them to
-its bytes; neither a storage nor a source can do that.
+its bytes; neither a storage nor a source can do that. Tied so, on the word of the inventory
+that the file did not change, they are marked as such (EARLIER, in `docs.origin`), and are not
+given to other machines.
 
 What a source says is believed of a file for as long as no measure refutes it: it is dropped
 when the checksums it gives contradict those of the file, or are those of a document that the
@@ -54,6 +56,7 @@ FORMAT = 3
 RETIRED = 101           # the format number of an earlier index once it has been converted
 KEEP = 30 * 86400       # seconds a document keeps its text after its last file has gone
 SUMS = ("md5:", "sha256:")      # the checksums of a whole file that documents are known by
+EARLIER = "earlier"             # in docs.origin: pages read by an earlier version, tied to bytes measured afterwards
 SUM = re.compile(r"(?:md5:[0-9a-f]{32}|sha256:[0-9a-f]{64})\Z")
 
 SCHEMA = """
@@ -597,36 +600,46 @@ def unread(db, doc):
 
 
 def hand_over(db, old, new):
-    """The pages of the document `old` were read from a file that belongs to the document
-    `new`: they go there with it. When `new` has pages of its own, both were read from the same
-    bytes: the reading that went furthest is kept, and a page recognised in the other only is
-    taken from it. The state of `new` is then what its pages say, whatever a source had been
-    left to answer for before. Returns True when the pages of `new` are, afterwards, those
-    that came."""
+    """The pages of the document `old`, read by an earlier version from a file that belongs to
+    the document `new`, go there with it. When `new` has pages of its own, both readings are of
+    the same bytes, and nothing recognised is lost where it can be kept: readings of the same
+    pages are merged page by page, the pages that `new` recognised staying as they are; of
+    readings of other pages, the one that recognises more pages is kept. A document that keeps
+    pages of the earlier reading is marked so (EARLIER, in `docs.origin`, see `by_measure`):
+    the bytes they belong to were measured afterwards, not read, so they are not given to other
+    machines. The state of `new` is then what its pages say, whatever a source had been left to
+    answer for before. Returns True when the pages of `new` are, afterwards, those that came,
+    or were completed by them."""
     told = {row["id"]: row for row in db.execute("SELECT id,state,error FROM docs WHERE id IN (?,?)", (old, new))}
-    came, both, asks = True, has_pages(db, new), False
-    if both:
-        came = blanks(db, old)[0] < blanks(db, new)[0]
-        keep, drop = (old, new) if came else (new, old)
+    rows = lambda doc: db.execute("SELECT id,page,section,needs_ocr,ztext FROM pages WHERE doc=? ORDER BY id", (doc,)).fetchall()
+    ours, theirs = rows(new), rows(old)
+    keep, came, asks = old, True, False
+    if ours:
+        recognised = lambda pages: sum(1 for page in pages if not page["needs_ocr"])
+        if [(row["page"], row["section"]) for row in ours] == [(row["page"], row["section"]) for row in theirs]:
+            filled = [(mine["ztext"], row["id"]) for row, mine in zip(ours, theirs) if row["needs_ocr"] and not mine["needs_ocr"]]
+            db.executemany("UPDATE pages SET ztext=?,needs_ocr=0 WHERE id=?", filled)
+            keep, came = new, bool(filled)
+        else:
+            came = recognised(theirs) > recognised(ours)
+            keep = old if came else new
+        drop = new if keep == old else old
         # The other reading still waited for an ordinary recognition, whatever a source had
         # been left to answer for meanwhile.
         asks = blanks(db, drop)[0] > 0 and told[drop]["state"] != "ocr-error"
-        theirs = {row["page"]: row["ztext"] for row in db.execute(
-            "SELECT page,ztext FROM pages WHERE doc=? AND needs_ocr=0 AND page IS NOT NULL", (drop,))}
-        if theirs and blanks(db, keep)[1] == blanks(db, drop)[1]:
-            for row in db.execute("SELECT id,page FROM pages WHERE doc=? AND needs_ocr=1", (keep,)).fetchall():
-                if row["page"] in theirs:
-                    db.execute("UPDATE pages SET ztext=?,needs_ocr=0 WHERE id=?", (theirs[row["page"]], row["id"]))
         db.execute("DELETE FROM pages WHERE doc=?", (drop,))
-    kept = told[old] if came else told[new]
-    if came:
+    if keep == old:
         db.execute("UPDATE pages SET doc=? WHERE doc=?", (new, old))
         db.execute("UPDATE files SET read=0 WHERE doc=?", (new,))
         db.execute("UPDATE docs SET origin=NULL WHERE id=?", (new,))
+    elif came:                                      # completed: the file that comes is the one read
+        db.execute("UPDATE files SET read=0 WHERE doc=?", (new,))
+        db.execute(f"UPDATE docs SET origin=origin||' {EARLIER}' WHERE id=? AND origin IS NOT NULL AND instr(origin,?)=0",
+                   (new, EARLIER))
     if blanks(db, new)[0] == 0:
         state, error = "indexed", None
-    elif kept["state"] == "ocr-error" and not asks:
-        state, error = "ocr-error", kept["error"]   # its recognition failed, and nothing asks for another
+    elif told[keep]["state"] == "ocr-error" and not asks:
+        state, error = "ocr-error", told[keep]["error"]     # its recognition failed, and nothing asks for another
     else:
         state, error = "needs-ocr", None
     db.execute("UPDATE docs SET state=?,error=? WHERE id=?", (state, error, new))
@@ -771,8 +784,10 @@ def by_measure(db, row, mine):
         move(db, file, target, untied)
     grew = learn(db, target, mine)
     if untied and len(mine) > 1 and has_pages(db, target):
-        # The pages read from this file by an earlier version are those of the bytes measured.
-        db.execute("UPDATE docs SET origin=? WHERE id=? AND origin IS NULL", (" ".join(mine), target))
+        # The pages read from this file by an earlier version are taken for those of the bytes
+        # measured, on the word of the inventory; they are marked as such, for they were not
+        # read from these very bytes, and no other machine receives them.
+        db.execute("UPDATE docs SET origin=? WHERE id=? AND origin IS NULL", (" ".join(mine) + f" {EARLIER}", target))
     purge(db, target, None if grew else file)
     return target
 
@@ -885,8 +900,8 @@ def take_pages(db, doc, keys, pages, holding=()):
         fuzzy.remember_more(db, (body for body, _ in filled))
         left = len([row for row in ours if row["needs_ocr"]]) - len(filled)
         state = "indexed" if not left else ("ocr-error" if told["state"] == "ocr-error" else "needs-ocr")
-    db.execute("UPDATE docs SET state=?,error=CASE WHEN ?='ocr-error' THEN error END,origin=? WHERE id=?",
-               (state, state, " ".join(sorted(keys)), doc))
+    db.execute("UPDATE docs SET state=?,error=CASE WHEN ?='ocr-error' THEN error END,"
+               "origin=CASE WHEN origin IS NULL THEN ? ELSE origin END WHERE id=?", (state, state, " ".join(sorted(keys)), doc))
     return True
 
 

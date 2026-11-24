@@ -24,7 +24,6 @@ import datetime
 import gzip
 import hashlib
 import json
-import json
 import os
 import random
 import shutil
@@ -35,7 +34,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 import invariants
-from shelffind import extract, indexer, parcels, sharing, store
+from shelffind import extract, indexer, machine, parcels, sharing, store
 
 SIZES = (600, 900)
 FORMATS = ("txt", "txt", "txt", "txt", "md", "md", "bin", "txt#600")
@@ -389,7 +388,8 @@ class Histories(unittest.TestCase):
             self.assertTrue(first.startswith("work") and first[8:13] == "token", f"{where}: document {doc} begins with no work")
             work = int(first[4:8])
             # The pages are tied to the bytes of the work they hold, and to no other, with or without a file.
-            self.assertIn(sealed[doc], (None, " ".join(world.sums(work))), f"{where}: document {doc} holds work {work} under other checksums")
+            self.assertIn(sealed[doc], (None, " ".join(world.sums(work)), " ".join(world.sums(work)) + f" {store.EARLIER}"),
+                          f"{where}: document {doc} holds work {work} under other checksums")
             allowed = world.pages_of(work)
             self.assertEqual(sorted(str(page) for page, _, _ in pages), sorted(str(page) for page in allowed),
                              f"{where}: document {doc} does not have the pages of work {work}")
@@ -461,6 +461,24 @@ class Histories(unittest.TestCase):
             if address(file) not in world.liars:
                 work = world.holds[address(file)]
                 self.assertEqual(seen.setdefault((work, file["format"]), file["doc"]), file["doc"], f"{where}: two documents for work {work}")
+        # What this data folder gave carries, under the checksums of a work, pages of that work
+        # alone, each with a text that this page may have.
+        try:
+            writer = json.loads((world.data / machine.WRITING).read_text())["writer"]
+        except OSError:
+            writer = None
+        for parcel in sorted((world.shared / "texts" / writer).glob("*.jsonl.gz")) if writer else ():
+            for raw in parcels.unpack(parcel.read_bytes())[1:]:
+                told = parcels.document(raw)
+                texts = [body for _, _, body, blank in told["pages"] if not blank]
+                self.assertTrue(texts and all(body.startswith("work") for body in texts), f"{where}: {parcel.name} gives no work")
+                work = int(texts[0][4:8])
+                self.assertEqual((told["md5"], told["sha256"]), tuple(world.sums(work)), f"{where}: {parcel.name} gives work {work} "
+                                                                                    "under other checksums")
+                allowed = world.pages_of(work)
+                for page, _, body, blank in told["pages"]:
+                    self.assertTrue(blank or body in allowed.get(page, ()), f"{where}: {parcel.name} gives a page {page} "
+                                                                             f"that work {work} does not have")
         if kind not in ("full", "recognise"):
             return
         # A complete run leaves nothing waiting, whatever the storage does.

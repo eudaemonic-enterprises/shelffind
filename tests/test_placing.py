@@ -617,6 +617,29 @@ class Handed(Placing):
         self.assertEqual([tuple(row) for row in self.db.execute("SELECT id,state FROM docs ORDER BY id")],
                          [(old, "pending"), (new, "indexed")])
 
+    def test_of_two_readings_of_other_pages_the_one_that_recognises_more_is_kept(self):
+        with self.db:
+            old, new = store.new_document(self.db, 9, "ps"), store.new_document(self.db, 9, "ps")
+            self.pages(old, [(1, "first page"), (2, "second page"), (3, "Late atlas"), (4, "")], "needs-ocr")
+            self.pages(new, [(1, "one"), (2, "two")], "indexed")
+            self.assertTrue(store.hand_over(self.db, old, new))
+        rows = [(row[0], store.inflate(row[1])) for row in self.db.execute("SELECT page,ztext FROM pages WHERE doc=? ORDER BY page", (new,))]
+        self.assertEqual(rows, [(1, "first page"), (2, "second page"), (3, "Late atlas"), (4, "")])
+        self.assertEqual(self.db.execute("SELECT state FROM docs WHERE id=?", (new,)).fetchone()[0], "needs-ocr")
+
+    def test_readings_of_the_same_pages_add_up_and_are_then_kept_from_other_machines(self):
+        sealed = "md5:" + "a" * 32 + " sha256:" + "b" * 64
+        with self.db:
+            old, new = store.new_document(self.db, 9, "pdf"), store.new_document(self.db, 9, "pdf")
+            self.pages(old, [(1, ""), (2, "second page")], "needs-ocr")
+            self.pages(new, [(1, "first page"), (2, "")], "needs-ocr")
+            self.db.execute("UPDATE docs SET origin=? WHERE id=?", (sealed, new))
+            self.assertTrue(store.hand_over(self.db, old, new))
+        rows = [(row[0], store.inflate(row[1])) for row in self.db.execute("SELECT page,ztext FROM pages WHERE doc=? ORDER BY page", (new,))]
+        self.assertEqual(rows, [(1, "first page"), (2, "second page")])
+        self.assertEqual(self.db.execute("SELECT state,origin FROM docs WHERE id=?", (new,)).fetchone()[:],
+                         ("indexed", f"{sealed} {store.EARLIER}"))
+
     def test_a_recognition_that_failed_is_still_known_to_have_failed_after_the_pages_are_handed_over(self):
         with self.db:
             old, new = store.new_document(self.db, 9, "pdf"), store.new_document(self.db, 9, "pdf")
@@ -978,9 +1001,9 @@ class Storage2(Placing):
             self.assertFalse(indexer.joined(self.db, self.ids()["book.txt"], self.sums(path)[:1], local=False))
         self.assertEqual([row["sum"] for row in self.db.execute("SELECT sum FROM files")], [None, None])
         self.read.clear()
-        self.assertEqual(self.build(), (0, 0))              # a reading in full ties the pages to the bytes
+        self.assertEqual(self.build(), (0, 0))              # a reading in full ties the pages to the bytes,
         origin = self.db.execute("SELECT d.origin FROM docs d JOIN files f ON f.doc=d.id WHERE f.rel='book.txt'").fetchone()[0]
-        self.assertEqual((origin.split(), self.read), (self.sums(path), []))
+        self.assertEqual((origin.split(), self.read), (self.sums(path) + [store.EARLIER], []))     # as an earlier reading
         self.sound()
 
     def test_a_complete_run_proves_against_the_storage_what_a_source_said(self):

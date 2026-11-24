@@ -252,8 +252,10 @@ def refresh_later(args, db, settings):
 
 
 def exchange(args, directory, settings):
-    """The command sync: the journals, then the texts, when the settings share them. The texts
-    are left to a reading of documents that is under way, which exchanges them itself."""
+    """The command sync: the journals, then the texts, when the settings share them: parcels
+    are taken and given, while their pages wait for the next run of the index, which gives
+    them once its inventory is made. Exits with 1 when the shared place failed; a parcel that
+    arrived damaged is said, and taken again at a later exchange."""
     place = sharing.carrier(settings)
     if place is None:
         raise ValueError("Nothing is shared: set share.history or share.texts, and share.folder or share.remote")

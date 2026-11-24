@@ -138,7 +138,8 @@ def structure(db):
             if told["origin"] is None:
                 if len(inside) != 1 or not readers or inside[0]["sum"] or content(doc):
                     found.append(f"document {doc} has pages that nothing ties to bytes, and is not one unmeasured file")
-            elif set(kinds(told["origin"].split())) != {"md5", "sha256"} or not set(told["origin"].split()) <= set(content(doc)):
+            elif set(kinds(told["origin"].split())) != {"md5", "sha256"} \
+                    or not set(told["origin"].split()) - {"earlier"} <= set(content(doc)):
                 found.append(f"document {doc} has pages of bytes it is not known by a reading to hold: {told['origin']}")
             if told["state"] not in ("indexed", "needs-ocr", "ocr-error", "covered"):
                 found.append(f"document {doc} has pages and is {told['state']}")
