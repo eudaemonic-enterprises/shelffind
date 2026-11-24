@@ -767,29 +767,92 @@ def by_measure(db, row, mine):
     if target != here:
         untied = untied and hand_over(db, here, target)
         move(db, file, target, untied)
-    grew = False
-    for key in mine:
-        grew |= db.execute("INSERT OR IGNORE INTO doc_keys(key,format,size,basis,doc) VALUES(?,?,?,'content',?)",
-                           (key, fmt, size, target)).rowcount > 0
-    for key in mine:
-        # Every statement that names one of these checksums is looked at again, now that the
-        # document is known by all of them: a statement may give one of them with another
-        # that is not its own. A file never measured is placed anew by what is said of it,
-        # which may bring it here; a statement about a file measured to be another document,
-        # or about other bytes, is refuted.
-        for record in db.execute(
-                "SELECT DISTINCT r.doc,r.file,coalesce(f.sum,'') AS sum FROM record_keys k JOIN records r ON r.id=k.record "
-                "JOIN docs d ON d.id=r.doc LEFT JOIN files f ON f.id=r.file WHERE k.key=? AND d.format=? AND r.doc!=?",
-                (key, fmt, target)).fetchall():
-            if record["file"] is not None and not record["sum"]:
-                replace(db, record["file"])
-            else:
-                purge(db, record["doc"])
+    grew = learn(db, target, mine)
     if untied and len(mine) > 1 and has_pages(db, target):
         # The pages read from this file by an earlier version are those of the bytes measured.
         db.execute("UPDATE docs SET origin=? WHERE id=? AND origin IS NULL", (" ".join(mine), target))
     purge(db, target, None if grew else file)
     return target
+
+
+def learn(db, doc, keys):
+    """A measure tells that a document holds the bytes of the checksums `keys`: they become
+    its keys. Returns True when one of them is new to it.
+
+    Every statement that names one of these checksums is looked at again, once the document
+    is known by all of them: a statement may give one of them with another that is not its
+    own. A file never measured is placed anew by what is said of it, which may bring it here;
+    a statement about a file measured to be another document, or about other bytes, is
+    refuted."""
+    told = db.execute("SELECT size,format FROM docs WHERE id=?", (doc,)).fetchone()
+    grew = False
+    for key in keys:
+        grew |= db.execute("INSERT OR IGNORE INTO doc_keys(key,format,size,basis,doc) VALUES(?,?,?,'content',?)",
+                           (key, told["format"], told["size"], doc)).rowcount > 0
+    for key in keys:
+        for record in db.execute(
+                "SELECT DISTINCT r.doc,r.file,coalesce(f.sum,'') AS sum FROM record_keys k JOIN records r ON r.id=k.record "
+                "JOIN docs d ON d.id=r.doc LEFT JOIN files f ON f.id=r.file WHERE k.key=? AND d.format=? AND r.doc!=?",
+                (key, told["format"], doc)).fetchall():
+            if record["file"] is not None and not record["sum"]:
+                replace(db, record["file"])
+            else:
+                purge(db, record["doc"])
+    return grew
+
+
+def taker(db, keys, size, fmt):
+    """The document that would take pages read elsewhere from the bytes of the checksums
+    `keys` (an MD5 and a SHA-256), of this size and format: the one that a measure knows by
+    them, with a file, and that no source answers for. None when there is none, or when a
+    measure contradicts these checksums."""
+    if fmt not in SUPPORTED:
+        return None
+    wrong, doc = refuted(db, size, fmt, keys)
+    if wrong or doc is None:
+        return None
+    told = db.execute("SELECT state FROM docs WHERE id=?", (doc,)).fetchone()
+    if told["state"] == "covered" or not db.execute("SELECT 1 FROM files WHERE doc=? LIMIT 1", (doc,)).fetchone():
+        return None
+    return doc
+
+
+def gains(db, doc, pages):
+    """Whether pages read elsewhere, as (page, section, text, still to recognise), would take
+    the reading of a document further: it has none, or has more pages still to recognise, or
+    has the same pages and one of its blanks is recognised there."""
+    if not has_pages(db, doc):
+        return True
+    ours, count = blanks(db, doc)
+    theirs = sum(1 for page in pages if page[3])
+    if ours != theirs:
+        return ours > theirs
+    if count != len(pages):
+        return False
+    waiting = {row["page"] for row in db.execute("SELECT page FROM pages WHERE doc=? AND needs_ocr=1", (doc,))}
+    return any(page[0] in waiting and not page[3] for page in pages)
+
+
+def take_pages(db, doc, keys, pages):
+    """Give a document the pages that another machine read from the bytes of the checksums
+    `keys` (see `taker`, which chose the document, and `gains`, which compared the readings).
+    The reading that went furthest is kept, and a page recognised in the other only is taken
+    from it, as when a file brings its pages (`hand_over`); the pages are then those of these
+    bytes, which the document is known by from now on."""
+    told = db.execute("SELECT size,format FROM docs WHERE id=?", (doc,)).fetchone()
+    had = has_pages(db, doc)
+    held = new_document(db, told["size"], told["format"])
+    db.executemany("INSERT INTO pages(doc,page,section,ztext,needs_ocr) VALUES(?,?,?,?,?)",
+                   [(held, page, section, deflate(body), int(bool(blank))) for page, section, body, blank in pages])
+    db.execute("UPDATE docs SET state=? WHERE id=?", ("needs-ocr" if any(page[3] for page in pages) else "indexed", held))
+    hand_over(db, held, doc)
+    db.execute("DELETE FROM docs WHERE id=?", (held,))
+    grew = learn(db, doc, keys)
+    db.execute("UPDATE docs SET origin=? WHERE id=?", (" ".join(sorted(keys)), doc))
+    # The words of a document are counted once, those of pages added to it later only kept.
+    (fuzzy.remember_more if had else fuzzy.remember_text)(db, (body for _, _, body, blank in pages if not blank))
+    if grew:
+        purge(db, doc)
 
 
 def disproved(db, row):

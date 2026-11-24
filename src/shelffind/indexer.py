@@ -214,7 +214,7 @@ def joined(db, file, measured, local=True):
     return store.measure(db, file, measured, local)
 
 
-def waiting(db, root, only=None, reading=False, thorough=False, absent=frozenset()):
+def waiting(db, root, only=None, reading=False, thorough=False, absent=frozenset(), offered=frozenset()):
     """The files of a folder that a measure would place or prove, and that have none of the
     kind wanted.
 
@@ -231,7 +231,11 @@ def waiting(db, root, only=None, reading=False, thorough=False, absent=frozenset
     storage to answer, unless the storage answered and did not hold the file (`absent`), or
     gave a checksum of another kind than the source. In either kind of folder, the files of a
     document of which the statements kept contradict one another, giving two checksums of one
-    kind, are read as well: one of the statements is false, and the reading tells which."""
+    kind, are read as well: one of the statements is false, and the reading tells which.
+
+    The files never measured whose size and format are those of a text that another machine
+    offers (`offered`, see `parcels`) are compared as well, by the storage or by a reading:
+    they may hold those bytes, which then need no reading of their own."""
     lacking = "instr(coalesce(f.sum,''),'sha256:')=0" if reading else "instr(coalesce(f.sum,''),'md5:')=0"
     rows = db.execute(f"SELECT {FILE},f.doc,f.sum,f.read AND d.origin IS NULL AS untied FROM files f JOIN docs d ON d.id=f.doc "
                       f"WHERE f.root=? AND {lacking} ORDER BY f.id", (root["id"],)).fetchall()
@@ -244,7 +248,7 @@ def waiting(db, root, only=None, reading=False, thorough=False, absent=frozenset
         told.setdefault(record["file"], []).append(set(store.kinds(record["keys"].split())))
     if not reading:
         several = {(doc["size"], doc["format"]) for doc in
-                   db.execute("SELECT size,format FROM docs GROUP BY size,format HAVING count(*)>1")}
+                   db.execute("SELECT size,format FROM docs GROUP BY size,format HAVING count(*)>1")} | set(offered)
         return [row for row in rows if not row["untied"]
                 and ((row["size"], row["format"]) in several or (thorough and row["id"] in told))]
 
@@ -261,12 +265,14 @@ def waiting(db, root, only=None, reading=False, thorough=False, absent=frozenset
     disputed = {doc for doc, found in given.items() if any(len(keys) > 1 for keys in found.values())}
     if root.get("remote"):
         return [row for row in rows if row["untied"]
-                or ((unproved(row) or row["doc"] in disputed) and (row["sum"] or row["id"] in absent))]
+                or ((unproved(row) or row["doc"] in disputed) and (row["sum"] or row["id"] in absent))
+                or (not row["sum"] and row["id"] in absent and (row["size"], row["format"]) in offered)]
     alike = {}                                      # size and format -> the document known by a checksum, or -1 for several
     for doc in db.execute("SELECT d.id,d.size,d.format FROM docs d WHERE EXISTS (SELECT 1 FROM doc_keys k WHERE k.doc=d.id)"):
         alike[(doc["size"], doc["format"])] = -1 if (doc["size"], doc["format"]) in alike else doc["id"]
     other = lambda row: alike.get((row["size"], row["format"]), row["doc"]) != row["doc"]
-    return [row for row in rows if row["untied"] or unproved(row) or row["doc"] in disputed or (not row["sum"] and other(row))]
+    return [row for row in rows if row["untied"] or unproved(row) or row["doc"] in disputed
+            or (not row["sum"] and (other(row) or (row["size"], row["format"]) in offered))]
 
 
 def ask_storage(db, root, rows, progress, absent=None, failed=None):
@@ -335,7 +341,8 @@ def read_in_full(db, root, rows, progress, failed):
     return learnt, failures
 
 
-def settle(db, roots, chosen, progress, reads=True, failed=None, asked=None, thorough=False, absent=None):
+def settle(db, roots, chosen, progress, reads=True, failed=None, asked=None, thorough=False, absent=None,
+           offered=frozenset()):
     """Compare the files of the folders with the documents already known, as far as it has not
     been done: see `waiting` for the files concerned. Where a folder has an rclone twin, its
     storage is asked, which costs no reading. Then, when `reads` allows, the files that only a
@@ -355,7 +362,8 @@ def settle(db, roots, chosen, progress, reads=True, failed=None, asked=None, tho
         for root in roots:
             if not root.get("remote") or root["id"] in silent:
                 continue
-            rows = [row for row in waiting(db, root, chosen[root["id"]], thorough=thorough) if row["id"] not in asked]
+            rows = [row for row in waiting(db, root, chosen[root["id"]], thorough=thorough, offered=offered)
+                    if row["id"] not in asked]
             asked.update(row["id"] for row in rows)
             found, stopped, missed = ask_storage(db, root, rows, progress, absent, failed) if rows else (0, False, 0)
             learnt += found
@@ -363,7 +371,7 @@ def settle(db, roots, chosen, progress, reads=True, failed=None, asked=None, tho
             if stopped:
                 silent.add(root["id"])
         for root in roots if reads else ():
-            rows = waiting(db, root, chosen[root["id"]], reading=True, absent=absent)
+            rows = waiting(db, root, chosen[root["id"]], reading=True, absent=absent, offered=offered)
             found, missed = read_in_full(db, root, rows, progress, failed)
             learnt += found
             failures += missed
@@ -489,7 +497,7 @@ def update_text(db, root, row, ocr, languages, wanted=None, hold=None):
 
 
 def build(db, directory, selected, *, names_only=False, ocr=False, languages="eng",
-          retry=False, limit=None, progress=print, paths=(), on_document=None, relink=False):
+          retry=False, limit=None, progress=print, paths=(), on_document=None, relink=False, exchange=None):
     """Refresh the inventory, compare the files with the documents already known, ask the
     sources which files they know, then read the waiting documents. `selected` is the list of
     folders, or a function that gives it once no other build can change them.
@@ -498,7 +506,13 @@ def build(db, directory, selected, *, names_only=False, ocr=False, languages="en
     `names_only` no file is opened: the files are compared only as far as the storage of a
     folder tells their checksums, and what the sources say is not proved. Returns the number
     of readings tried, which `limit` caps, a file found to need no reading not being one, and
-    the number of problems."""
+    the number of problems.
+
+    With `exchange` (see `parcels`), a complete run shares texts with the other machines: it
+    takes what they read before comparing the files, so that a document read elsewhere is not
+    read here, reads the documents in an order of this machine's own, so that two machines
+    reading at once take different documents first, takes and gives texts every few minutes
+    while it reads, and gives what it read at the end."""
     done = failures = 0
     ready = []
     with store.index_lock(directory):
@@ -521,6 +535,10 @@ def build(db, directory, selected, *, names_only=False, ocr=False, languages="en
         chosen = {root["id"]: {str(p.relative_to(root["path"])) for p in paths if p.is_relative_to(root["path"])}
                   if paths else None for root in ready}
         failed, asked, absent, offline = set(), set(), set(), set()
+        offered = frozenset()
+        if exchange is not None and not names_only:
+            exchange.run("receive")
+            offered = exchange.sizes()
 
         def acquaint(reads, thorough, again=False):
             """Compare the files with the known documents, then ask the sources. What the
@@ -530,17 +548,19 @@ def build(db, directory, selected, *, names_only=False, ocr=False, languages="en
             recognise more, which ends, since a file is measured once and a statement that a
             measure refuted is not taken a second time."""
             live = [root for root in ready if root["id"] not in offline]
-            missed = settle(db, live, chosen, progress, reads, failed, asked, thorough, absent)
+            missed = settle(db, live, chosen, progress, reads, failed, asked, thorough, absent, offered)
             first = True
             while link.link(db, directory, live, progress, everything=again and first):
                 first = False
-                missed += settle(db, live, chosen, progress, reads, failed, asked, thorough, absent)
+                missed += settle(db, live, chosen, progress, reads, failed, asked, thorough, absent, offered)
             link.cover(db, directory)
             return missed
 
         failures += acquaint(not names_only, not names_only, relink)
         if names_only:
             return done, failures
+        if exchange is not None:                # the files compared may hold what was offered
+            exchange.run("apply")
         # The copies are made in a folder that the run makes for itself in the data folder,
         # when the first is needed. What a run that was cut short left behind is removed first.
         failures += forget_copies(db, directory, progress)
@@ -552,7 +572,7 @@ def build(db, directory, selected, *, names_only=False, ocr=False, languages="en
         marks = ",".join("?" * len(states))
         waiting_of = lambda file: db.execute(
             f"SELECT d.id FROM files f JOIN docs d ON d.id=f.doc WHERE f.id=? AND d.state IN ({marks})", (file, *states)).fetchone()
-        charged, tried, halted = set(), set(), False
+        charged, tried, measured, halted = set(), set(), set(), False
         wanted = lambda doc, state: state in states and doc not in charged
         try:
             while not halted and (limit is None or done < limit):
@@ -561,7 +581,8 @@ def build(db, directory, selected, *, names_only=False, ocr=False, languages="en
                 # something else. What a pass reads, and what the sources say afterwards, may
                 # leave other documents waiting, which the next pass takes up. No reading is
                 # tried twice through one file in a run; a file that a pass only measured,
-                # its document needing no reading then, may be read by a later pass.
+                # its document needing no reading then, may be read by a later pass, and is
+                # taken at most twice, so that a run always ends.
                 candidates = {}
                 for root in ready:
                     if root["id"] in offline:
@@ -580,6 +601,10 @@ def build(db, directory, selected, *, names_only=False, ocr=False, languages="en
                             candidates.setdefault(row["doc"], []).append((root, row))
                 if not candidates:
                     break
+                if exchange is not None:
+                    # An order of this machine's own, the same from one run to the next.
+                    candidates = dict(sorted(candidates.items(), key=lambda item: hashlib.sha256(
+                        (exchange.label + item[1][0][1]["rel"]).encode("utf-8", "surrogatepass")).digest()))
                 if hold is None:
                     try:
                         hold = copies_folder(db, directory)
@@ -613,6 +638,10 @@ def build(db, directory, selected, *, names_only=False, ocr=False, languages="en
                             if update_text(db, root, row, ocr, languages, wanted, hold):
                                 done += 1
                                 tried.add(row["id"])
+                            elif row["id"] in measured:
+                                tried.add(row["id"])        # copied twice without a reading: not a third time
+                            else:
+                                measured.add(row["id"])
                         except sqlite3.Error:
                             raise
                         except Unplaced as exc:     # no room for the copy: nothing is wrong with the documents
@@ -668,13 +697,22 @@ def build(db, directory, selected, *, names_only=False, ocr=False, languages="en
                         done += 1
                     if done // 100 > before // 100:
                         progress(f"{done // 100 * 100:,} documents processed")
+                    if exchange is not None and done > before and exchange.due():
+                        exchange.run("send", "receive", "apply")    # documents read elsewhere meanwhile are skipped
                 if not taken:
                     break
                 # What was just read may be what other files hold, and what the sources know by
                 # its checksum: the files of its size are compared with it now, and the
                 # sources are asked about the files just measured, so that the next run finds
                 # nothing left to do.
+                if exchange is not None:
+                    exchange.run("receive")
+                    offered = exchange.sizes()
                 failures += acquaint(True, True)
+                if exchange is not None:
+                    exchange.run("apply")
+            if exchange is not None:
+                exchange.run("send")
         finally:
             failures += forget_copies(db, directory, progress)
     return done, failures

@@ -14,12 +14,16 @@ storage answers as rclone does, in lines that the program has to read. Since the
 what every file holds, it can tell after each step whether a file shows a text that is not its
 own, page by page, whether a checksum kept is that of the bytes, whether anything read or
 recognised was lost or done twice, whether a run did what it reports, and whether the
-documents are those that the facts name, whatever the order of the events.
+documents are those that the facts name, whatever the order of the events. Another machine
+shares the shelf through a shared place: now and then it gives the pages of a work that it read,
+in a parcel, and every complete run takes them and gives what it read in turn.
 
 The number of histories is 40, or what SHELFFIND_HISTORIES says; SHELFFIND_HISTORY replays the
 one of a given number."""
 import datetime
+import gzip
 import hashlib
+import json
 import json
 import os
 import random
@@ -31,7 +35,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 import invariants
-from shelffind import extract, indexer, store
+from shelffind import extract, indexer, parcels, sharing, store
 
 SIZES = (600, 900)
 FORMATS = ("txt", "txt", "txt", "txt", "md", "md", "bin", "txt#600")
@@ -42,6 +46,9 @@ def body(work, size):
     """What the work number `work` holds, at the size `size`: its own word, again and again."""
     text = f"work{work:04d}token " * (size // 14 + 1)
     return text[:size].encode()
+
+
+OTHER = "0123456789abcdef"     # the label of the other machine
 
 
 class World:
@@ -72,6 +79,8 @@ class World:
         self.recognised = []
         self.stumbled = []
         self.log = []
+        self.shared = base / "shared"               # the shared place, and the parcels of another machine
+        self.gifts = []
 
     # ---- the truth ------------------------------------------------------------------------
     def new_work(self):
@@ -162,7 +171,7 @@ class World:
         dice = self.dice
         kind = dice.choice(("add", "add", "again", "copy", "move", "rename", "change", "remove", "sync", "sync",
                             "believe", "believe", "learn", "forget", "silence", "lie", "inventory", "inventory",
-                            "full", "full", "limited", "relink", "recognise", "targeted", "retry"))
+                            "full", "full", "limited", "relink", "recognise", "targeted", "retry", "gift"))
         if not self.aged and dice.random() < 0.01:
             kind = "age"
         elif dice.random() < 0.015:
@@ -205,6 +214,8 @@ class World:
                 del self.beliefs[name][dice.choice(sorted(self.beliefs[name]))]
             elif self.known[name]:
                 self.known[name].discard(dice.choice(sorted(self.known[name])))
+        elif kind == "gift":
+            self.gift()
         elif kind == "restyle":                             # a source comes to give other checksums, or another order
             self.styles[dice.choice(sorted(self.styles))] += 1
         elif kind == "silence":
@@ -282,6 +293,31 @@ class World:
                 db.execute("UPDATE names SET title='',byline='' WHERE rowid=?", (file["id"],))
             db.execute("DELETE FROM docs WHERE NOT EXISTS (SELECT 1 FROM files f WHERE f.doc=docs.id)")
 
+    def gift(self):
+        """Another machine gives, in a parcel of its own, the true pages of a work it read, under
+        a readable format: a work that a file of this shelf holds, or one that none holds yet. A
+        work that no reader can read is given by nobody."""
+        works = [work for work in sorted(self.works) if not self.broken(work)]
+        if not works:
+            return
+        work = self.dice.choice(works)
+        fmt = self.dice.choice(("txt", "md"))
+        body = self.bytes_of(work).decode()
+        if self.scan_of(work):
+            seen = self.dice.random() < 0.5
+            pages = [[1, None, body, 0], [2, None, f"work{work:04d}token recognised on page 2" if seen else "", int(not seen)]]
+        else:
+            pages = [[None, None, body, 0]]
+        md5, sha = self.sums(work)
+        line = {"md5": md5, "sha256": sha, "size": self.works[work], "format": fmt, "pages": pages}
+        header = {"format": parcels.FORMAT, "machine": OTHER}
+        data = gzip.compress((json.dumps(header) + "\n" + json.dumps(line) + "\n").encode())
+        self.gifts.append({"name": f"texts/{OTHER}/{len(self.gifts) + 1:06d}.jsonl.gz", "size": len(data),
+                           "sha256": hashlib.sha256(data).hexdigest(), "documents": 1})
+        place = sharing.Folder(self.shared)
+        place.put(self.gifts[-1]["name"], data)
+        sharing.put_card(place, OTHER, {"id": OTHER, "name": "elsewhere", "updated": 0, "parcels": self.gifts})
+
     def take(self, path):
         path.unlink()
         del self.holds[path]
@@ -294,7 +330,8 @@ class World:
         self.log.append(kind)
         before = len(self.extracted)
         self.liars |= self.misled()                         # what it says of them now may be kept for long
-        done = indexer.build(self.db, self.data, store.roots(self.db), progress=lambda _: None, **options)
+        exchange = parcels.Exchange(self.data, self.db, sharing.Folder(self.shared))
+        done = indexer.build(self.db, self.data, store.roots(self.db), progress=lambda _: None, exchange=exchange, **options)
         return done, self.extracted[before:]
 
 

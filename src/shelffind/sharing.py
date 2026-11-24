@@ -1,5 +1,6 @@
 # Copyright 2026 Eudaemonic Enterprises Inc.
-"""What several machines share: the journal of the searches made and of the documents opened.
+"""What several machines share: the journal of the searches made and of the documents opened,
+and the text that each one read (see `parcels`).
 
 Each machine writes its own files in the shared place and never touches those of another, so
 no two machines write the same file. A machine lists what it has put there in one small file,
@@ -7,9 +8,15 @@ with a checksum for each journal; another machine takes a journal only when its 
 agrees. The shared place is a folder kept in step by any tool, or a remote reached with rclone.
 
     .shelffind-shared               {"format": 1}
-    machines/LABEL.json             the name of the machine and the list of its journals
+    machines/LABEL.json             the name of the machine, the list of its journals and of its parcels
     history/LABEL/YYYY-MM.jsonl     its journal of one month, one event per line
+    texts/LABEL/NNNNNN.jsonl.gz     a parcel of the text it read
+
+The exchanges of one data folder take turns (`alone`), and a machine rewrites its card keeping
+what it does not change.
 """
+import contextlib
+import fcntl
 import hashlib
 import json
 import os
@@ -60,9 +67,9 @@ class Rclone:
     def __init__(self, remote, program="rclone"):
         self.remote, self.program = remote.rstrip("/"), program
 
-    def run(self, *words, data=None):
+    def run(self, *words, data=None, seconds=900):
         try:
-            done = subprocess.run([self.program, *words], input=data, capture_output=True, timeout=120)
+            done = subprocess.run([self.program, *words], input=data, capture_output=True, timeout=seconds)
         except (OSError, subprocess.TimeoutExpired) as fault:
             raise ValueError(f"rclone could not be run: {fault}") from None
         return done.returncode, done.stdout, done.stderr.decode("utf-8", "replace").strip()
@@ -89,9 +96,27 @@ class Rclone:
             raise ValueError(f"rclone: {err[:300]}")
 
 
+@contextlib.contextmanager
+def alone(directory):
+    """Hold the exchange of the data folder `directory`: yields True, or False at once when
+    another process of this folder is exchanging."""
+    with (Path(directory) / "sync.lock").open("a") as lock:
+        try:
+            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            yield False
+            return
+        yield True
+
+
+def put_card(place, label, card):
+    """Write the card of the machine `label` in the shared place."""
+    place.put(f"machines/{label}.json", json.dumps(card, indent=2).encode() + b"\n")
+
+
 def carrier(settings):
     """The shared place the settings name, or None when nothing is shared."""
-    if not settings["share.history"]:
+    if not (settings["share.history"] or settings["share.texts"]):
         return None
     if settings["share.folder"]:
         return Folder(os.path.expanduser(settings["share.folder"]))
@@ -131,9 +156,10 @@ def outgoing(directory, label):
     return {month: (len(lines), "".join(lines).encode("utf-8")) for month, lines in months.items()}
 
 
-def sync(directory, place, name=None, now=None):
-    """Put the journals of this machine in the shared place and take those of the others.
-    Returns what happened: {"sent", "received", "damaged", "machines"}."""
+def sync(directory, place, name=None, now=None, journals=True):
+    """Put the journals of this machine in the shared place and take those of the others, or,
+    without `journals`, only note which machines share. Returns what happened: {"sent",
+    "received", "damaged", "machines"}. The caller holds the exchange (`alone`)."""
     me = machine.identity(directory, name)
     told = place.get(".shelffind-shared")
     if told is None:
@@ -151,22 +177,22 @@ def sync(directory, place, name=None, now=None):
         listed = json.loads(place.get(f"machines/{me['id']}.json") or b"{}")
     except ValueError:
         pass
-    journals = listed.get("journals") if isinstance(listed.get("journals"), dict) else {}
+    listed = listed if isinstance(listed, dict) else {}
+    given = listed.get("journals") if isinstance(listed.get("journals"), dict) else {}
     sent = 0
-    for month, (lines, body) in sorted(outgoing(directory, me["id"]).items()):
-        known = journals.get(month) if isinstance(journals.get(month), dict) else {}
+    for month, (lines, body) in sorted(outgoing(directory, me["id"]).items() if journals else ()):
+        known = given.get(month) if isinstance(given.get(month), dict) else {}
         checksum = hashlib.sha256(body).hexdigest()
         # A month already given is given again only when it has grown: the journal of this
         # machine drops its oldest lines when it is full, and what was shared stays shared.
         if known.get("sha256") == checksum or known.get("lines", 0) > lines:
             continue
         place.put(f"history/{me['id']}/{month}.jsonl", body)
-        journals[month] = {"lines": lines, "sha256": checksum}
+        given[month] = {"lines": lines, "sha256": checksum}
         sent += 1
     if sent or listed.get("name") != me["name"]:
-        place.put(f"machines/{me['id']}.json", json.dumps(
-            {"id": me["id"], "name": me["name"], "updated": int(time.time() if now is None else now),
-             "journals": journals}, indent=2).encode() + b"\n")
+        put_card(place, me["id"], {**listed, "id": me["id"], "name": me["name"],
+                                   "updated": int(time.time() if now is None else now), "journals": given})
     # What the others give.
     received = damaged = 0
     others = {}
@@ -177,14 +203,14 @@ def sync(directory, place, name=None, now=None):
             continue
         try:
             card = json.loads(place.get(f"machines/{entry}") or b"")
-            given = card["journals"]
+            theirs = card.get("journals") or {}
             others[label] = {"name": " ".join(str(card.get("name") or label).split())[:40],
                              "updated": int(card.get("updated") or 0)}
         except (ValueError, KeyError, TypeError, AttributeError):
             damaged += 1
             continue
-        for month in recent(now):
-            wanted = given.get(month) if isinstance(given, dict) else None
+        for month in recent(now) if journals else ():
+            wanted = theirs.get(month) if isinstance(theirs, dict) else None
             if not isinstance(wanted, dict) or not isinstance(wanted.get("sha256"), str):
                 continue
             kept = peers / label / f"{month}.jsonl"

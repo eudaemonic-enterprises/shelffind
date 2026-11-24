@@ -11,7 +11,7 @@ import time
 from contextlib import closing
 from pathlib import Path
 
-from . import (__version__, config, curate, desktop, doctor, helptext, indexer, machine, migrate, sharing, shell,
+from . import (__version__, config, curate, desktop, doctor, helptext, indexer, machine, migrate, parcels, sharing, shell,
                sources, store)
 from .picker import panel
 from .text import json_text, safe
@@ -96,7 +96,7 @@ def parser():
     rp.add_argument("--root", help="One registered folder")
     rp.add_argument("--source", help="For unlinked: the files this source does not know")
     rp.add_argument("--json", action="store_true")
-    sy = cmds.add_parser("sync", help="Exchange the journal of searches with your other machines")
+    sy = cmds.add_parser("sync", help="Exchange the journal of searches, and the texts read, with your other machines")
     sy.add_argument("--quiet", action="store_true", help="Say nothing unless something fails")
     mc = cmds.add_parser("machine", help="The name of this machine among those that share")
     mc.add_argument("--name", help="Give this machine a name, such as home or office")
@@ -251,6 +251,41 @@ def refresh_later(args, db, settings):
         apart(args, "index", "--names-only")
 
 
+def exchange(args, directory, settings):
+    """The command sync: the journals, then the texts, when the settings share them. The texts
+    are left to a reading of documents that is under way, which exchanges them itself."""
+    place = sharing.carrier(settings)
+    if place is None:
+        raise ValueError("Nothing is shared: set share.history or share.texts, and share.folder or share.remote")
+    with sharing.alone(directory) as free:
+        if not free:
+            if not args.quiet:
+                print("Another exchange of this data folder is under way.")
+            return 0
+        done = sharing.sync(directory, place, journals=settings["share.history"])
+        damaged, texts = done["damaged"], None
+        if settings["share.texts"]:
+            try:
+                with closing(store.connect(directory, upgrade=False)) as db, store.index_lock(directory):
+                    texts = parcels.Exchange(directory, db, place, lambda text: print(safe(text), file=sys.stderr))
+                    texts.steps("receive", "apply", "send")
+                    damaged += texts.counts["damaged"]
+            except store.NeedsUpgrade:
+                pass                            # the texts wait for the conversion of the index
+            except ValueError as busy:
+                if "already running" not in str(busy):
+                    raise
+    if damaged or not args.quiet:
+        others = ", ".join(done["machines"]) or "no other machine yet"
+        told = [f"{done['sent']} sent, {done['received']} received ({others})"]
+        if texts is not None:
+            told.append(f"texts of {texts.counts['sent']:,} documents given, {texts.counts['received']:,} taken")
+        if damaged:
+            told.append(f"{damaged} could not be taken and will be asked again")
+        print("; ".join(told))
+    return 0
+
+
 def exchange_later(args, directory, settings):
     """After the panel, when journals are shared and the last exchange is not recent: start
     one in a process of its own, which outlives this one and delays nothing."""
@@ -316,12 +351,14 @@ def execute(args, db, directory, settings):
                 sys.stderr.write(text)
                 sys.stderr.flush()
             live = report.Progress(write, lambda: shutil.get_terminal_size(), look(settings, sys.stderr))
+        said = live.message if live else lambda s: print(safe(s), file=sys.stderr, flush=True)
+        place = sharing.carrier(settings) if settings["share.texts"] else None
         try:
             count, failures = indexer.build(
                 db, directory, roots, names_only=args.names_only, ocr=args.ocr, languages=args.lang,
-                retry=args.retry, limit=args.limit, paths=files, relink=args.relink,
-                progress=live.message if live else lambda s: print(safe(s), file=sys.stderr, flush=True),
-                on_document=live.document if live else None)
+                retry=args.retry, limit=args.limit, paths=files, relink=args.relink, progress=said,
+                on_document=live.document if live else None,
+                exchange=parcels.Exchange(directory, db, place, said) if place is not None else None)
         finally:
             if live:
                 live.clear()
@@ -466,14 +503,7 @@ def main(argv=None):
                 told = machine.identity(directory, args.name)
                 print(f"{told['name']}  ({told['id']})")
             elif args.command == "sync":
-                place = sharing.carrier(settings)
-                if place is None:
-                    raise ValueError("Nothing is shared: set share.history and share.folder or share.remote")
-                done = sharing.sync(directory, place)
-                if done["damaged"] or not args.quiet:
-                    others = ", ".join(done["machines"]) or "no other machine yet"
-                    print(f"{done['sent']} sent, {done['received']} received ({others})"
-                          + (f"; {done['damaged']} could not be taken and will be asked again" * bool(done["damaged"])))
+                return exchange(args, directory, settings)
             elif args.command == "upgrade":
                 if args.discard_old:
                     freed = migrate.discard_old(directory)

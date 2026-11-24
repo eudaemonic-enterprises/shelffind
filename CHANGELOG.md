@@ -6,6 +6,23 @@ ShelfFind follows semantic versioning. Before version 1.0 a minor version may ch
 JSON keys and the exit codes that other programs rely on are kept from one version to the next and
 are covered by tests.
 
+## 0.4.0 (in preparation)
+
+The text that one machine reads travels to the others. With `share.texts`, a machine puts the
+pages it read in the shared place of the journals, in parcels of at most 16 MB that are never
+changed once written, named with their checksums on its list; another machine takes a parcel
+only when its checksum agrees, so a parcel cut or changed on the way is taken another time. The
+pages go to the document known, by a measure, by the checksums of the bytes they were read
+from, when it waits for its text or has more pages to recognise, and never to other bytes or to
+a document whose text a source answers for. A complete run takes what the others read before
+it compares the files, reads in an order of the machine's own, and exchanges every two minutes
+while it reads, so that several machines can share one long reading. `shelffind sync`
+exchanges texts too. What a machine knows of the parcels is kept in `exchange.sqlite3`, which
+can be deleted at any time.
+
+A file that a pass of a run copied without reading it may be read by a later pass of the same
+run, and is taken at most twice, so that a run always ends.
+
 ## 0.3.0
 
 The folders and the sources in one list, with the text attached to documents.
