@@ -102,6 +102,20 @@ class Ahead(Shelf):
         self.assertEqual([t.name for t in threading.enumerate() if t.name == "shelffind-copy"], [])
         self.assertEqual(self.build(workers=4), (10, 0))
 
+    def test_a_copy_made_ahead_keeps_the_time_of_the_last_change_that_it_saw(self):
+        self.write(1)
+        path = self.root / "volume00.txt"
+        row = self.db.execute("SELECT id,rel,size,mtime,format FROM files WHERE rel='volume00.txt'").fetchone()
+        self.build(names_only=True)
+        row = self.db.execute("SELECT id,rel,size,mtime,format FROM files WHERE rel='volume00.txt'").fetchone()
+        hold = self.base / "hold"
+        hold.mkdir()
+        folder, copy, measured, same, changed = indexer.prepare(path, row, hold, None)
+        self.addCleanup(folder.cleanup)
+        self.assertEqual(changed, path.stat().st_ctime_ns)
+        self.assertEqual(copy.read_bytes(), path.read_bytes())
+        self.assertEqual(measured[0], "md5:" + hashlib.md5(path.read_bytes()).hexdigest())
+
     def test_a_file_that_cannot_be_copied_is_said_as_before(self):
         self.write(4)
         for workers in (1, 4):

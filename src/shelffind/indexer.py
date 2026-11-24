@@ -150,18 +150,23 @@ running = threading.local()     # the copying threads of a run put there the eve
 
 def prepare(path, row, hold, known):
     """What `update_text` makes first, made in advance: the folder of the copy, the copy, its
-    checksums, and what tells the file itself apart from another: (folder, copy, checksums,
-    itself). A fault is raised as `update_text` would have met it."""
+    checksums, what tells the file itself apart from another, and the time of its last change as it
+    stood at the end of the copy, which a rewriting that put the date back still moves: (folder,
+    copy, checksums, itself, changed). A fault is raised as `update_text` would have met it."""
     try:
         folder = tempfile.TemporaryDirectory(prefix="copy-", dir=hold, ignore_cleanup_errors=True)
     except OSError as fault:
         raise Unplaced(str(fault)) from None
     try:
         copy, measured, same = private_copy(path, row, Path(folder.name), known)
+        try:
+            changed = path.stat().st_ctime_ns
+        except OSError:
+            changed = None
     except BaseException:
         folder.cleanup()
         raise
-    return folder, copy, measured, same
+    return folder, copy, measured, same, changed
 
 
 class Ahead:
@@ -584,7 +589,7 @@ def update_text(db, root, row, ocr, languages, wanted=None, hold=None, offered=N
         raise ValueError("Plain text exceeds 64 MiB")       # said before a copy of that size is made
     if made is not None:
         try:
-            folder, copy, measured, same = made.result()
+            folder, copy, measured, same, touched = made.result()
         except (OSError, ValueError) as fault:
             raise Unreadable(str(fault)) from None
     else:
@@ -614,10 +619,11 @@ def update_text(db, root, row, ocr, languages, wanted=None, hold=None, offered=N
         if not wanted(doc, told["state"]):
             return False
         if offered is not None:
-            try:
-                touched = path.stat().st_ctime_ns       # what a rewriting in place that kept the date still changes
-            except OSError:
-                touched = None
+            if made is None:
+                try:
+                    touched = path.stat().st_ctime_ns   # what a rewriting in place that kept the date still changes
+                except OSError:
+                    touched = None
 
             def unchanged():
                 try:
