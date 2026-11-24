@@ -115,13 +115,16 @@ def ago(seconds):
     return f"{int(max(0, seconds))} s"
 
 
-def machines(here, last, theme, unicode=True, now=None):
-    """The line of `status` on the machines that share their journals with this one."""
+def machines(here, last, theme, unicode=True, now=None, names=None):
+    """The line of `status` on the machines that share their journals with this one. `names` gives
+    the names that the settings choose, by label, over those that the machines give themselves."""
     now = time.time() if now is None else now
+    names = names or {}
     dot = " · " if unicode else " - "
-    others = sorted(last.get("machines", {}).values(), key=lambda card: card.get("name") or "")
-    told = [f"{safe(here['name'])} (here)"] + [
-        f"{safe(card.get('name') or '?')}, shared {ago(now - card.get('updated', 0))} ago" for card in others]
+    others = sorted(((names.get(label) or card.get("name") or "?", card)
+                     for label, card in last.get("machines", {}).items()), key=lambda found: found[0])
+    told = [f"{safe(names.get(here['id']) or here['name'])} (here)"] + [
+        f"{safe(name)}, shared {ago(now - card.get('updated', 0))} ago" for name, card in others]
     when = f"last exchange {ago(now - last['synced'])} ago" if last.get("synced") else "no exchange yet: shelffind sync"
     yield theme.render([("Machines".ljust(10), "muted"), (dot.join(told), None), (dot + when, "muted")])
 

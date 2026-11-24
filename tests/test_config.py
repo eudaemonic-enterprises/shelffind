@@ -53,6 +53,15 @@ class Layers(unittest.TestCase):
                          ("bottom", "command line"))
         self.assertEqual(settings.height(10), 9)
 
+    def test_machines_are_named_by_label_in_the_settings(self):
+        label = "0123456789abcdef"
+        settings = self.load(f'[machines]\n{label} = "home"\n')
+        self.assertEqual(settings.tables["machines"], {label: "home"})
+        self.assertTrue(any(line.startswith(f"machines.{label} = \"home\"") for line in config.report(settings)))
+        for text in (f'[machines]\n{label} = ""\n', '[machines]\nnotalabel = "home"\n', f'[machines]\n{label} = 3\n'):
+            with self.assertRaises(config.ConfigError, msg=text):
+                self.load(text)
+
     def test_an_included_file_ranks_below_the_file_that_names_it(self):
         private = self.home / "private/shelffind.toml"
         private.parent.mkdir()

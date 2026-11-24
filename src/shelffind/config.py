@@ -67,6 +67,7 @@ TABLES = {
     "theme": "Colours by role, one table per theme.",
     "sources": "Outside sources: [sources.NAME] command = [\"program\", \"argument\"].",
     "roots": "Document folders: [roots.NAME] path = \"~/Books\", and remote = \"cloud:Books\" for its rclone twin.",
+    "machines": "Names for your machines whatever they call themselves: [machines] LABEL = \"office\"; `shelffind machine` prints the label.",
     "convert": "Formats read by a program: [convert.doc] command = [\"antiword\", \"{path}\"], which prints the text.",
 }
 VARIABLE = re.compile(r"\$(?:\{(\w+)\}|(\w+))")
@@ -202,6 +203,8 @@ class Settings:
                              "roots": isinstance(content, dict) and isinstance(content.get("path"), str)
                              and content["path"] and all(isinstance(v, str) for v in content.values())
                              and set(content) <= {"path", "remote"},
+                             "machines": isinstance(content, str) and bool(content.strip()) and len(content) <= 40
+                             and re.fullmatch(r"[0-9a-f]{16}", inner) is not None,
                              "convert": isinstance(content, dict) and set(content) == {"command"} and isinstance(
                                  content["command"], list) and content["command"] and all(
                                  isinstance(w, str) for w in content["command"]) and any(

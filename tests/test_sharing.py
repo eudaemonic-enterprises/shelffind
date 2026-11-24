@@ -250,6 +250,11 @@ class Identity(Machines):
                          ["Machines  home (here) · laptop, shared 3 days ago · office, shared 1 h ago"
                           " · last exchange 1 h ago"])
         self.assertIn("no exchange yet", next(report.machines({"id": "c" * 16, "name": "home"}, {}, plain)))
+        # Names that the settings choose, by label, win over the names that machines give themselves.
+        named = {"a" * 16: "work", "c" * 16: "desk"}
+        self.assertEqual(list(report.machines({"id": "c" * 16, "name": "spy"}, last, plain, now=4600, names=named)),
+                         ["Machines  desk (here) · laptop, shared 3 days ago · work, shared 1 h ago"
+                          " · last exchange 1 h ago"])
         self.assertEqual([report.ago(s) for s in (5, 59, 60, 3599, 3600, 86400 * 2)],
                          ["5 s", "59 s", "1 min", "59 min", "1 h", "2 days"])
 

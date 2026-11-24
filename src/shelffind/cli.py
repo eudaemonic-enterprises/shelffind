@@ -172,7 +172,7 @@ def status(args, rows, directory, settings):
             print(line)
         if sharing.carrier(settings) is not None:
             for line in report.machines(machine.identity(directory), sharing.last(directory), theme,
-                                        unicode_signs(settings, sys.stdout)):
+                                        unicode_signs(settings, sys.stdout), names=settings.tables["machines"]):
                 print(line)
     else:
         for row in rows:
@@ -507,7 +507,7 @@ def main(argv=None):
                     desktop.reveal(target["path"])
             elif args.command == "machine":
                 told = machine.identity(directory, args.name)
-                print(f"{told['name']}  ({told['id']})")
+                print(f"{settings.tables['machines'].get(told['id']) or told['name']}  ({told['id']})")
             elif args.command == "sync":
                 return exchange(args, directory, settings)
             elif args.command == "upgrade":
