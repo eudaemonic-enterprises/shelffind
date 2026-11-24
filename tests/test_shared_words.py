@@ -1,6 +1,7 @@
 # Copyright 2026 Eudaemonic Enterprises Inc.
 """A query whose words are shared between the name of a document and its text."""
 import json
+import re
 import unittest
 
 from shelffind import search
@@ -68,6 +69,20 @@ class Shared(Shelf):
         self.assertEqual(code, 0)
         rows = {row["name"]: row for row in json.loads(out)}
         self.assertEqual(rows["Whitham-LinearAndNonlinearWaves.txt"]["match"], "name and passage")
+
+    def test_the_look_into_the_text_of_the_documents_that_the_names_give_is_bounded(self):
+        for n in range(search.SHARED * 3):
+            (self.root / f"Alpha{n:04d}.txt").write_text(f"beta number {n} " * 5)
+        self.build()
+        probes = []
+        self.db.set_trace_callback(lambda sql: probes.append(sql) if re.search(r"AND rowid BETWEEN \d+ AND \d+", sql) else None)
+        self.assertEqual([r for r in search.search(self.db, "alpha gamma", where="all")], [])
+        self.assertEqual(len(probes), search.SHARED)
+        del probes[:]
+        found = search.search(self.db, "alpha beta", where="all", limit=5)
+        self.assertEqual([r["match"] for r in found], ["name and passage"] * 5)
+        self.assertEqual(len(probes), 5)                     # it stops once the list is full
+        self.db.set_trace_callback(None)
 
     def test_how_the_words_are_shared(self):
         self.assertEqual(search.shares(1), [])

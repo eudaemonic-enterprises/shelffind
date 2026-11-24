@@ -12,8 +12,11 @@ from . import fuzzy, store
 SAMPLE = 20_000
 SPREAD = 2_000          # the number of pages such a sample aims at
 # A query whose words are shared between the name of a document and its text is answered from the
-# documents that the names give: at most this many are looked into for each way of sharing.
-SHARED = 300
+# documents that the names give: at most this many are looked into for all the ways of sharing
+# together, the ways that give the name more words first, so that a long query stays quick.
+SHARED = 120
+# What the names give for one way of sharing is read to this many documents at most.
+LISTED = 300
 # What is a document, as against the programs, pictures and data that some folders hold: among
 # matches of the same kind, documents are listed first.
 DOCUMENTS = frozenset("pdf djvu ps ps.gz epub txt md rst tex bib typ doc docx odt rtf html htm fb2 mobi azw3 chm "
@@ -420,17 +423,20 @@ def search(db, query, *, root=None, fmt=None, limit=25, exact=False, where="all"
         and whose text holds the others (`whitham dispersion`: one in the name, one in the page).
         They come before the documents found by their text alone, and after those found by
         their names, and the page shown is the one that holds the words asked of the text."""
-        crossed, aimed = set(), targets(parts, close, exact)
+        crossed, aimed, budget = set(), targets(parts, close, exact), SHARED
         for chosen, rest in shares(len(parts)):
-            if len(crossed) >= limit:
+            if len(crossed) >= limit or budget <= 0:
                 break
             names_expr = " AND ".join(clause(parts, close, index, exact) for index in chosen)
             text_expr = " AND ".join(clause(parts, close, index, exact, True) for index in rest)
             sql = (f"SELECT {COLUMNS} FROM names JOIN files f ON f.id=names.rowid JOIN docs d ON d.id=f.doc "
                    "WHERE names MATCH ?" + filters + " ORDER BY bm25(names,10.0,3.0,6.0,3.0) LIMIT ?")
-            for row in db.execute(sql, (names_expr, *bindings, SHARED)).fetchall():
+            for row in db.execute(sql, (names_expr, *bindings, LISTED)).fetchall():
                 if row["doc"] in crossed or len(crossed) >= limit:
                     continue
+                if budget <= 0:
+                    break
+                budget -= 1
                 first, last = db.execute("SELECT min(id),max(id) FROM pages WHERE doc=?", (row["doc"],)).fetchone()
                 if first is None:
                     continue
