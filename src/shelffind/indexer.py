@@ -124,14 +124,27 @@ def whole_checksums(path, row, copy=None):
     return [f"md5:{found[0].hexdigest()}", f"sha256:{found[1].hexdigest()}"]
 
 
+def plain_name(path):
+    """The name of the copy of a file: its own, with every character that a shell or a program may
+    take for something else (blanks, quotes, $, ;, &, |, brackets, a backslash) put down as an
+    underscore, and the end of the name, which tells the format, kept."""
+    name = re.sub(r"[^\w.\-]", "_", path.name)
+    if len(name) > 100:
+        ending = re.sub(r"[^\w.\-]", "_", "".join(path.suffixes[-2:]))[-20:]
+        name = name[:100 - len(ending)] + ending
+    return name.lstrip(".") or "document"
+
+
 def private_copy(path, row, hold, known=None):
     """A copy of a file on this machine, with its checksums and with what tells the file itself
     apart from another: (copy, checksums, itself). `known` is the MD5 that was measured of the
     file before, by its storage as a rule. A reading that contradicts it is made a second
     time, since a file that comes through a network may arrive damaged: the second reading
     stands when it agrees with what was known or with the first, and the file is not read when
-    the two readings differ from each other and from it."""
-    copy = hold / path.name
+    the two readings differ from each other and from it. The copy is named after the file, with the
+    characters that a shell would take for something else put down (see `plain_name`), so that a
+    file name cannot give an order to a program that reads the copy."""
+    copy = hold / plain_name(path)
     same = check_stamp(path, row)
     measured = whole_checksums(path, row, copy)
     if known and known != measured[0]:
@@ -178,7 +191,13 @@ class Ahead:
     are limited in number and in bytes, and the threads are those of this run alone."""
 
     def __init__(self, hold, workers, room=ROOM):
-        self.hold, self.workers, self.room = hold, workers, room
+        try:
+            free = shutil.disk_usage(hold).free
+        except OSError:
+            free = 4 * room
+        # At most a quarter of the room that is free is held ahead, so that the copy of the
+        # document being read is never starved by those of the next.
+        self.hold, self.workers, self.room = hold, workers, max(0, min(room, free // 4))
         self.stop = threading.Event()
         self.jobs = queue.SimpleQueue()
         self.tasks = {}                     # file id -> (future, size) of the copies asked for and not taken
@@ -224,6 +243,25 @@ class Ahead:
         future, size = self.tasks.pop(file, (None, 0))
         self.kept -= size
         return future
+
+    def shed(self):
+        """The disk has no room for a copy: the copies not yet taken are given up, and one at most
+        is held ahead from now on."""
+        self.room = 0
+        running = []
+        for file in list(self.tasks):
+            future = self.take(file)
+            if future is not None and not future.cancel():
+                running.append(future)
+        end = time.monotonic() + LEAVE          # what is being copied is waited for: it is the room it holds that is wanted
+        for future in running:
+            try:
+                future.exception(timeout=max(0.0, end - time.monotonic()))
+            except Exception:
+                self.discard(future)            # still being made: removed when it is
+                continue
+            if future.exception() is None:
+                future.result()[0].cleanup()
 
     def discard(self, future):
         """Give up a copy that was taken from here and will not be used: it is removed when made."""
@@ -590,9 +628,12 @@ def update_text(db, root, row, ocr, languages, wanted=None, hold=None, offered=N
     if made is not None:
         try:
             folder, copy, measured, same, touched = made.result()
+        except Unplaced:
+            ahead.shed()        # the copies made ahead may hold the room that this one lacked: it is made again, alone
+            made = None
         except (OSError, ValueError) as fault:
             raise Unreadable(str(fault)) from None
-    else:
+    if made is None:
         try:                                        # what cannot be removed afterwards goes with the folder of the run
             folder = tempfile.TemporaryDirectory(prefix="copy-", dir=hold, ignore_cleanup_errors=True)
         except OSError as fault:
@@ -834,7 +875,8 @@ def build(db, directory, selected, *, names_only=False, ocr=False, languages="en
                     if halted or (limit is not None and done >= limit):
                         break
                     if ahead is not None:
-                        for _, later in order[seen:seen + 2 * workers]:
+                        reach = 2 * workers if limit is None else max(0, min(2 * workers, limit - done))
+                        for _, later in order[seen:seen + reach]:
                             if ahead.full():
                                 break
                             if later[0][0]["id"] not in offline:

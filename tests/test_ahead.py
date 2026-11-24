@@ -12,6 +12,8 @@ from pathlib import Path
 from unittest.mock import patch
 
 from shelffind import extract, indexer, store
+from shelffind.search import search
+from collections import namedtuple
 
 from support import Shelf
 
@@ -117,6 +119,62 @@ class Ahead(Shelf):
         self.assertEqual(changed, path.stat().st_ctime_ns)
         self.assertEqual(copy.read_bytes(), path.read_bytes())
         self.assertEqual(measured[0], "md5:" + hashlib.md5(path.read_bytes()).hexdigest())
+
+    def test_a_disk_that_holds_two_copies_only_does_not_stop_a_reading_that_one_at_a_time_finishes(self):
+        for n in range(10):
+            (self.root / f"v{n:02d}.txt").write_text(f"lantern {n} " * 270_000)          # about 3 MB each
+        real = indexer.put
+
+        def tight(data):
+            def put(target, block):
+                used = sum(f.stat().st_size for f in data.glob("copies-*/**/*") if f.is_file())
+                if used + len(block) > 5_000_000:
+                    raise indexer.Unplaced("No space left on device")
+                return real(target, block)
+            return put
+        for workers in (1, 4):
+            db, data = self.other(f"tight-{workers}")
+            with patch("shelffind.indexer.put", tight(data)):
+                self.assertEqual(indexer.build(db, data, store.roots(db), progress=lambda _: None, workers=workers), (10, 0))
+            self.assertEqual(db.execute("SELECT count(*) FROM docs WHERE state='indexed'").fetchone()[0], 10)
+
+    def test_the_copies_held_ahead_are_a_share_of_the_free_room_and_not_beyond_the_limit(self):
+        usage = namedtuple("usage", "total used free")
+        with patch("shelffind.indexer.shutil.disk_usage", return_value=usage(10**9, 10**9 - 4_000_000, 4_000_000)):
+            ahead = indexer.Ahead(self.base, 2)
+        self.addCleanup(ahead.close)
+        self.assertEqual(ahead.room, 1_000_000)
+        self.write(6)
+        copied = []
+        real = indexer.private_copy
+
+        def counting(path, row, hold, known=None):
+            copied.append(path.name)
+            return real(path, row, hold, known)
+        with patch("shelffind.indexer.private_copy", counting):
+            self.assertEqual(self.build(workers=4, limit=1), (1, 0))
+        self.assertEqual(len(copied), 1)
+
+    def test_the_copy_of_a_file_has_no_character_that_a_shell_takes_for_an_order(self):
+        for name, wanted in (("plain.pdf", "plain.pdf"), ("a b.pdf", "a_b.pdf"), ("$(touch x).ps.gz", "__touch_x_.ps.gz"),
+                             ("it's;rm -rf.txt", "it_s_rm_-rf.txt"), (".hidden.pdf", "hidden.pdf"), ("Привет.djvu", "Привет.djvu"),
+                             ("a`b`|c&d>e<f.txt", "a_b__c_d_e_f.txt")):
+            self.assertEqual(indexer.plain_name(Path("/some/folder") / name), wanted)
+        long_name = Path("/x/" + "n" * 300 + ".ps.gz")
+        shortened = indexer.plain_name(long_name)
+        self.assertLessEqual(len(shortened), 100)
+        self.assertTrue(shortened.endswith(".ps.gz"))
+
+    def test_a_file_name_cannot_run_a_command_through_a_converter_written_with_a_shell(self):
+        marker = self.base / "marker"
+        folder = self.root
+        (folder / "$(touch $MARK).zzz").write_text("quiet harbour")
+        extract.declare({"zzz": {"command": ["sh", "-c", "cat {path}"]}})
+        self.addCleanup(extract.declare, {})
+        with patch.dict(os.environ, {"MARK": str(marker)}):
+            self.assertEqual(self.build(), (1, 0))
+        self.assertFalse(marker.exists())
+        self.assertTrue(search(self.db, "harbour", where="text"))
 
     def test_a_file_that_cannot_be_copied_is_said_as_before(self):
         self.write(4)
