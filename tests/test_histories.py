@@ -310,13 +310,13 @@ class World:
             pages = [[None, None, body, 0]]
         md5, sha = self.sums(work)
         line = {"md5": md5, "sha256": sha, "size": self.works[work], "format": fmt, "pages": pages}
-        header = {"format": parcels.FORMAT, "machine": OTHER}
+        header = {"format": parcels.FORMAT, "writer": OTHER}
         data = gzip.compress((json.dumps(header) + "\n" + json.dumps(line) + "\n").encode())
         self.gifts.append({"name": f"texts/{OTHER}/{len(self.gifts) + 1:06d}.jsonl.gz", "size": len(data),
                            "sha256": hashlib.sha256(data).hexdigest(), "documents": 1})
         place = sharing.Folder(self.shared)
         place.put(self.gifts[-1]["name"], data)
-        sharing.put_card(place, OTHER, {"id": OTHER, "name": "elsewhere", "updated": 0, "parcels": self.gifts})
+        place.put(f"texts/{OTHER}.json", json.dumps({"format": 1, "writer": OTHER, "parcels": self.gifts}).encode())
 
     def take(self, path):
         path.unlink()

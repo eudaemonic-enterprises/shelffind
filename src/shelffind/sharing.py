@@ -38,6 +38,7 @@ class Folder:
 
     def __init__(self, path):
         self.path = Path(path)
+        self.identity = f"folder:{self.path.expanduser().absolute()}"
 
     def names(self, folder):
         try:
@@ -45,9 +46,14 @@ class Folder:
         except FileNotFoundError:
             return []
 
-    def get(self, name):
+    def get(self, name, limit=None):
+        """The bytes of a file of the shared place, None when there is none; with `limit`, a
+        file larger than that is refused before it is read."""
         try:
-            return (self.path / name).read_bytes()
+            with (self.path / name).open("rb") as held:
+                if limit is not None and os.fstat(held.fileno()).st_size > limit:
+                    raise ValueError(f"{name} is larger than it should be")
+                return held.read()
         except FileNotFoundError:
             return None
 
@@ -66,6 +72,7 @@ class Rclone:
 
     def __init__(self, remote, program="rclone"):
         self.remote, self.program = remote.rstrip("/"), program
+        self.identity = f"rclone:{self.remote}"
 
     def run(self, *words, data=None, seconds=900):
         try:
@@ -74,39 +81,82 @@ class Rclone:
             raise ValueError(f"rclone could not be run: {fault}") from None
         return done.returncode, done.stdout, done.stderr.decode("utf-8", "replace").strip()
 
+    @staticmethod
+    def fault(err):
+        """What rclone says went wrong: its last line, which follows its notices."""
+        lines = [line for line in err.splitlines() if line.strip()]
+        return f"rclone: {(lines[-1] if lines else 'no answer')[:300]}"
+
     def names(self, folder):
-        code, out, err = self.run("lsf", "--files-only", f"{self.remote}/{folder}")
+        code, out, err = self.run("lsf", "--files-only", f"{self.remote}/{folder}", seconds=300)
         if code:
             if "not found" in err:
                 return []
-            raise ValueError(f"rclone: {err[:300]}")
+            raise ValueError(self.fault(err))
         return sorted(line for line in out.decode("utf-8", "replace").splitlines() if line)
 
-    def get(self, name):
-        code, out, err = self.run("cat", f"{self.remote}/{name}")
+    def get(self, name, limit=None):
+        """The bytes of a file of the shared place, None when there is none; with `limit`, no
+        more than one byte beyond it is read, so that a file larger than that is refused."""
+        bound = ["--count", str(limit + 1)] if limit is not None else []
+        code, out, err = self.run("cat", *bound, f"{self.remote}/{name}", seconds=600)
         if code:
             if "not found" in err:
                 return None
-            raise ValueError(f"rclone: {err[:300]}")
+            raise ValueError(self.fault(err))
+        if limit is not None and len(out) > limit:
+            raise ValueError(f"{name} is larger than it should be")
         return out
 
     def put(self, name, data):
-        code, _, err = self.run("rcat", f"{self.remote}/{name}", data=data)
+        """Write a file of the shared place under a passing name, then move it to its own:
+        rclone writes a file in place, and a writing cut short would leave the file empty, or
+        remove the one it replaces. A reader never meets a file half written, and a writing
+        that fails leaves the former file as it was."""
+        passing = f"{name}.arriving.{os.getpid()}"
+        code, _, err = self.run("rcat", f"{self.remote}/{passing}", data=data)
         if code:
-            raise ValueError(f"rclone: {err[:300]}")
+            self.run("deletefile", f"{self.remote}/{passing}", seconds=120)
+            raise ValueError(self.fault(err))
+        code, _, err = self.run("moveto", f"{self.remote}/{passing}", f"{self.remote}/{name}")
+        if code:
+            raise ValueError(self.fault(err))
 
 
 @contextlib.contextmanager
-def alone(directory):
-    """Hold the exchange of the data folder `directory`: yields True, or False at once when
-    another process of this folder is exchanging."""
+def alone(directory, wait=0.0):
+    """Hold the exchange of the data folder `directory`: yields True, or False when another
+    process of this folder is exchanging and goes on doing so for `wait` seconds."""
+    deadline = time.monotonic() + wait
+    Path(directory).mkdir(mode=0o700, parents=True, exist_ok=True)
     with (Path(directory) / "sync.lock").open("a") as lock:
-        try:
-            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
-        except BlockingIOError:
-            yield False
-            return
+        while True:
+            try:
+                fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                break
+            except BlockingIOError:
+                if time.monotonic() >= deadline:
+                    yield False
+                    return
+                time.sleep(0.2)
         yield True
+
+
+def check_format(place):
+    """Make sure the shared place is one that this version may write in: it bears the mark of
+    its format, which is written when there is none, and which a newer ShelfFind may have
+    raised, in which case ValueError says so and nothing is written."""
+    told = place.get(".shelffind-shared", 4096)
+    if told is None:
+        place.put(".shelffind-shared", json.dumps({"format": FORMAT}).encode() + b"\n")
+        return
+    try:
+        made = json.loads(told).get("format", 0)
+        newer = type(made) is not int or made > FORMAT
+    except (ValueError, AttributeError, RecursionError):
+        newer = True
+    if newer:
+        raise ValueError("The shared place was written by a newer ShelfFind: update this one first")
 
 
 def put_card(place, label, card):
@@ -161,16 +211,7 @@ def sync(directory, place, name=None, now=None, journals=True):
     without `journals`, only note which machines share. Returns what happened: {"sent",
     "received", "damaged", "machines"}. The caller holds the exchange (`alone`)."""
     me = machine.identity(directory, name)
-    told = place.get(".shelffind-shared")
-    if told is None:
-        place.put(".shelffind-shared", json.dumps({"format": FORMAT}).encode() + b"\n")
-    else:
-        try:
-            newer = json.loads(told).get("format", 0) > FORMAT
-        except (ValueError, AttributeError):
-            newer = True
-        if newer:
-            raise ValueError("The shared place was written by a newer ShelfFind: update this one first")
+    check_format(place)
     # What this machine gives.
     listed = {}
     try:

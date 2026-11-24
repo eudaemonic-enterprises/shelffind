@@ -257,6 +257,7 @@ def exchange(args, directory, settings):
     place = sharing.carrier(settings)
     if place is None:
         raise ValueError("Nothing is shared: set share.history or share.texts, and share.folder or share.remote")
+    failed = False
     with sharing.alone(directory) as free:
         if not free:
             if not args.quiet:
@@ -265,25 +266,24 @@ def exchange(args, directory, settings):
         done = sharing.sync(directory, place, journals=settings["share.history"])
         damaged, texts = done["damaged"], None
         if settings["share.texts"]:
+            # The parcels are carried both ways; their pages are given by the next run of the
+            # index, once its inventory is made, which the panel starts by itself.
             try:
-                with closing(store.connect(directory, upgrade=False)) as db, store.index_lock(directory):
+                with closing(store.connect(directory, upgrade=False)) as db:
                     texts = parcels.Exchange(directory, db, place, lambda text: print(safe(text), file=sys.stderr))
-                    texts.steps("receive", "apply", "send")
+                    failed = not texts.steps("receive", "send")
                     damaged += texts.counts["damaged"]
             except store.NeedsUpgrade:
                 pass                            # the texts wait for the conversion of the index
-            except ValueError as busy:
-                if "already running" not in str(busy):
-                    raise
-    if damaged or not args.quiet:
+    if damaged or failed or not args.quiet:
         others = ", ".join(done["machines"]) or "no other machine yet"
         told = [f"{done['sent']} sent, {done['received']} received ({others})"]
         if texts is not None:
-            told.append(f"texts of {texts.counts['sent']:,} documents given, {texts.counts['received']:,} taken")
+            told.append(f"texts of {texts.counts['sent']:,} documents given")
         if damaged:
             told.append(f"{damaged} could not be taken and will be asked again")
         print("; ".join(told))
-    return 0
+    return int(failed)
 
 
 def exchange_later(args, directory, settings):

@@ -17,6 +17,11 @@ from support import run_main
 RCLONE = """#!/usr/bin/env python3
 import os, sys
 verb, *rest = sys.argv[1:]
+count = -1
+if "--count" in rest:                       # rclone cat --count N prints the first N bytes
+    at = rest.index("--count")
+    count = int(rest[at + 1])
+    del rest[at:at + 2]
 place = [word for word in rest if not word.startswith("--")][0]
 path = os.path.join(os.environ["PRETENDED_REMOTE"], place.split(":", 1)[1])
 if verb == "lsf":
@@ -27,11 +32,21 @@ elif verb == "cat":
     if not os.path.isfile(path):
         sys.exit("ERROR : error listing: directory not found")
     with open(path, "rb") as source:
-        sys.stdout.buffer.write(source.read())
+        sys.stdout.buffer.write(source.read(count))
 elif verb == "rcat":
     os.makedirs(os.path.dirname(path), exist_ok=True)
+    data = sys.stdin.buffer.read()
     with open(path, "wb") as target:
-        target.write(sys.stdin.buffer.read())
+        if os.environ.get("PRETENDED_FULL"):        # the disk refuses the rest: half is written
+            target.write(data[:len(data) // 2])
+            sys.exit("ERROR : Failed to copy: write: no space left on device")
+        target.write(data)
+elif verb == "moveto":
+    target = [word for word in rest if not word.startswith("--")][1]
+    os.replace(path, os.path.join(os.environ["PRETENDED_REMOTE"], target.split(":", 1)[1]))
+elif verb == "deletefile":
+    if os.path.isfile(path):
+        os.remove(path)
 else:
     sys.exit("unknown command " + verb)
 """

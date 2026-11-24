@@ -35,6 +35,8 @@ then found again wherever it reappears. Anything else that was said of a file go
 """
 import contextlib
 import fcntl
+import hashlib
+import json
 import os
 import re
 import sqlite3
@@ -801,58 +803,91 @@ def learn(db, doc, keys):
     return grew
 
 
-def taker(db, keys, size, fmt):
+def shape(identities):
+    """What tells two readings of the same bytes apart by their pages: a digest of the page
+    numbers and sections, in their order."""
+    return hashlib.sha256(json.dumps([list(one) for one in identities]).encode()).hexdigest()[:16]
+
+
+def reading(db, doc):
+    """The reading of a document as far as another reading is compared with it: (layout,
+    positions of the pages still to recognise), or None when it has no pages."""
+    rows = db.execute("SELECT page,section,needs_ocr FROM pages WHERE doc=? ORDER BY id", (doc,)).fetchall()
+    if not rows:
+        return None
+    return shape((row["page"], row["section"]) for row in rows), {number for number, row in enumerate(rows) if row["needs_ocr"]}
+
+
+def helps(ours, theirs, blanks):
+    """Whether a reading of the layout `theirs`, with the pages at the positions `blanks`
+    still to recognise, takes the reading `ours` (see `reading`) further: ours has no pages,
+    or has the same pages and one of its blanks is recognised there."""
+    return ours is None or (ours[0] == theirs and bool(ours[1] - set(blanks)))
+
+
+def answered(db, doc, holding):
+    """True when a source among `holding`, whose text is relied upon, gives the checksums of
+    the document and holds its text: the text is left to that source."""
+    if not holding:
+        return False
+    return db.execute(f"SELECT 1 FROM records WHERE doc=? AND text=1 AND keys!='' AND source IN ({','.join('?' * len(holding))}) "
+                      "LIMIT 1", (doc, *sorted(holding))).fetchone() is not None
+
+
+def taker(db, keys, size, fmt, holding=()):
     """The document that would take pages read elsewhere from the bytes of the checksums
     `keys` (an MD5 and a SHA-256), of this size and format: the one that a measure knows by
-    them, with a file, and that no source answers for. None when there is none, or when a
-    measure contradicts these checksums."""
+    them, with a file, waiting for its text, and whose text no source among `holding` answers
+    for. None when there is none, or when a measure contradicts these checksums."""
     if fmt not in SUPPORTED:
         return None
     wrong, doc = refuted(db, size, fmt, keys)
     if wrong or doc is None:
         return None
     told = db.execute("SELECT state FROM docs WHERE id=?", (doc,)).fetchone()
-    if told["state"] == "covered" or not db.execute("SELECT 1 FROM files WHERE doc=? LIMIT 1", (doc,)).fetchone():
+    if told["state"] not in ("pending", "error", "needs-ocr", "ocr-error") or answered(db, doc, holding) \
+            or not db.execute("SELECT 1 FROM files WHERE doc=? LIMIT 1", (doc,)).fetchone():
         return None
     return doc
 
 
-def gains(db, doc, pages):
-    """Whether pages read elsewhere, as (page, section, text, still to recognise), would take
-    the reading of a document further: it has none, or has more pages still to recognise, or
-    has the same pages and one of its blanks is recognised there."""
-    if not has_pages(db, doc):
-        return True
-    ours, count = blanks(db, doc)
-    theirs = sum(1 for page in pages if page[3])
-    if ours != theirs:
-        return ours > theirs
-    if count != len(pages):
-        return False
-    waiting = {row["page"] for row in db.execute("SELECT page FROM pages WHERE doc=? AND needs_ocr=1", (doc,))}
-    return any(page[0] in waiting and not page[3] for page in pages)
-
-
-def take_pages(db, doc, keys, pages):
+def take_pages(db, doc, keys, pages, holding=()):
     """Give a document the pages that another machine read from the bytes of the checksums
-    `keys` (see `taker`, which chose the document, and `gains`, which compared the readings).
-    The reading that went furthest is kept, and a page recognised in the other only is taken
-    from it, as when a file brings its pages (`hand_over`); the pages are then those of these
-    bytes, which the document is known by from now on."""
-    told = db.execute("SELECT size,format FROM docs WHERE id=?", (doc,)).fetchone()
-    had = has_pages(db, doc)
-    held = new_document(db, told["size"], told["format"])
-    db.executemany("INSERT INTO pages(doc,page,section,ztext,needs_ocr) VALUES(?,?,?,?,?)",
-                   [(held, page, section, deflate(body), int(bool(blank))) for page, section, body, blank in pages])
-    db.execute("UPDATE docs SET state=? WHERE id=?", ("needs-ocr" if any(page[3] for page in pages) else "indexed", held))
-    hand_over(db, held, doc)
-    db.execute("DELETE FROM docs WHERE id=?", (held,))
-    grew = learn(db, doc, keys)
-    db.execute("UPDATE docs SET origin=? WHERE id=?", (" ".join(sorted(keys)), doc))
-    # The words of a document are counted once, those of pages added to it later only kept.
-    (fuzzy.remember_more if had else fuzzy.remember_text)(db, (body for _, _, body, blank in pages if not blank))
-    if grew:
+    `keys` (an MD5 and a SHA-256), as (page, section, text, still to recognise); `taker` chose
+    the document. Returns True when something was given.
+
+    The checksums are learnt first: they are facts about the bytes the document is known by,
+    and may refute what a source said of one of its files, which then leaves it. The document
+    is then looked at again: it must still have a file, wait for its text, and not be left to
+    a source. A document without pages takes the reading whole. A document with pages takes
+    only pages that it still has to recognise, from a reading of the same pages, page by page:
+    nothing recognised here is ever replaced, so the readings of several machines add up,
+    in whatever order they come."""
+    if learn(db, doc, keys):
         purge(db, doc)
+    told = db.execute("SELECT state FROM docs WHERE id=?", (doc,)).fetchone()
+    if told is None or told["state"] not in ("pending", "error", "needs-ocr", "ocr-error") or answered(db, doc, holding) \
+            or not db.execute("SELECT 1 FROM files WHERE doc=? LIMIT 1", (doc,)).fetchone():
+        return False
+    ours = db.execute("SELECT id,page,section,needs_ocr FROM pages WHERE doc=? ORDER BY id", (doc,)).fetchall()
+    if not ours:
+        db.executemany("INSERT INTO pages(doc,page,section,ztext,needs_ocr) VALUES(?,?,?,?,?)",
+                       [(doc, page, section, deflate(body), int(bool(blank))) for page, section, body, blank in pages])
+        fuzzy.remember_text(db, (body for _, _, body, blank in pages if not blank))
+        state = "needs-ocr" if any(page[3] for page in pages) else "indexed"
+    else:
+        if [(row["page"], row["section"]) for row in ours] != [(page[0], page[1]) for page in pages]:
+            return False                        # another layout of the same bytes: ours stays as it is
+        filled = [(page[2], row["id"]) for row, page in zip(ours, pages) if row["needs_ocr"] and not page[3]]
+        if not filled:
+            return False
+        db.executemany("UPDATE pages SET ztext=?,needs_ocr=0 WHERE id=?", [(deflate(body), number) for body, number in filled])
+        fuzzy.remember_more(db, (body for body, _ in filled))
+        left = len([row for row in ours if row["needs_ocr"]]) - len(filled)
+        state = "indexed" if not left else ("ocr-error" if told["state"] == "ocr-error" else "needs-ocr")
+    db.execute("UPDATE docs SET state=?,error=CASE WHEN ?='ocr-error' THEN error END,origin=? WHERE id=?",
+               (state, state, " ".join(sorted(keys)), doc))
+    return True
 
 
 def disproved(db, row):
