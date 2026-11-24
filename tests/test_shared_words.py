@@ -80,5 +80,22 @@ class Shared(Shelf):
         self.assertEqual(len(search.shares(8)), 16)
 
 
+class Documents(Shelf):
+    def test_documents_come_before_programs_and_pictures_of_the_same_name(self):
+        for name in ("burgers.m", "burgers.eps", "Burgers.txt", "BurgersEquation.txt", "notes on burgers.md", "burgers.py"):
+            (self.root / name).write_text("a stand-in for the file " + name)
+        self.build()
+        names = [row["name"] for row in search.search(self.db, "burgers", where="name")]
+        first_other = min(names.index(n) for n in ("burgers.m", "burgers.eps", "burgers.py"))
+        for document in ("Burgers.txt", "BurgersEquation.txt", "notes on burgers.md"):
+            self.assertLess(names.index(document), first_other, names)
+
+    def test_a_format_asked_for_is_not_put_behind(self):
+        for name in ("burgers.m", "burgers.py", "Burgers.txt"):
+            (self.root / name).write_text("a stand-in")
+        self.build()
+        self.assertEqual([r["name"] for r in search.search(self.db, "burgers", fmt="m")], ["burgers.m"])
+
+
 if __name__ == "__main__":
     unittest.main()

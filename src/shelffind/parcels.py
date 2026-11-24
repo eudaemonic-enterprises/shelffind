@@ -69,6 +69,7 @@ PAGES = 100_000         # pages of one document at most
 LAST = 999_999          # the number of the last parcel of a writer
 BIG = 1 << 53           # no size, page number or count goes beyond this
 EVERY = 120             # seconds between two exchanges while documents are being read
+SHARE = 4               # and at least this many times what the last exchange took, so that reading gets most of the time
 WAIT = 120              # seconds that a run waits for an exchange of another process to end
 PAUSE = 900             # seconds without exchange after the shared place failed
 AWAIT = 7 * 86400       # seconds that a parcel of its own named and not there, or not whole, stays named,
@@ -305,7 +306,7 @@ class Exchange:
         self.directory.mkdir(mode=0o700, parents=True, exist_ok=True)
         me = machine.identity(self.directory, name)
         self.label, self.writer, self.name = me["id"], me["writer"], me["name"]
-        self.last = time.monotonic()
+        self.last, self.took = time.monotonic(), 0.0
         self.counts = dict.fromkeys(("sent", "received", "damaged", "newer", "skipped"), 0)
         self.learnt = 0                         # documents that pages offered made known by more checksums
         self.sources = None
@@ -372,9 +373,11 @@ class Exchange:
             self.db.execute("DETACH DATABASE exchange")
 
     def due(self):
-        """True when the last exchange is old enough for another during a reading; after a
-        failure of the shared place, PAUSE seconds more."""
-        return time.monotonic() - self.last >= EVERY
+        """True when the last exchange is old enough for another during a reading: EVERY seconds
+        after its end, or SHARE times as long as it took when that is longer, since an exchange
+        with a distant place may take minutes and would leave no time to read; after a failure
+        of the shared place, PAUSE seconds more."""
+        return time.monotonic() - self.last >= max(EVERY, SHARE * self.took)
 
     def run(self, *steps, wait=False):
         """Do the steps of an exchange, among "receive", "apply" and "send", unless another
@@ -393,7 +396,8 @@ class Exchange:
         shared place is looked at each time, and again before each thing written there, so
         that a newer ShelfFind that marked it since is left alone; an exchange that receives
         or sends begins with the list of this data folder (`reconcile`)."""
-        self.last, self.entries = time.monotonic(), None
+        began = self.last = time.monotonic()
+        self.entries = None
         try:
             self.ready = False
             sharing.check_format(self.place)
@@ -409,6 +413,8 @@ class Exchange:
             self.last = time.monotonic() + PAUSE
             return False
         self.failing = False
+        self.took = time.monotonic() - began
+        self.last = time.monotonic()
         return True
 
     def put(self, name, data):

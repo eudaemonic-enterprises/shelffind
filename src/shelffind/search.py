@@ -14,6 +14,10 @@ SPREAD = 2_000          # the number of pages such a sample aims at
 # A query whose words are shared between the name of a document and its text is answered from the
 # documents that the names give: at most this many are looked into for each way of sharing.
 SHARED = 300
+# What is a document, as against the programs, pictures and data that some folders hold: among
+# matches of the same kind, documents are listed first.
+DOCUMENTS = frozenset("pdf djvu ps ps.gz epub txt md rst tex bib typ doc docx odt rtf html htm fb2 mobi azw3 chm "
+                      "ppt pptx".split())
 SHARES = 5              # beyond this many words, only one word, or all but one, goes to the name
 # In the text only the last word of a query may be the beginning of a longer one, and only
 # from this many letters: completing every short word of a large collection costs seconds.
@@ -450,7 +454,11 @@ def search(db, query, *, root=None, fmt=None, limit=25, exact=False, where="all"
             # a better kind of match.
             score, item = entry
             kind = int(score)
-            return (kind, score - kind - min(0.9, 0.3 * (often or {}).get(item["doc"], 0)), item["path"])
+            plain = item["format"] not in DOCUMENTS
+            # A program or a picture whose name is the query is not put before the documents that
+            # have it in their names.
+            return (max(kind, 1) if plain else kind, plain,
+                    score - kind - min(0.9, 0.3 * (often or {}).get(item["doc"], 0)), item["path"])
         listed = sorted(found.values(), key=order)
         if where == "all" and len(listed) > limit:
             # Names would fill the list alone: a third of it is kept for passages, which no key

@@ -1634,6 +1634,22 @@ class Turns(Two):
             with patch("shelffind.parcels.time.monotonic", return_value=start + later):
                 self.assertEqual(told.due(), due)
 
+    def test_a_long_exchange_leaves_most_of_the_time_to_reading(self):
+        self.shelf()
+        machine_ = self.machines["office"]
+        with self.at("office"):
+            told = parcels.Exchange(machine_["data"], machine_["db"], sharing.Folder(self.shared))
+        start = time.monotonic()
+        now = [start]
+        with patch("shelffind.parcels.time.monotonic", side_effect=lambda: now[0]), \
+                patch.object(told, "receive", side_effect=lambda: now.__setitem__(0, now[0] + 90)):    # it takes 90 seconds
+            self.assertTrue(told.run("receive"))
+        self.assertEqual(round(told.took), 90)
+        for later, due in ((90 + parcels.EVERY - 1, False), (90 + parcels.SHARE * 90 - 1, False),
+                           (90 + parcels.SHARE * 90 + 1, True)):
+            with patch("shelffind.parcels.time.monotonic", return_value=start + later):
+                self.assertEqual(told.due(), due, later)
+
     def test_a_parcel_never_takes_a_number_already_in_the_shared_place(self):
         self.shelf()
         stray = self.shared / "texts" / self.writer("home") / "000001.jsonl.gz"
