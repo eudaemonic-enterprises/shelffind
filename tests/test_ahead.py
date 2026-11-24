@@ -3,6 +3,8 @@
 index that results is the one of a reading that copies one file at a time."""
 import hashlib
 import os
+import shutil
+import subprocess
 import threading
 import time
 import unittest
@@ -180,6 +182,21 @@ class Pages(Shelf):
         with patch("shelffind.extract.recognize", side_effect=lambda p, f, w, n, l: f"recognised page {n}"):
             self.assertEqual(self.build(ocr=True, workers=4), (1, 0))
         self.assertEqual(self.texts(), [f"recognised page {n}" for n in range(1, 7)])
+
+    @unittest.skipUnless(all(shutil.which(p) for p in ("gs", "pdftoppm", "pdftotext", "tesseract", "prlimit")),
+                         "Poppler, Ghostscript, Tesseract and prlimit required")
+    def test_real_pages_are_recognised_at_once_by_tesseract_under_prlimit(self):
+        words = ["Sapphire meadow", "Copper lantern", "Velvet harbour", "Amber orchard"]
+        ps = self.base / "outlined.ps"
+        ps.write_text("%!PS\n/Helvetica findfont 48 scalefont setfont\n" + "".join(
+            f"40 600 moveto ({w}) true charpath fill showpage\n" for w in words))
+        subprocess.run(["gs", "-q", "-dSAFER", "-dBATCH", "-dNOPAUSE", "-sDEVICE=pdfwrite",
+                        f"-sOutputFile={self.root / 'scan.pdf'}", str(ps)], check=True)
+        self.assertEqual(self.build(workers=3), (1, 0))
+        self.assertEqual(self.db.execute("SELECT state FROM docs").fetchone()[0], "needs-ocr")
+        self.assertEqual(self.build(ocr=True, workers=3), (1, 0))
+        self.assertEqual([" ".join(text.split()).lower() for text in self.texts()], [w.lower() for w in words])
+        self.assertEqual(self.db.execute("SELECT state FROM docs").fetchone()[0], "indexed")
 
     def test_djvu_pages_asked_for_one_by_one_come_back_in_order(self):
         live, widest, lock = [0], [0], threading.Lock()
