@@ -31,7 +31,7 @@ from pathlib import Path
 from . import __version__, fuzzy, history, store
 
 RETIRED = store.RETIRED         # the format number an old index receives once it has been converted
-ORIGIN = "converted_from"       # in the new index: the print of the old index it was made from
+ORIGIN = store.CONVERTED        # in the new index: the print of the old index it was made from
 # What versions 0.1 and 0.2 declared when they created their index, word for word. An earlier
 # index is converted, and later deleted, only when it declares exactly this: what an index
 # declared beyond it would be neither converted nor kept.

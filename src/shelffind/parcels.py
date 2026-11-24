@@ -11,8 +11,9 @@ other data folder uses, even on the same machine (see `machine.identity`):
                                    line for each document: the MD5 and the SHA-256 of the bytes
                                    its pages were read from, their size and format, and the pages
 
-A parcel is never changed once written, and its number is never given twice, whatever is lost
-afterwards: the list keeps the last number given, and the bookkeeping keeps it too. Only its
+A parcel is never changed once written, and its number is never given twice: the list keeps the
+last number given, and the bookkeeping the greatest one it saw, so that only the loss of both
+while a parcel is still on its way could let a number come back. Only its
 writer writes in its folder and its list, so no two writers ever write the same file. The lists
 are apart from the cards of the machines that the journals rewrite. A parcel holds at most LIMIT
 bytes and unpacks to at most UNPACKED bytes, its first line included, and a list holds at most
@@ -50,6 +51,7 @@ gone, was withdrawn: what it offered is forgotten.
 import contextlib
 import hashlib
 import json
+import os
 import re
 import sqlite3
 import time
@@ -68,8 +70,9 @@ BIG = 1 << 53           # no size, page number or count goes beyond this
 EVERY = 120             # seconds between two exchanges while documents are being read
 WAIT = 120              # seconds that a run waits for an exchange of another process to end
 PAUSE = 900             # seconds without exchange after the shared place failed
+AWAIT = 7 * 86400       # seconds that a parcel of its own named and not there stays named
 KEEPING = "exchange.sqlite3"
-LAYOUT = "3"            # the form of the bookkeeping: another one is thrown away and made anew
+LAYOUT = "4"            # the form of the bookkeeping: another one is thrown away and made anew
 WRITER = re.compile(r"[0-9a-f]{16}\Z")
 NAME = re.compile(r"texts/([0-9a-f]{16})/(\d{6})\.jsonl\.gz\Z")
 NUMBERED = re.compile(r"(\d{6})\.jsonl\.gz\Z")
@@ -79,17 +82,21 @@ SHA = re.compile(r"sha256:[0-9a-f]{64}\Z")
 DIGEST = re.compile(r"[0-9a-f]{64}\Z")
 WAITING = ("pending", "error", "needs-ocr", "ocr-error")
 PAGED = {"pdf", "djvu", "ps", "ps.gz"}      # formats read page by page
-# What tells a reading from another of the same bytes, from the pages of its document alone:
-# their number, the pages still to recognise, the rows they are kept in and the positions of
-# both, their page numbers and the length of their sections. A reading changed in any way,
-# taken anew or completed page by page, has another.
-READING = ("count(p.id)||':'||sum(p.needs_ocr)||':'||sum(p.id)||':'||sum(p.needs_ocr*p.id)||':'||"
-           "sum(coalesce(p.page,0)*(1+p.needs_ocr))||':'||sum(length(coalesce(p.section,'')))")
+# What tells a reading from another of the same bytes, from the pages of its document alone: their
+# number, and two sums over its pages of a mixing of the row each is kept in, its page number,
+# whether it is still to recognise, the length of its text and the name of its section. A reading
+# changed in any way, taken anew or completed page by page, has another, but by a chance of the
+# order of one in 2**60.
+PRIME = 2147483647
+READING = (f"SELECT doc, count(*)||':'||sum(h)||':'||sum((h*h+x)%{PRIME}) AS reading FROM ("
+           f"SELECT doc, x, (x*x)%{PRIME} AS h FROM ("
+           f"SELECT doc, (id*2654435761+coalesce(page,0)*40503+needs_ocr*977+length(ztext)*69069"
+           f"+CASE WHEN section IS NULL THEN 0 ELSE shelf_crc(section) END)%{PRIME} AS x FROM pages)) GROUP BY doc")
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS exchange.notes (key TEXT PRIMARY KEY, value TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS exchange.parcels (
     writer TEXT NOT NULL, name TEXT NOT NULL, sha256 TEXT NOT NULL, size INTEGER NOT NULL,
-    documents INTEGER NOT NULL, state TEXT NOT NULL, PRIMARY KEY (writer, name)
+    documents INTEGER NOT NULL, state TEXT NOT NULL, stamp TEXT, PRIMARY KEY (writer, name)
 );
 CREATE TABLE IF NOT EXISTS exchange.entries (
     writer TEXT NOT NULL, name TEXT NOT NULL, line INTEGER NOT NULL, md5 TEXT NOT NULL,
@@ -118,12 +125,17 @@ def written(found):
     return ",".join(str(one) for one in sorted(found))
 
 
+def crc(text):
+    """The CRC-32 of a name, for READING."""
+    return zlib.crc32(text.encode("utf-8", "surrogatepass")) if text is not None else 0
+
+
 def reading_of(rows):
-    """READING, for the rows of the pages of a document, in their order."""
-    return ":".join(str(value) for value in (
-        len(rows), sum(row["needs_ocr"] for row in rows), sum(row["id"] for row in rows),
-        sum(row["needs_ocr"] * row["id"] for row in rows), sum((row["page"] or 0) * (1 + row["needs_ocr"]) for row in rows),
-        sum(len(row["section"] or "") for row in rows)))
+    """READING, for the rows of the pages of a document."""
+    mixed = [(row["id"] * 2654435761 + (row["page"] or 0) * 40503 + row["needs_ocr"] * 977 + len(row["ztext"]) * 69069
+              + crc(row["section"])) % PRIME for row in rows]
+    squares = [x * x % PRIME for x in mixed]
+    return f"{len(rows)}:{sum(squares)}:{sum((h * h + x) % PRIME for h, x in zip(squares, mixed))}"
 
 
 class Packer:
@@ -229,13 +241,15 @@ def listing(data, writer):
         told = json.loads(data)
     except (ValueError, RecursionError):
         raise ValueError("The list cannot be read") from None
-    if not isinstance(told, dict) or told.get("writer") != writer or not isinstance(told.get("parcels"), list):
+    if not isinstance(told, dict) or told.get("writer") != writer:
         raise ValueError("The list is not one of its writer")
     made = told.get("format")
     if type(made) is not int or made < 1:
         raise ValueError("The list names no format")
-    if made > FORMAT:
+    if made > FORMAT:                           # whatever else it holds is that version's
         raise Newer(f"The list of {writer} was written by a newer ShelfFind")
+    if not isinstance(told.get("parcels"), list):
+        raise ValueError("The list names no parcels")
     last = told.get("last")
     found, aside, names = [], 0, set()
     for parcel in told["parcels"]:
@@ -281,7 +295,9 @@ class Exchange:
         self.named, self.number = {}, 0         # what its list is to name, and the last number it gave
         self.fresh = set()                      # documents measured since the sources were last asked
         self.held = {}                          # file copied in this run -> (its document, whether it is still the one copied)
-        self.told, self.entries = set(), None
+        self.told, self.entries, self.folders = set(), None, None
+        db.create_function("shelf_crc", 1, crc, deterministic=True)
+        store.mark_earlier(db)                  # before anything is given (see `store.mark_earlier`)
         try:
             keeping = sqlite3.connect(self.directory / KEEPING, timeout=30)
             try:
@@ -298,15 +314,20 @@ class Exchange:
             self.say(text)
 
     @contextlib.contextmanager
-    def attached(self):
-        """The bookkeeping, reachable from the index as `exchange`: made when it is not there, and
-        made anew when it is of another form or describes another shared place. Nothing is
-        written in it to look at it."""
+    def attached(self, mend=True):
+        """The bookkeeping, reachable from the index as `exchange`. With `mend`, which only the
+        holder of the exchange asks for, it is made when it is not there, and made anew when it
+        is of another form or describes another shared place; yields True. Without, nothing is
+        written in it, and False is yielded when it is not the bookkeeping of this shared place."""
         self.db.execute("ATTACH DATABASE ? AS exchange", (str(self.directory / KEEPING),))
         try:
             self.db.execute("PRAGMA exchange.synchronous=NORMAL")
             tables = {row[0] for row in self.db.execute("SELECT name FROM exchange.sqlite_master WHERE type='table'")}
             notes = dict(self.db.execute("SELECT key,value FROM exchange.notes").fetchall()) if "notes" in tables else {}
+            mine = notes.get("layout") == LAYOUT and notes.get("place") == self.place.identity and set(TABLES) <= tables
+            if not mend:
+                yield mine
+                return
             if notes.get("layout") != LAYOUT or notes.get("place") != self.place.identity:
                 with self.db:
                     for table in TABLES:
@@ -324,7 +345,7 @@ class Exchange:
                 with self.db:
                     self.db.execute("DELETE FROM exchange.compared WHERE verdict='large'")
                     self.db.execute("INSERT OR REPLACE INTO exchange.notes(key,value) VALUES('limits',?)", (limits,))
-            yield
+            yield True
         finally:
             self.db.execute("DETACH DATABASE exchange")
 
@@ -347,9 +368,9 @@ class Exchange:
 
     def steps(self, *steps):
         """The steps of `run`, for a caller that holds the exchange already. The mark of the
-        shared place is looked at each time, so that a newer ShelfFind that marked it since the
-        last exchange is left alone; an exchange that receives or sends begins with the list of
-        this data folder (`reconcile`)."""
+        shared place is looked at each time, and again before each thing written there, so
+        that a newer ShelfFind that marked it since is left alone; an exchange that receives
+        or sends begins with the list of this data folder (`reconcile`)."""
         self.last, self.entries = time.monotonic(), None
         try:
             self.ready = False
@@ -368,12 +389,23 @@ class Exchange:
         self.failing = False
         return True
 
+    def put(self, name, data):
+        """Write a file in the shared place, unless a newer ShelfFind marked it meanwhile."""
+        sharing.check_format(self.place)
+        self.place.put(name, data)
+
+    def delete(self, name):
+        sharing.check_format(self.place)
+        self.place.delete(name)
+
     def sizes(self):
         """The sizes and formats of the documents that the parcels offer and that this data
         folder does not know by a measure: files of these are worth comparing. None of them
-        when the bookkeeping cannot be read at this moment."""
+        when the bookkeeping cannot be read at this moment, or is not yet that of this place."""
         try:
-            with self.attached():
+            with self.attached(mend=False) as mine:
+                if not mine:
+                    return frozenset()
                 return frozenset((row[0], row[1]) for row in self.db.execute(
                     "SELECT DISTINCT e.size,e.format FROM exchange.entries e JOIN exchange.parcels p ON p.writer=e.writer "
                     "AND p.name=e.name AND p.state='taken' WHERE NOT EXISTS "
@@ -391,59 +423,104 @@ class Exchange:
     def reconcile(self):
         """Check the list of this data folder against its parcels and its bookkeeping, and keep
         in `named` what it is to name. A parcel that the bookkeeping knows and the shared place
-        no longer holds is forgotten, so that its documents are given again in another parcel.
-        A parcel that the shared place holds and the list does not name, or names with another
-        size or checksum, the list having been lost, cut or spoilt, is named again as the
-        bookkeeping knows it. A parcel that the list names and the bookkeeping does not know,
-        the bookkeeping having been deleted, is taken again, so that nothing is given twice;
-        one that cannot be taken at this moment, being cut, changed or of a newer format, stays
-        named as it is, since it may yet arrive whole, or be read by a newer version. A parcel
-        put whose list could not be written is named once it is found whole, and forgotten
-        otherwise. No number is given twice: the last one given is kept in the list and in the
-        bookkeeping. What a writing of this data folder cut short left under a passing name is
-        removed. A list that a newer ShelfFind wrote is left to it, and nothing is given."""
+        no longer holds was removed: it is forgotten, so that its documents are given again in
+        another parcel. A parcel that the shared place holds and the list does not name, or
+        names with another size or checksum, the list having been lost, cut or spoilt, is
+        named again as the bookkeeping knows it. A parcel that the list names and the
+        bookkeeping does not know, the bookkeeping having been deleted, is taken again, so that
+        nothing is given twice; one that cannot be taken at this moment, being cut, changed or
+        of a newer format, stays named as it is, and one not there stays named for AWAIT
+        seconds, since a folder that synchronises may yet bring it. A parcel put whose list
+        could not be written is named once it is found whole, and forgotten otherwise. No number
+        is given twice: the greatest one seen is kept in the list and in the bookkeeping. What a
+        writing of this data folder cut short left under a passing name is removed. A list
+        that a newer ShelfFind wrote is left to it, and nothing is given; so is a list that
+        cannot be fetched, which stops the exchange.
+
+        A parcel put is read back once, at the next exchange, and then known by its size and the
+        time of its last change, which the shared place tells without a reading; when they
+        change, it is read again, and a parcel found to hold other bytes than those put is
+        removed, and its documents given again under another number."""
+        self.named = {}
+        if self.writer is None:
+            self.writing = False
+            self.tell("The name under which this data folder gives its texts cannot be read or kept at this moment: "
+                      "they wait for the next exchange")
+            return
         entries = self.entries = self.place.names("texts")
-        here = self.place.names(f"texts/{self.writer}")
-        present = {f"texts/{self.writer}/{name}" for name in here if NUMBERED.match(name)}
-        for name in [f"texts/{self.writer}/{name}" for name in here if PASSING.search(name)] + \
-                [f"texts/{name}" for name in entries if name.startswith(f"{self.writer}.json.") and PASSING.search(name)]:
-            self.place.delete(name)
         self.writing, listed, last, spoilt = True, None, 0, False
         try:
             data = self.place.get(f"texts/{self.writer}.json", LISTED)
-            if data is not None:
-                found, _, last = listing(data, self.writer)
-                listed = {parcel["name"]: parcel for parcel in found}
-        except Newer:
-            self.writing, self.named = False, {}
-            self.tell("A newer ShelfFind wrote the list of this data folder: its texts are left to that version")
+        except sharing.Oversized:
+            self.writing = False
+            self.tell("The list of this data folder is larger than this version reads: it is left as it is")
             return
-        except ValueError:
-            listed, spoilt = None, True         # cut or damaged: written anew below
+        if data is not None:
+            try:
+                found, aside, last = listing(data, self.writer)
+                listed, spoilt = {parcel["name"]: parcel for parcel in found}, aside > 0
+            except Newer:
+                self.writing = False
+                self.tell("A newer ShelfFind wrote the list of this data folder: its texts are left to that version")
+                return
+            except ValueError:
+                listed, spoilt = None, True     # cut or damaged: written anew below
+        here = self.place.stamps(f"texts/{self.writer}")
+        present = {f"texts/{self.writer}/{name}": stamp for name, stamp in here.items() if NUMBERED.match(name)}
+        for name in [f"texts/{self.writer}/{name}" for name in here if PASSING.search(name)] + \
+                [f"texts/{name}" for name in entries if name.startswith(f"{self.writer}.json.") and PASSING.search(name)]:
+            self.delete(name)
         rows = {row["name"]: dict(row) for row in self.db.execute(
-            "SELECT name,size,sha256,documents,state FROM exchange.parcels WHERE writer=?", (self.writer,)).fetchall()}
+            "SELECT name,size,sha256,documents,state,stamp FROM exchange.parcels WHERE writer=?", (self.writer,)).fetchall()}
         mark = self.db.execute("SELECT value FROM exchange.notes WHERE key='number'").fetchone()
         self.number = max([last, int(mark[0]) if mark else 0] +
                           [int(NAME.match(name).group(2)) for name in [*rows, *present, *(listed or {})]])
-        named = {}
+        with self.db:                           # the greatest number seen is never given, whatever is lost afterwards
+            self.db.execute("INSERT OR REPLACE INTO exchange.notes(key,value) VALUES('number',?)", (str(self.number),))
+            for writer, name in self.db.execute("SELECT writer,name FROM exchange.parcels WHERE state='sending' AND writer!=?",
+                                                (self.writer,)).fetchall():
+                self.forget(writer, name)       # what another writer of this folder was sending is not this one's to finish
+        named, stamp, now = {}, "UPDATE exchange.parcels SET state='taken',stamp=? WHERE writer=? AND name=?", int(time.time())
+        awaited = {}
         for name, row in rows.items():
-            if row["state"] == "taken" and name in present:
+            if row["state"] == "taken" and name in present and row["stamp"] == present[name]:
                 named[name] = row
-            elif row["state"] == "sending" and name in present and self.whole(row):
-                with self.db:                   # put whole, and never named: it is named now
-                    self.db.execute("UPDATE exchange.parcels SET state='taken' WHERE writer=? AND name=?", (self.writer, name))
+            elif row["state"] in ("taken", "sending") and name in present and self.whole(row):
+                with self.db:                   # read back, or touched with the same bytes; put whole and never named
+                    self.db.execute(stamp, (present[name], self.writer, name))
                 named[name] = row
-                self.counts["sent"] += row["documents"]
+                if row["state"] == "sending":
+                    self.counts["sent"] += row["documents"]
             elif row["state"] in ("taken", "sending"):
-                with self.db:                   # lost, or never put whole: its documents are given again
+                with self.db:                   # removed, or changed: its documents are given again
                     self.forget(self.writer, name)
+                if present.pop(name, None) is not None:
+                    self.delete(name)
+                    self.say(f"A parcel of this data folder held other bytes than those put: {name}, given again")
+            elif row["state"].startswith("awaited:"):
+                awaited[name] = row
         for name, parcel in (listed or {}).items():
-            if name in present and name not in named:
-                self.take(self.writer, parcel)
-                named[name] = parcel
+            if name not in named and name not in awaited and name not in rows:
+                awaited[name] = {**parcel, "state": None}
+        for name, parcel in awaited.items():
+            if name in present:
+                if self.take(self.writer, parcel):
+                    with self.db:
+                        self.db.execute(stamp, (present[name], self.writer, name))
+                named[name] = parcel            # what cannot be taken at this moment stays named as it is
+                continue
+            since = int(parcel["state"][8:]) if parcel["state"] else now
+            with self.db:
+                if now - since >= AWAIT:
+                    self.forget(self.writer, name)
+                    continue
+                if not parcel["state"]:
+                    self.remember(self.writer, parcel, f"awaited:{since}")
+            named[name] = parcel                # it may yet arrive
         self.named = named
         fields = lambda parcels: {name: tuple(parcel[key] for key in ("size", "sha256", "documents")) for name, parcel in parcels.items()}
-        if listed is None and (named or spoilt) or listed is not None and (fields(listed) != fields(named) or last < self.number):
+        if listed is None and (named or spoilt) or listed is not None and (spoilt or fields(listed) != fields(named)
+                                                                           or last < self.number):
             self.publish()
 
     def whole(self, parcel):
@@ -461,8 +538,15 @@ class Exchange:
                                        for name in sorted(named)]}, indent=1).encode() + b"\n"
 
     def publish(self):
-        """Write the list of this data folder, naming `named`."""
-        self.place.put(f"texts/{self.writer}.json", self.listing(self.named, self.number))
+        """Write the list of this data folder, naming `named`, unless it would grow beyond what
+        a reader takes: the list in the shared place then stays as it is, and nothing more is
+        given."""
+        data = self.listing(self.named, self.number)
+        if len(data) > LISTED:
+            self.writing = False
+            self.tell("The list of this data folder is full: its texts are no longer given")
+            return
+        self.put(f"texts/{self.writer}.json", data)
 
     def forget(self, writer, name):
         """Forget a parcel and what it offered: what was compared with it is compared again.
@@ -478,13 +562,19 @@ class Exchange:
         has not taken yet: what they offer is remembered; the pages are given later, by
         `apply`. What a list no longer names was withdrawn by its writer, as was everything of
         a writer whose list and parcels are gone: it is forgotten. A list or a parcel that
-        cannot be read is counted, and the others are taken all the same."""
+        cannot be read once fetched is counted, and the others are taken all the same; a shared
+        place that fails while it is fetched stops the exchange."""
         entries = self.entries if self.entries is not None else self.place.names("texts")
         writers = {entry.removesuffix(".json") for entry in entries if entry.endswith(".json")}
         writers = {writer for writer in writers if WRITER.match(writer) and writer != self.writer}
         for writer in sorted(writers):
             try:
-                found, aside, _ = listing(self.place.get(f"texts/{writer}.json", LISTED) or b"", writer)
+                data = self.place.get(f"texts/{writer}.json", LISTED)
+            except sharing.Oversized:
+                self.counts["damaged"] += 1
+                continue
+            try:
+                found, aside, _ = listing(data or b"", writer)
             except Newer:
                 self.counts["newer"] += 1
                 continue
@@ -540,17 +630,21 @@ class Exchange:
 
     def take(self, writer, parcel):
         """Take one parcel: what each of its documents offers is remembered, and the parcel
-        marked as taken, in one step. A parcel whose name now holds other bytes than those
-        taken before is taken anew, and what it offered before is forgotten. Returns True when
+        marked as taken, in one step. A parcel that its list now describes otherwise than when
+        it was taken is taken anew, and what it offered before is forgotten. Returns True when
         the parcel is taken."""
-        row = self.db.execute("SELECT sha256,state FROM exchange.parcels WHERE writer=? AND name=?",
+        row = self.db.execute("SELECT sha256,size,documents,state FROM exchange.parcels WHERE writer=? AND name=?",
                               (writer, parcel["name"])).fetchone()
-        if row is not None and row["sha256"] == parcel["sha256"]:
+        if row is not None and (row["sha256"], row["size"], row["documents"]) == (parcel["sha256"], parcel["size"],
+                                                                                  parcel["documents"]):
             if row["state"] == "taken":
                 return True
             if row["state"].startswith("newer:") and int(row["state"][6:]) > FORMAT:
                 self.counts["newer"] += 1
                 return False
+        elif row is not None and row["state"] == "taken":
+            with self.db:
+                self.forget(writer, parcel["name"])
         lines = self.fetch(parcel)
         if lines is None:
             return False
@@ -604,23 +698,43 @@ class Exchange:
 
     def settled(self):
         """The sources were asked about the files measured since the last time: their documents
-        may now take what is offered for them."""
+        may now take what is offered for them, and the sources are looked at anew, since one
+        may have come or gone."""
         self.fresh.clear()
+        self.sources = None
+
+    def measured(self, file):
+        """A file was copied for its reading, and measured: its document takes nothing before the
+        sources are asked about it (`settled`)."""
+        try:
+            row = self.db.execute("SELECT doc FROM files WHERE id=?", (file,)).fetchone()
+        except sqlite3.Error:
+            return
+        if row is not None:
+            self.fresh.add(row["doc"])
 
     def apply(self):
         """Give the documents of this data folder that wait for their text what the parcels
         taken offer for their bytes, except those measured since the sources were last asked,
-        which wait for their answer. Only the parcels that would take a reading further are
-        fetched, each once, so an exchange with nothing new fetches nothing."""
+        which wait for their answer. Each document takes its most complete offer; what another
+        offer adds is given at the next round (see `indexer.build`). Only the parcels that would
+        take a reading further are fetched, each once, so an exchange with nothing new fetches
+        nothing."""
+        self.folders = None
         self.give(self.candidates(skip=self.fresh))
 
     def give(self, found):
-        """Fetch the parcels of the offers `found` and give their pages. A parcel is fetched only
-        while one of its offers still takes a document further, and one found changed since it
-        was taken is forgotten, to be taken again if its list still names it. A document whose
-        file was copied for its reading takes nothing when the file has changed since."""
-        wanted = {}
+        """Fetch the parcels of the offers `found` and give their pages, the first offer of each
+        document only. A parcel is fetched only while one of its offers still takes a document
+        further, and one found changed since it was taken is forgotten, to be taken again if its
+        list still names it. The checksums that come with an offer are learnt first, and the
+        document is chosen again after them; it takes nothing when a file of it changed since
+        this run looked at it (`unchanged`)."""
+        best = {}
         for writer, name, line, doc in found:
+            best.setdefault(doc, (writer, name, line))
+        wanted = {}
+        for doc, (writer, name, line) in best.items():
             wanted.setdefault((writer, name), []).append((line, doc))
         for (writer, name), lines in wanted.items():
             lines = [(line, doc) for line, doc in lines if self.helps(writer, name, line, doc)]
@@ -633,19 +747,19 @@ class Exchange:
                 with self.db:
                     self.forget(writer, name)
                 continue
-            for number, doc in lines:
+            for number, _ in lines:
                 told = document(got[number]) if number < len(got) else None
-                if told is None or not self.unchanged(doc):
+                if told is None:
                     continue
                 keys = [told["md5"], told["sha256"]]
                 with self.db:
                     target = store.taker(self.db, keys, told["size"], told["format"], self.holders())
-                    if target is None:
-                        continue
-                    if store.learn(self.db, target, keys):
+                    if target is not None and store.learn(self.db, target, keys):
                         store.purge(self.db, target)
-                        self.learnt += 1
-                    if store.take_pages(self.db, target, keys, told["pages"], self.holders()):
+                        self.learnt += 1        # what was learnt may have moved the files, or left the text to a source
+                        target = store.taker(self.db, keys, told["size"], told["format"], self.holders())
+                    if target is not None and self.unchanged(target) \
+                            and store.take_pages(self.db, target, keys, told["pages"], self.holders()):
                         self.counts["received"] += 1
 
     def helps(self, writer, name, line, doc):
@@ -657,9 +771,25 @@ class Exchange:
             and store.helps(store.reading(self.db, doc), row["layout"], positions(row["blanks"]))
 
     def unchanged(self, doc):
-        """False when a file of the document copied for its reading is no longer the one copied."""
-        files = {row["id"] for row in self.db.execute("SELECT id FROM files WHERE doc=?", (doc,))}
-        return all(still() for file, (_, still) in self.held.items() if file in files)
+        """False when a file of the document changed since this run looked at it: a file copied
+        for its reading is still the one copied, and every file of a folder at hand still has the
+        size and the date that the inventory saw. A folder out of reach is taken at its word."""
+        if self.folders is None:
+            self.folders = {root["id"]: Path(root["path"]) if store.available(root) else None for root in store.roots(self.db)}
+        for file in self.db.execute("SELECT id,root,rel,size,mtime FROM files WHERE doc=?", (doc,)).fetchall():
+            held = self.held.get(file["id"])
+            if held is not None and not held[1]():
+                return False
+            folder = self.folders.get(file["root"])
+            if folder is None:
+                continue
+            try:
+                info = os.stat(folder / file["rel"])
+            except OSError:
+                return False
+            if (info.st_size, info.st_mtime_ns) != (file["size"], file["mtime"]):
+                return False
+        return True
 
     def offer(self, doc, file=None, still=None):
         """Whether a document whose file `file` was just copied for its reading, and measured,
@@ -667,14 +797,14 @@ class Exchange:
         taken offers a reading that takes it further. The document is then not read here, and
         takes those pages at the first exchange that follows the next questions to the sources
         (`settled`), provided `still()` then says that the file is still the one copied.
-        Nothing is fetched here. False, and the document is read here, when the shared place
-        failed at the last exchange or may not be used."""
+        Nothing is fetched or written here. False, and the document is read here, when the
+        shared place failed at the last exchange or may not be used."""
         self.fresh.add(doc)
         if self.ready is not True or self.failing:
             return False
         try:
-            with self.attached():
-                if not self.candidates(doc):
+            with self.attached(mend=False) as mine:
+                if not mine or not self.candidates(doc):
                     return False
         except (OSError, sqlite3.OperationalError):
             return False
@@ -687,17 +817,18 @@ class Exchange:
         """Put in the shared place the readings of this data folder that recognise pages which
         nothing taken offers for the same bytes and pages: documents with a file, read here or
         completed here, apart from pages that an earlier version read. A reading compared once
-        is compared again when it changes, or when what it was compared with is withdrawn;
-        each comparison is made on one reading of the pages of the document, read at once."""
+        is compared again when it changes (READING), or when what it was compared with is
+        withdrawn; each comparison is made on one reading of the pages of the document, read at
+        once."""
         if not self.writing:
             return
         compared = {(row[0], row[1], row[2], row[3]): row[4]
                     for row in self.db.execute("SELECT md5,sha256,size,format,reading FROM exchange.compared").fetchall()}
         changed = []
         for doc in self.db.execute(
-                f"SELECT d.id,d.origin,d.size,d.format,{READING} AS reading FROM docs d JOIN pages p ON p.doc=d.id "
+                f"SELECT d.id,d.origin,d.size,d.format,r.reading FROM docs d JOIN ({READING}) r ON r.doc=d.id "
                 "WHERE d.origin IS NOT NULL AND instr(d.origin,?)=0 AND EXISTS (SELECT 1 FROM files f WHERE f.doc=d.id) "
-                "GROUP BY d.id ORDER BY d.id", (store.EARLIER,)).fetchall():
+                "ORDER BY d.id", (store.INHERITED,)).fetchall():
             keys = store.sums(doc["origin"])
             if set(keys) != {"md5", "sha256"} or doc["format"] not in extract.SUPPORTED:
                 continue
@@ -712,8 +843,9 @@ class Exchange:
             chunk = sums[start:start + 500]
             for row in self.db.execute(
                     "SELECT e.md5,e.sha256,e.size,e.format,e.layout,e.pages,e.blanks FROM exchange.entries e "
-                    "JOIN exchange.parcels p ON p.writer=e.writer AND p.name=e.name AND p.state IN ('taken','sending') "
-                    f"WHERE e.md5 IN ({','.join('?' * len(chunk))})", chunk).fetchall():
+                    "JOIN exchange.parcels p ON p.writer=e.writer AND p.name=e.name "
+                    "AND (p.state='taken' OR (p.state='sending' AND p.writer=?)) "
+                    f"WHERE e.md5 IN ({','.join('?' * len(chunk))})", (self.writer, *chunk)).fetchall():
                 if (row["md5"], row["sha256"], row["size"], row["format"]) in wanted:
                     shipped.setdefault((row["md5"], row["sha256"], row["size"], row["format"], row["layout"]), set()).update(
                         set(range(row["pages"])) - positions(row["blanks"]))
@@ -783,9 +915,8 @@ class Exchange:
                                 "VALUES(?,?,?,?,?,?,?,?,?,?)", [(self.writer, parcel["name"], line, *told[:7])
                                                                 for line, told in enumerate(given, 1)])
         self.number = number
-        sharing.check_format(self.place)       # a newer ShelfFind may have marked the shared place since
-        self.place.put(parcel["name"], data)
-        self.place.put(f"texts/{self.writer}.json", listed)
+        self.put(parcel["name"], data)
+        self.put(f"texts/{self.writer}.json", listed)
         self.named = named
         with self.db:
             self.db.execute("UPDATE exchange.parcels SET state='taken' WHERE writer=? AND name=?", (self.writer, parcel["name"]))

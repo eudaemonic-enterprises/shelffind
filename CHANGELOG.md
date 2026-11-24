@@ -24,11 +24,21 @@ while it reads, so that several machines can share one long reading. Pages read 
 are not given to other machines. `shelffind sync` carries parcels both ways, with exit code 1
 when the shared place fails. What a data folder knows of the parcels is kept in
 `exchange.sqlite3`, bound to one shared place, checked at each exchange against the shared place,
-and may be deleted while nothing runs.
+and may be deleted while nothing runs. Each parcel put is read back once, then known by its size
+and date in the shared place; one found changed there is removed and its documents given again.
+A parcel of its own named and not there yet stays named for seven days, the greatest number seen
+is kept, a list or a card that cannot be fetched stops the exchange instead of being written
+anew, a list of a newer version is left to it, and every writing looks first at the mark of the
+shared place. A document takes pages only when its files still have the size and the date that
+the inventory saw, and the sources that answer for texts are looked at anew after each round of
+questions. A machine whose journals are not shared writes no card in the shared place.
 
 When a file read by version 0.2 joins a document read since, the two readings are joined page by
 page when they have the same pages, and otherwise the one that recognised more pages is kept: a
-page recognised by the earlier version is no longer lost to a shorter reading.
+page recognised by the earlier version is no longer lost to a shorter reading. In an index
+converted from version 0.2, the first run of this version marks the readings that version 0.3
+tied to bytes, which nothing tells apart from a reading of its own: they stay on their machine
+until they are read again.
 
 A file that a pass of a run copied without reading it may be read by a later pass of the same
 run, and is taken at most twice, so that a run always ends.

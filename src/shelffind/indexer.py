@@ -466,10 +466,15 @@ def update_text(db, root, row, ocr, languages, wanted=None, hold=None, offered=N
         if not wanted(doc, told["state"]):
             return False
         if offered is not None:
+            try:
+                touched = path.stat().st_ctime_ns       # what a rewriting in place that kept the date still changes
+            except OSError:
+                touched = None
+
             def unchanged():
                 try:
                     check_stamp(path, row, same)
-                    return True
+                    return path.stat().st_ctime_ns == touched
                 except (OSError, ValueError):
                     return False
             if offered(doc, file["id"], unchanged):
@@ -536,6 +541,7 @@ def build(db, directory, selected, *, names_only=False, ocr=False, languages="en
     done = failures = 0
     ready = []
     with store.index_lock(directory):
+        store.mark_earlier(db)                  # what version 0.3 tied stays on this machine
         if callable(selected):
             selected = selected()
         for root in selected:
@@ -584,7 +590,7 @@ def build(db, directory, selected, *, names_only=False, ocr=False, languages="en
             and what is offered given again, for as long as that teaches something, so that the
             run ends with nothing left for the next one. Returns the problems of the comparisons."""
             missed = 0
-            for _ in range(4):
+            for _ in range(1000):                # each round gives pages or learns checksums, of which there are so many
                 taken, learnt = exchange.counts["received"], exchange.learnt
                 exchange.settled()
                 exchange.run("apply")
@@ -641,7 +647,7 @@ def build(db, directory, selected, *, names_only=False, ocr=False, languages="en
                 if exchange is not None:
                     # An order of this data folder's own, the same from one run to the next.
                     candidates = dict(sorted(candidates.items(), key=lambda item: hashlib.sha256(
-                        "\0".join((exchange.writer, item[1][0][0]["name"], item[1][0][1]["rel"])).encode(
+                        "\0".join((exchange.writer or exchange.label, item[1][0][0]["name"], item[1][0][1]["rel"])).encode(
                             "utf-8", "surrogatepass")).digest()))
                 if hold is None:
                     try:
@@ -719,6 +725,9 @@ def build(db, directory, selected, *, names_only=False, ocr=False, languages="en
                             progress(f"Could not read {row['rel']}: {exc}")
                             failures += 1
                             done += 1
+                        finally:
+                            if exchange is not None:
+                                exchange.measured(row["id"])        # its document waits for the sources to be asked
                     # A document of which no file could be taken waits for a retry when all its
                     # files were tried; one that was not among those chosen may still be read.
                     stuck = {}

@@ -388,7 +388,7 @@ class Histories(unittest.TestCase):
             self.assertTrue(first.startswith("work") and first[8:13] == "token", f"{where}: document {doc} begins with no work")
             work = int(first[4:8])
             # The pages are tied to the bytes of the work they hold, and to no other, with or without a file.
-            self.assertIn(sealed[doc], (None, " ".join(world.sums(work)), " ".join(world.sums(work)) + f" {store.EARLIER}"),
+            self.assertIn(sealed[doc], (None, " ".join(world.sums(work)), " ".join(world.sums(work)) + f" {store.INHERITED}"),
                           f"{where}: document {doc} holds work {work} under other checksums")
             allowed = world.pages_of(work)
             self.assertEqual(sorted(str(page) for page, _, _ in pages), sorted(str(page) for page in allowed),

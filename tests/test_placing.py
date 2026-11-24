@@ -638,7 +638,7 @@ class Handed(Placing):
         rows = [(row[0], store.inflate(row[1])) for row in self.db.execute("SELECT page,ztext FROM pages WHERE doc=? ORDER BY page", (new,))]
         self.assertEqual(rows, [(1, "first page"), (2, "second page")])
         self.assertEqual(self.db.execute("SELECT state,origin FROM docs WHERE id=?", (new,)).fetchone()[:],
-                         ("indexed", f"{sealed} {store.EARLIER}"))
+                         ("indexed", f"{sealed} {store.INHERITED}"))
 
     def test_a_recognition_that_failed_is_still_known_to_have_failed_after_the_pages_are_handed_over(self):
         with self.db:
@@ -1003,7 +1003,7 @@ class Storage2(Placing):
         self.read.clear()
         self.assertEqual(self.build(), (0, 0))              # a reading in full ties the pages to the bytes,
         origin = self.db.execute("SELECT d.origin FROM docs d JOIN files f ON f.doc=d.id WHERE f.rel='book.txt'").fetchone()[0]
-        self.assertEqual((origin.split(), self.read), (self.sums(path) + [store.EARLIER], []))     # as an earlier reading
+        self.assertEqual((origin.split(), self.read), (self.sums(path) + [store.INHERITED], []))     # as an earlier reading
         self.sound()
 
     def test_a_complete_run_proves_against_the_storage_what_a_source_said(self):

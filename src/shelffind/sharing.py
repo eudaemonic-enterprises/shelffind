@@ -8,12 +8,15 @@ with a checksum for each journal; another machine takes a journal only when its 
 agrees. The shared place is a folder kept in step by any tool, or a remote reached with rclone.
 
     .shelffind-shared               {"format": 1}
-    machines/LABEL.json             the name of the machine, the list of its journals and of its parcels
+    machines/LABEL.json             the name of the machine and the list of its journals
     history/LABEL/YYYY-MM.jsonl     its journal of one month, one event per line
-    texts/LABEL/NNNNNN.jsonl.gz     a parcel of the text it read
+    texts/WRITER.json               the list of the parcels of one data folder (see `parcels`)
+    texts/WRITER/NNNNNN.jsonl.gz    a parcel of the text that data folder read
 
 The exchanges of one data folder take turns (`alone`), and a machine rewrites its card keeping
-what it does not change.
+what it does not change. A machine whose journals are not shared writes no card. A shared
+place that fails while a card or a journal is read stops the exchange; a card that cannot be
+read once fetched is counted as damaged, or written anew when it is this machine's.
 """
 import contextlib
 import fcntl
@@ -48,6 +51,18 @@ class Folder:
             return sorted(entry.name for entry in (self.path / folder).iterdir() if entry.is_file())
         except FileNotFoundError:
             return []
+
+    def stamps(self, folder):
+        """The files of a folder of the shared place, each with what changes when it is
+        written: its size and the time of its last change."""
+        found = {}
+        for name in self.names(folder):
+            try:
+                info = (self.path / folder / name).stat()
+            except FileNotFoundError:
+                continue
+            found[name] = f"{info.st_size}:{info.st_mtime_ns}"
+        return found
 
     def get(self, name, limit=None):
         """The bytes of a file of the shared place, None when there is none; with `limit`, a
@@ -108,6 +123,21 @@ class Rclone:
                 return []
             raise ValueError(self.fault(err))
         return sorted(line for line in out.decode("utf-8", "replace").splitlines() if line)
+
+    def stamps(self, folder):
+        """The files of a folder of the shared place, each with what changes when it is
+        written: its size and the time of its last change, as the remote tells them."""
+        code, out, err = self.run("lsjson", "--files-only", f"{self.remote}/{folder}", seconds=300)
+        if code:
+            if "not found" in err:
+                return {}
+            raise ValueError(self.fault(err))
+        try:
+            listed = json.loads(out or b"[]")
+        except (ValueError, RecursionError):
+            raise ValueError("rclone gave a list of files that cannot be read") from None
+        return {item["Name"]: f"{item.get('Size')}:{item.get('ModTime')}" for item in listed if isinstance(listed, list)
+                and isinstance(item, dict) and isinstance(item.get("Name"), str) and not item.get("IsDir")}
 
     def get(self, name, limit=None):
         """The bytes of a file of the shared place, None when there is none; with `limit`, no
@@ -233,10 +263,12 @@ def sync(directory, place, name=None, now=None, journals=True):
     check_format(place)
     # What this machine gives.
     listed = {}
-    try:
-        listed = json.loads(place.get(f"machines/{me['id']}.json") or b"{}")
-    except ValueError:
-        pass
+    if journals:
+        told = place.get(f"machines/{me['id']}.json")      # a shared place that fails stops the exchange
+        try:
+            listed = json.loads(told or b"{}")
+        except (ValueError, RecursionError):
+            pass                                # spoilt: written anew
     listed = listed if isinstance(listed, dict) else {}
     given = listed.get("journals") if isinstance(listed.get("journals"), dict) else {}
     sent = 0
@@ -250,7 +282,7 @@ def sync(directory, place, name=None, now=None, journals=True):
         place.put(f"history/{me['id']}/{month}.jsonl", body)
         given[month] = {"lines": lines, "sha256": checksum}
         sent += 1
-    if sent or listed.get("name") != me["name"]:
+    if journals and (sent or listed.get("name") != me["name"]):
         put_card(place, me["id"], {**listed, "id": me["id"], "name": me["name"],
                                    "updated": int(time.time() if now is None else now), "journals": given})
     # What the others give.
@@ -261,12 +293,13 @@ def sync(directory, place, name=None, now=None, journals=True):
         label = entry.removesuffix(".json")
         if not machine.LABEL.match(label) or label == me["id"]:
             continue
+        told = place.get(f"machines/{entry}")
         try:
-            card = json.loads(place.get(f"machines/{entry}") or b"")
+            card = json.loads(told or b"")
             theirs = card.get("journals") or {}
             others[label] = {"name": " ".join(str(card.get("name") or label).split())[:40],
                              "updated": int(card.get("updated") or 0)}
-        except (ValueError, KeyError, TypeError, AttributeError):
+        except (ValueError, KeyError, TypeError, AttributeError, RecursionError):
             damaged += 1
             continue
         for month in recent(now) if journals else ():

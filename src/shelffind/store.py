@@ -24,7 +24,7 @@ same pass, and `docs.origin` keeps those checksums: no other bytes complete them
 Pages that an earlier version read, when checksums were not kept, stay with the file they were
 read from (`files.read`) and with it alone, until a reading in full of that file ties them to
 its bytes; neither a storage nor a source can do that. Tied so, on the word of the inventory
-that the file did not change, they are marked as such (EARLIER, in `docs.origin`), and are not
+that the file did not change, they are marked as such (INHERITED, in `docs.origin`), and are not
 given to other machines.
 
 What a source says is believed of a file for as long as no measure refutes it: it is dropped
@@ -56,7 +56,9 @@ FORMAT = 3
 RETIRED = 101           # the format number of an earlier index once it has been converted
 KEEP = 30 * 86400       # seconds a document keeps its text after its last file has gone
 SUMS = ("md5:", "sha256:")      # the checksums of a whole file that documents are known by
-EARLIER = "earlier"             # in docs.origin: pages read by an earlier version, tied to bytes measured afterwards
+INHERITED = "earlier"           # in docs.origin: pages read by an earlier version, tied to bytes measured afterwards
+CONVERTED = "converted_from"    # in the meta of an index converted from version 0.2 (see `migrate`)
+MARKED = "earlier_marked"       # in the meta: the readings that version 0.3 tied are marked (see `mark_earlier`)
 SUM = re.compile(r"(?:md5:[0-9a-f]{32}|sha256:[0-9a-f]{64})\Z")
 
 SCHEMA = """
@@ -605,7 +607,7 @@ def hand_over(db, old, new):
     the same bytes, and nothing recognised is lost where it can be kept: readings of the same
     pages are merged page by page, the pages that `new` recognised staying as they are; of
     readings of other pages, the one that recognises more pages is kept. A document that keeps
-    pages of the earlier reading is marked so (EARLIER, in `docs.origin`, see `by_measure`):
+    pages of the earlier reading is marked so (INHERITED, in `docs.origin`, see `by_measure`):
     the bytes they belong to were measured afterwards, not read, so they are not given to other
     machines. The state of `new` is then what its pages say, whatever a source had been left to
     answer for before. Returns True when the pages of `new` are, afterwards, those that came,
@@ -634,8 +636,8 @@ def hand_over(db, old, new):
         db.execute("UPDATE docs SET origin=NULL WHERE id=?", (new,))
     elif came:                                      # completed: the file that comes is the one read
         db.execute("UPDATE files SET read=0 WHERE doc=?", (new,))
-        db.execute(f"UPDATE docs SET origin=origin||' {EARLIER}' WHERE id=? AND origin IS NOT NULL AND instr(origin,?)=0",
-                   (new, EARLIER))
+        db.execute(f"UPDATE docs SET origin=origin||' {INHERITED}' WHERE id=? AND origin IS NOT NULL AND instr(origin,?)=0",
+                   (new, INHERITED))
     if blanks(db, new)[0] == 0:
         state, error = "indexed", None
     elif told[keep]["state"] == "ocr-error" and not asks:
@@ -645,6 +647,20 @@ def hand_over(db, old, new):
     db.execute("UPDATE docs SET state=?,error=? WHERE id=?", (state, error, new))
     unread(db, old)
     return came
+
+
+def mark_earlier(db):
+    """Mark, once, the readings of an index converted from version 0.2 that version 0.3 tied to
+    bytes: 0.3 tied them as `by_measure` does, without the mark INHERITED. Nothing in such an index
+    tells them apart from a reading that 0.3 made itself, which is marked as well and is kept
+    from other machines until it is read again. Called before anything else that a run or an
+    exchange does, so that every reading of this version comes after it."""
+    if db.execute("SELECT 1 FROM meta WHERE key=?", (MARKED,)).fetchone():
+        return
+    with db:
+        if db.execute("SELECT 1 FROM meta WHERE key=?", (CONVERTED,)).fetchone():
+            db.execute(f"UPDATE docs SET origin=origin||' {INHERITED}' WHERE origin IS NOT NULL AND instr(origin,?)=0", (INHERITED,))
+        db.execute("INSERT OR REPLACE INTO meta(key,value) VALUES(?,'1')", (MARKED,))
 
 
 def cards(db, doc):
@@ -787,7 +803,7 @@ def by_measure(db, row, mine):
         # The pages read from this file by an earlier version are taken for those of the bytes
         # measured, on the word of the inventory; they are marked as such, for they were not
         # read from these very bytes, and no other machine receives them.
-        db.execute("UPDATE docs SET origin=? WHERE id=? AND origin IS NULL", (" ".join(mine) + f" {EARLIER}", target))
+        db.execute("UPDATE docs SET origin=? WHERE id=? AND origin IS NULL", (" ".join(mine) + f" {INHERITED}", target))
     purge(db, target, None if grew else file)
     return target
 
@@ -878,6 +894,8 @@ def take_pages(db, doc, keys, pages, holding=()):
     only pages that it still has to recognise, from a reading of the same pages, page by page:
     nothing recognised here is ever replaced, so the readings of several machines add up,
     in whatever order they come."""
+    if db.execute("SELECT 1 FROM docs WHERE id=?", (doc,)).fetchone() is None:
+        return False                            # gone meanwhile: what was learnt moved its files elsewhere
     if learn(db, doc, keys):
         purge(db, doc)
     told = db.execute("SELECT state FROM docs WHERE id=?", (doc,)).fetchone()

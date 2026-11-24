@@ -72,7 +72,7 @@ class Earlier(unittest.TestCase):
         homes = patch.dict(os.environ, {"HOME": str(self.home)})
         homes.start()
         self.addCleanup(homes.stop)
-        self.old = sqlite3.connect(self.data / store.EARLIER)
+        self.old = sqlite3.connect(self.data / "index.sqlite3")    # the name that version 0.2 gave it, as it was
         self.old.create_function("word_grams", 1, fuzzy.grams, deterministic=True)
         self.old.execute("PRAGMA journal_mode=WAL")
         self.old.executescript(EARLIER)

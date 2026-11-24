@@ -28,6 +28,13 @@ if verb == "lsf":
     if not os.path.isdir(path):
         sys.exit("ERROR : error listing: directory not found")
     print("\\n".join(sorted(n for n in os.listdir(path) if os.path.isfile(os.path.join(path, n)))))
+elif verb == "lsjson":
+    if not os.path.isdir(path):
+        sys.exit("ERROR : error listing: directory not found")
+    import json
+    names = sorted(n for n in os.listdir(path) if os.path.isfile(os.path.join(path, n)))
+    print(json.dumps([{"Path": n, "Name": n, "Size": os.path.getsize(os.path.join(path, n)), "IsDir": False,
+                       "ModTime": str(os.stat(os.path.join(path, n)).st_mtime_ns)} for n in names]))
 elif verb == "cat":
     if not os.path.isfile(path):
         sys.exit("ERROR : error listing: directory not found")
