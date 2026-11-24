@@ -31,7 +31,7 @@ ASKED = "instr(' '||asked||' ',?)"      # with ' NAME ' for parameter: whether t
 def checksums(record):
     """The checksums a record gives, when they are well formed and one of each kind at most:
     two checksums of one kind in one record describe no file."""
-    given = [key for key in record.get("keys") or () if isinstance(key, str) and SUM.match(key)]
+    given = sorted({key for key in record.get("keys") or () if isinstance(key, str) and SUM.match(key)})
     return given if len({key.split(":", 1)[0] for key in given}) == len(given) else []
 
 
@@ -110,11 +110,13 @@ def cover(db, directory):
     relied_upon = [name for name in programs if sources.policy(name)["text"] == "trust" and name not in without]
     holding = [name for name, relied in found.items() if relied]
     with db:
+        # A statement that gives no checksum can never be proved: it names a work, and does
+        # not answer for the text of a file.
         db.execute(f"UPDATE docs SET state={RESTORED} WHERE state='covered' AND NOT EXISTS (SELECT 1 FROM records r "
-                   f"WHERE r.doc=docs.id AND r.text=1 AND r.source IN ({','.join('?' * len(relied_upon))}))",
+                   f"WHERE r.doc=docs.id AND r.text=1 AND r.keys!='' AND r.source IN ({','.join('?' * len(relied_upon))}))",
                    relied_upon)
         db.execute(f"UPDATE docs SET state='covered',error=NULL WHERE state IN ({','.join('?' * len(WAITING))}) "
-                   f"AND EXISTS (SELECT 1 FROM records r WHERE r.doc=docs.id AND r.text=1 AND r.source IN "
+                   f"AND EXISTS (SELECT 1 FROM records r WHERE r.doc=docs.id AND r.text=1 AND r.keys!='' AND r.source IN "
                    f"({','.join('?' * len(holding))}))", (*WAITING, *holding))
 
 

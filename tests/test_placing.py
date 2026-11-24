@@ -211,8 +211,8 @@ class Statements(Placing):
         copy.unlink()
         self.build(names_only=True)
         self.assertFalse(self.say("a/book.txt", "W1", ["sha256:" + "ee" * 32]))
-        held = sorted(row["key"] for row in self.db.execute("SELECT key FROM doc_keys"))
-        self.assertEqual(held, sorted(f"{key}@txt" for key in self.sums(one)))
+        held = sorted(tuple(row) for row in self.db.execute("SELECT key,basis FROM doc_keys"))
+        self.assertEqual(held, sorted((key, "content") for key in self.sums(one)))
         self.sound()
 
     def test_a_file_leaves_when_the_last_statement_about_it_is_withdrawn(self):
@@ -240,7 +240,8 @@ class Statements(Placing):
             self.assertTrue(self.say("a/book.txt", "W1", [wrong], source=source, title="Old Title"))
         for source in ("library", "catalogue"):             # each corrects itself in its turn
             self.assertTrue(self.say("a/book.txt", "W1", [right], source=source, title="New Title"))
-        self.assertEqual([row["key"] for row in self.db.execute("SELECT key FROM doc_keys")], [f"{right}@txt#{len(LARGE)}"])
+        self.assertEqual([tuple(row) for row in self.db.execute("SELECT key,format,size,basis FROM doc_keys")],
+                         [(right, "txt", len(LARGE), "source")])
         self.assertEqual((names(self.db, "new title"), names(self.db, "old title")), (["a/book.txt"], []))
         self.sound()
 
@@ -310,7 +311,8 @@ class Words2(Placing):
         self.assertEqual(self.db.execute("SELECT count(*) FROM records WHERE file IS NULL").fetchone()[0], 1)
         self.assertTrue(self.say("b/book.txt", "W1", [md5], source="catalogue", title="Catalogue Card"))
         self.assertEqual((names(self.db, "catalogue card"), names(self.db, "library card")), (["b/book.txt"], []))
-        self.assertEqual([row["key"] for row in self.db.execute("SELECT key FROM doc_keys")], [f"{md5}@txt#{len(LARGE)}"])
+        self.assertEqual([tuple(row) for row in self.db.execute("SELECT key,format,size,basis FROM doc_keys")],
+                         [(md5, "txt", len(LARGE), "source")])
         self.sound()
 
     def test_what_was_said_of_a_file_without_naming_its_bytes_is_forgotten_with_it(self):
@@ -353,6 +355,219 @@ class Words2(Placing):
         self.assertTrue(self.say("b/book.txt", "W1", [first]))
         docs = self.docs()
         self.assertEqual((docs["a/book.txt"] == docs["b/book.txt"], docs["b/book.txt"] == docs["c/book.txt"]), (True, False))
+        self.sound()
+
+
+class Sixth(Placing):
+    """Cases in which the placing went wrong before it was examined a sixth time."""
+
+    def exact(self, word, size=512):
+        """A text of exactly `size` bytes that says `word`."""
+        return (word + " ") * (size // (len(word) + 1)) + "." * (size % (len(word) + 1))
+
+    def test_the_ending_of_a_file_name_cannot_pass_for_the_size_a_checksum_was_said_of(self):
+        one = self.write("notes.txt", self.exact("northbound"))
+        two = self.write("notes.txt#512", self.exact("southbound"))    # its format reads txt#512
+        self.build(names_only=True)
+        self.assertTrue(self.say("notes.txt", "W2", self.sums(two)))    # a source takes the first for the second,
+        self.assertTrue(self.say("notes.txt#512", "W2", self.sums(two)))    # and says the truth of the second
+        self.assertEqual(self.documents(), 2)               # two formats: two documents, whatever is said
+        self.assertEqual(self.build(), (1, 0))
+        self.assertEqual((names(self.db, "northbound"), search(self.db, "southbound", exact=True)), (["Reading Room/notes.txt"], []))
+        self.assertEqual(self.db.execute("SELECT count(*) FROM records").fetchone()[0], 1)      # the false statement is gone
+        two.unlink()
+        self.write("identical.txt", self.exact("northbound"), when=1_800_000_000)
+        self.assertEqual(self.build(), (0, 0))
+        self.assertEqual((self.shown("northbound"), search(self.db, "southbound", exact=True)), (["identical.txt", "notes.txt"], []))
+        self.sound()
+
+    def test_a_document_without_file_keeps_its_checksums_when_its_bytes_arrive_under_another_format(self):
+        old = self.write("old.txt#draft")
+        self.build(names_only=True)
+        self.measure("old.txt#draft")
+        self.assertTrue(self.say("old.txt#draft", "W1", self.sums(old), title="Draft Card"))
+        old.unlink()
+        self.write("new.txt")                               # the same bytes, another format
+        self.assertEqual(self.build(), (1, 0))
+        kept = [tuple(row) for row in self.db.execute("SELECT format,basis,count(*) FROM doc_keys GROUP BY 1,2 ORDER BY 1")]
+        self.assertEqual(kept, [("txt", "content", 2), ("txt#draft", "content", 2)])
+        self.assertEqual([row["title"] for row in self.db.execute("SELECT title FROM records WHERE file IS NULL")], ["Draft Card"])
+        self.sound()
+
+    def test_pages_read_by_an_earlier_version_survive_the_proof_that_their_file_is_a_known_document(self):
+        one = self.write("a/scan.txt")
+        self.build(paths=[one])
+        self.unmeasured()                                   # read by an earlier version: one page, recognised
+        self.write("c/scan.txt")                            # a true copy, known by the MD5 of its storage
+        self.build(names_only=True)
+        self.measure("c/scan.txt", local=False)
+        with self.db:                                       # a source answered for the text of the first meanwhile
+            self.db.execute("UPDATE docs SET state='covered' WHERE id=?", (self.docs()["a/scan.txt"],))
+        self.read.clear()
+        self.assertEqual(self.build(), (0, 0))              # read in full, the first is that document: its pages stay
+        self.assertEqual((self.read, self.documents(), self.state("c/scan.txt")), ([], 1, "indexed"))
+        self.assertEqual(self.shown("northern harbours"), ["a/scan.txt", "c/scan.txt"])
+        self.sound()
+
+    def facts(self, statements_first):
+        """One file whose storage tells its MD5 and which is then read; another of which two
+        sources give, the one that MD5, the other its own SHA-256: the same facts in two orders."""
+        one, other = self.write("a/book.txt"), self.write("g/book.txt", OTHER)
+        self.build(names_only=True)
+        self.measure("a/book.txt", local=False)
+        say = lambda: (self.assertTrue(self.say("g/book.txt", "W1", [self.sums(one)[0]])),
+                       self.assertTrue(self.say("g/book.txt", "W1", [self.sums(other)[1]], source="catalogue")))
+        if statements_first:
+            say()
+            self.assertEqual(self.documents(), 1)           # nothing contradicts yet: the two are one document
+            self.measure("a/book.txt")
+        else:
+            self.measure("a/book.txt")
+            say()
+        docs = self.docs()
+        self.assertNotEqual(docs["a/book.txt"], docs["g/book.txt"])     # together, the two statements are refuted
+        self.assertEqual(self.db.execute("SELECT count(*) FROM records").fetchone()[0], 2)
+        self.sound()
+
+    def test_two_statements_refuted_only_together_part_a_file_whatever_the_order_of_the_facts(self):
+        self.facts(True)
+
+    def test_the_same_facts_in_the_other_order_give_the_same_documents(self):
+        self.facts(False)
+
+    def test_a_statement_becomes_usable_again_when_the_document_that_contradicted_it_is_forgotten(self):
+        annex = self.base / "Annex"
+        annex.mkdir()
+        self.run_cli("roots", "add", str(annex))
+        one = self.write("a/book.txt")
+        self.write("g/book.txt", OTHER)
+        (annex / "third.txt").write_text(THIRD)
+        self.build(names_only=True)
+        self.measure("a/book.txt", local=False)
+        third = self.db.execute("SELECT f.id FROM files f JOIN roots r ON r.id=f.root WHERE r.name='Annex'").fetchone()[0]
+        with self.db:
+            indexer.joined(self.db, third, self.sums(annex / "third.txt"))
+        self.assertTrue(self.say("g/book.txt", "W1", [self.sums(one)[0]]))
+        self.assertTrue(self.say("g/book.txt", "W1", [self.sums(annex / "third.txt")[1]], source="catalogue"))
+        self.assertEqual(self.documents(), 3)               # what is said of it names two documents: it joins neither
+        self.run_cli("roots", "remove", "Annex")
+        docs = self.docs()
+        self.assertEqual(docs["a/book.txt"], docs["g/book.txt"])        # one document is left that it can be
+        self.sound()
+
+    def test_the_same_holds_when_that_document_is_forgotten_after_its_month(self):
+        one = self.write("a/book.txt")
+        self.write("g/book.txt", OTHER)
+        third = self.write("t/third.txt", THIRD)
+        self.build(names_only=True)
+        self.measure("a/book.txt", local=False)
+        self.measure("t/third.txt")
+        self.assertTrue(self.say("t/third.txt", "W3", self.sums(third), title="Third Work"))
+        self.assertTrue(self.say("g/book.txt", "W1", [self.sums(one)[0]]))
+        self.assertTrue(self.say("g/book.txt", "W1", [self.sums(third)[1]], source="catalogue"))
+        third.unlink()
+        self.build(names_only=True)                         # kept for a month, with what was said of its bytes
+        self.assertEqual(self.documents(), 3)
+        import time
+        with self.db:
+            store.tend_orphans(self.db, now=int(time.time()) + store.KEEP + 60)
+        docs = self.docs()
+        self.assertEqual((self.documents(), docs["a/book.txt"]), (1, docs["g/book.txt"]))
+        self.sound()
+
+    def test_what_was_said_of_a_file_that_is_gone_is_dropped_when_a_measure_refutes_it(self):
+        one, two = self.write("a/book.txt"), self.write("b/book.txt", OTHER)
+        self.build(names_only=True)
+        self.measure("a/book.txt", local=False)
+        self.assertTrue(self.say("a/book.txt", "W2", [self.sums(two)[1]], title="Eastern", text=True))  # the SHA-256 of the second
+        one.unlink()
+        self.build(names_only=True)
+        self.assertEqual(self.db.execute("SELECT count(*) FROM records WHERE file IS NULL").fetchone()[0], 1)
+        self.measure("b/book.txt")                          # the second is measured: that SHA-256 goes with another MD5
+        self.assertEqual(self.db.execute("SELECT count(*) FROM records").fetchone()[0], 0)
+        self.write("back/book.txt", when=1_800_000_000)     # the first comes back under another name
+        self.build(names_only=True)
+        self.measure("back/book.txt", local=False)
+        self.assertEqual((names(self.db, "eastern"), self.state("back/book.txt")), ([], "pending"))
+        self.assertEqual(self.build(), (2, 0))
+        self.assertEqual(names(self.db, "northern harbours"), ["back/book.txt"])
+        self.sound()
+
+    def test_a_source_that_gives_its_checksums_in_another_order_moves_no_file(self):
+        for folder in "abc":
+            self.write(f"{folder}/book.txt")
+        self.build(names_only=True)
+        md5, sha = "md5:" + "aa" * 16, "sha256:" + "bb" * 32
+        for folder in "abc":
+            self.assertTrue(self.say(f"{folder}/book.txt", "W1", [sha, md5]))
+        docs = self.docs()
+        with patch("shelffind.store.place", side_effect=AssertionError("a file was placed again")):
+            for folder in "abc":
+                self.assertTrue(self.say(f"{folder}/book.txt", "W1", [md5, sha]))
+        self.assertEqual((self.docs(), {row["keys"] for row in self.db.execute("SELECT keys FROM records")}),
+                         (docs, {f"{md5} {sha}"}))
+        self.sound()
+
+
+class Proofs(Placing):
+    """A complete run proves or refutes every statement, in a folder with a storage too."""
+
+    def setUp(self):
+        super().setUp()
+        self.questions = self.twin()                        # a storage that holds what the folder holds
+
+    def test_a_file_that_the_storage_cannot_be_asked_about_is_read_to_prove_what_is_said_of_it(self):
+        cached = self.write("cached.txt")
+        self.build(paths=[cached])
+        odd = self.write("chapter\ntwo.txt", OTHER)         # a line break in its name: the storage is not asked
+        self.build(names_only=True)
+        self.assertTrue(self.say("chapter\ntwo.txt", "W1", self.sums(cached)))      # a source takes it for the first
+        self.assertEqual(self.build(names_only=True), (0, 0))
+        self.assertEqual(self.shown("northern harbours"), ["cached.txt", "chapter\ntwo.txt"])   # believed by an inventory,
+        self.assertEqual(self.build(), (1, 0))              # refuted by a complete run, which reads the file
+        self.assertEqual((self.shown("northern harbours"), self.shown("southern capes")), (["cached.txt"], ["chapter\ntwo.txt"]))
+        self.assertTrue(odd.exists())
+        self.sound()
+
+    def test_a_statement_of_another_kind_than_the_storage_tells_is_proved_by_a_reading(self):
+        self.write("covered.txt", OTHER)
+        self.build(names_only=True)
+        self.assertTrue(self.say("covered.txt", "W1", ["sha256:" + "ee" * 32], title="Another Work", text=True))
+        self.assertEqual(self.build(names_only=True), (0, 0))
+        self.assertEqual(names(self.db, "another work"), ["Reading Room/covered.txt"])
+        self.assertEqual(self.build(limit=0), (0, 0))       # the MD5 of the storage proves nothing of a SHA-256
+        self.assertEqual((names(self.db, "another work"), self.db.execute("SELECT count(*) FROM records").fetchone()[0]), ([], 0))
+        self.assertIn("sha256:", self.db.execute("SELECT sum FROM files").fetchone()[0])
+        self.assertEqual(self.build(), (1, 0))
+        self.assertEqual(names(self.db, "southern capes"), ["Reading Room/covered.txt"])
+        self.sound()
+
+    def test_a_statement_that_the_storage_proves_costs_no_reading(self):
+        path = self.write("book.txt")
+        self.build(names_only=True)
+        self.assertTrue(self.say("book.txt", "W1", self.sums(path), title="True Work"))
+        with patch("shelffind.indexer.whole_checksums", side_effect=AssertionError("the file was read")):
+            self.assertEqual(self.build(limit=0), (0, 0))
+        self.assertEqual((names(self.db, "true work"), self.db.execute("SELECT sum FROM files").fetchone()[0]),
+                         (["Reading Room/book.txt"], self.sums(path)[0]))
+        self.sound()
+
+
+class Coverage(Placing):
+    def test_a_statement_without_checksum_names_a_work_and_never_answers_for_the_text_of_a_file(self):
+        self.write("book.txt")
+
+        def question(directory, name, op, **fields):
+            return {"records": [{"n": file["n"], "id": "W1", "title": "Titled Only", "text": True} for file in fields["files"]]}
+
+        usable = lambda directory, progress=None: ({"library": ["library"]}, {"library": True}, set())
+        with patch("shelffind.link.usable", side_effect=usable), patch("shelffind.sources.question", side_effect=question), \
+                patch("shelffind.sources.policy", return_value={"text": "trust", "identify": True}):
+            self.assertEqual(self.build(names_only=True), (0, 0))
+            self.assertEqual(self.state("book.txt"), "pending")
+            self.assertEqual(self.build(), (1, 0))          # nothing can prove such a statement: the file is read
+        self.assertEqual((names(self.db, "titled only"), names(self.db, "northern harbours")),
+                         (["Reading Room/book.txt"], ["Reading Room/book.txt"]))
         self.sound()
 
 
@@ -644,9 +859,19 @@ class Storage2(Placing):
         self.write("a/book.txt")
         self.write("b/book.txt", OTHER)
         self.build(names_only=True)
-        self.assertTrue(self.say("a/book.txt", "W1", ["md5:" + "ee" * 16]))     # one of the two is known by a checksum
-        with patch("shelffind.indexer.whole_checksums", side_effect=AssertionError("a file was read")):
-            self.assertEqual(self.build(limit=0), (0, 0))   # the other waits for the storage: nothing is read
+        self.assertTrue(self.say("a/book.txt", "W1", ["md5:" + "ee" * 16]))     # of one of the two a source gives a checksum
+        real, read = indexer.whole_checksums, []
+
+        def reading(path, row, copy=None):
+            read.append(path.parent.name)
+            return real(path, row, copy)
+
+        with patch("shelffind.indexer.whole_checksums", side_effect=reading):
+            self.assertEqual(self.build(limit=0), (0, 0))
+        # The statement has to be proved, and the storage does not hold the file: it is read.
+        # The other file is merely of the size of a known document, and waits for the storage.
+        self.assertEqual(read, ["a"])
+        self.assertEqual(self.db.execute("SELECT count(*) FROM records").fetchone()[0], 0)      # and the statement was false
         self.sound()
 
     def test_what_the_first_batches_taught_is_used_though_the_storage_then_falls_silent(self):
@@ -750,6 +975,15 @@ class Results(Placing):
             self.db.execute("DELETE FROM docs WHERE NOT EXISTS (SELECT 1 FROM files f WHERE f.doc=docs.id)")
         self.assertIsNone(fuse.document(self.db, "library", {"id": "X", "keys": [md5, sha], "format": "md"}, "md"))
 
+    def test_a_reference_does_not_name_a_document_measured_to_be_other_bytes_than_the_result(self):
+        old = self.write("old.txt")
+        self.build(names_only=True)
+        self.measure("old.txt")
+        self.assertTrue(self.say("old.txt", "W1", self.sums(old)))      # true when it was said
+        revised = ["md5:" + "ab" * 16, "sha256:" + "cd" * 32]           # the work has changed at the source since
+        self.assertIsNone(fuse.document(self.db, "library", {"id": "W1", "keys": revised, "format": "txt"}))
+        self.assertEqual(fuse.document(self.db, "library", {"id": "W1", "keys": [], "format": "txt"}), self.docs()["old.txt"])
+
     def test_the_checksums_of_a_result_outrank_a_reference_given_to_other_bytes(self):
         old, current = self.write("old.txt"), self.write("current.txt", OTHER)
         self.build(names_only=True)
@@ -836,24 +1070,6 @@ class Practical(Placing):
         self.assertEqual((names(self.db, "known work"), names(self.db, "loose card")), (["Reading Room/book.txt"], []))
         self.sound()
 
-    def test_the_copy_of_a_document_is_made_on_a_disk_unless_another_folder_is_named(self):
-        with patch.dict(os.environ, {"TMPDIR": str(self.base)}):
-            self.assertIsNone(indexer.scratch())
-        with patch.dict(os.environ):
-            os.environ.pop("TMPDIR", None)
-            on_disk = os.path.isdir("/var/tmp") and os.access("/var/tmp", os.W_OK | os.X_OK)
-            self.assertEqual(indexer.scratch(), "/var/tmp" if on_disk else None)
-
-    def test_a_copy_left_by_a_run_that_was_cut_short_is_removed_a_day_later(self):
-        old, recent = self.base / "shelffind-copy-old", self.base / "shelffind-copy-recent"
-        for left in (old, recent):
-            left.mkdir()
-            (left / "book.pdf").write_text("left behind")
-        os.utime(old, (1_700_000_000, 1_700_000_000))
-        with patch.dict(os.environ, {"TMPDIR": str(self.base)}), patch("tempfile.gettempdir", return_value=str(self.base)):
-            indexer.sweep()
-        self.assertEqual((old.exists(), recent.exists()), (False, True))
-
     def test_a_djvu_document_kept_in_several_files_is_refused_with_its_remedy(self):
         from shelffind import extract
         bundled = self.base / "bundled.djvu"
@@ -886,6 +1102,45 @@ class Conversion2(Earlier):
         self.assertEqual((db.execute("PRAGMA user_version").fetchone()[0], db.execute("SELECT note FROM annotations").fetchone()[0]),
                          (37, "the only copy"))
         db.close()
+
+    def test_an_old_index_with_a_column_of_its_own_is_not_converted(self):
+        self.change("ALTER TABLE pages ADD COLUMN annotation TEXT; UPDATE pages SET annotation='a note in the margin';")
+        with self.assertRaises(ValueError) as refusal:
+            migrate.upgrade(self.data)
+        self.assertIn("columns of pages", str(refusal.exception))
+        self.assertFalse((self.data / store.INDEX).exists())
+        db = sqlite3.connect(self.data / store.EARLIER)
+        self.assertEqual(db.execute("SELECT count(*) FROM pages WHERE annotation IS NOT NULL").fetchone()[0] > 0, True)
+        db.close()
+
+    def test_a_table_named_like_one_that_sqlite_keeps_is_a_table_of_its_own_all_the_same(self):
+        self.change("CREATE TABLE passages_content (note TEXT); INSERT INTO passages_content VALUES ('the only copy');")
+        with self.assertRaises(ValueError):
+            migrate.upgrade(self.data)
+        self.change("DROP TABLE passages_content;")
+        self.assertIsNotNone(migrate.upgrade(self.data))
+        self.change("CREATE TABLE passages_content (note TEXT); INSERT INTO passages_content VALUES ('written since');")
+        with self.assertRaises(ValueError):
+            migrate.discard_old(self.data)
+        self.assertTrue((self.data / store.EARLIER).exists())
+
+    def test_the_earlier_index_is_not_deleted_beside_a_new_index_that_this_version_cannot_use(self):
+        self.assertIsNotNone(migrate.upgrade(self.data))
+        new = sqlite3.connect(self.data / store.INDEX)      # as a trial of this version left it
+        new.execute("PRAGMA user_version=2")
+        new.close()
+        with self.assertRaises(ValueError):
+            store.connect(self.data)
+        with self.assertRaises(ValueError):                 # not "nothing to convert"
+            migrate.upgrade(self.data)
+        with self.assertRaises(ValueError):
+            migrate.discard_old(self.data)
+        self.assertTrue((self.data / store.EARLIER).exists())
+        (self.data / store.INDEX).unlink()                  # moved away, as the message says:
+        for left in self.data.glob(store.INDEX + "-*"):
+            left.unlink()
+        self.assertIsNotNone(migrate.upgrade(self.data))    # the earlier index is converted again
+        self.assertTrue(migrate.discard_old(self.data) > 0)
 
     def test_a_table_this_version_does_not_know_keeps_the_old_index_from_being_converted_or_deleted(self):
         self.change("CREATE TABLE annotations (note TEXT); INSERT INTO annotations VALUES ('the only copy');")

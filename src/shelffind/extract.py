@@ -14,6 +14,7 @@ from xml.etree import ElementTree
 from zipfile import ZipFile
 
 SUPPORTED = {"pdf", "djvu", "ps", "ps.gz", "epub", "txt", "md", "rst", "tex"}
+PLAIN = {"txt", "md", "rst", "tex"}     # read as they are, up to MAX_TEXT
 MAX_TEXT = 64 * 1024 * 1024
 
 

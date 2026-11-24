@@ -32,8 +32,24 @@ from . import __version__, fuzzy, history, store
 
 RETIRED = store.RETIRED         # the format number an old index receives once it has been converted
 ORIGIN = "converted_from"       # in the new index: the print of the old index it was made from
-TABLES = {"roots", "files", "pages", "history", "words"}    # what an index of version 0.2 holds,
-SEARCHED = {"names", "passages", "spelling"}                # and its tables of words, each kept in several
+# What an index of versions 0.1 and 0.2 holds, and nothing else: its tables with their columns,
+# the tables that SQLite keeps beside the three tables of words, its indexes and its triggers.
+# What is not in this layout would be neither converted nor counted in the print of the index.
+LAYOUT = {
+    "roots": ("id", "path", "mount", "scanned", "problem"),
+    "files": ("id", "root", "rel", "name", "folded", "format", "size", "mtime", "state", "error"),
+    "pages": ("id", "file", "page", "section", "text", "needs_ocr"),
+    "history": ("query", "used"),
+    "words": ("term",),
+    "names": ("name", "folder"),
+    "passages": ("text",),
+    "spelling": ("grams",),
+}
+BESIDE = {"names_config", "names_content", "names_data", "names_docsize", "names_idx",
+          "passages_config", "passages_data", "passages_docsize", "passages_idx",
+          "spelling_config", "spelling_data", "spelling_docsize", "spelling_idx"}
+OTHERS = {"index:files_state", "index:pages_file", "trigger:files_ad", "trigger:pages_ad", "trigger:pages_ai",
+          "trigger:pages_au", "trigger:words_ai"}
 
 
 def refuse_development(directory):
@@ -95,23 +111,30 @@ def exclusively(old):
     version = old.execute("PRAGMA user_version").fetchone()[0]
     unknown = strangers(old)
     if version not in (1, RETIRED) or unknown:
-        what = f"tables that this version does not know ({', '.join(unknown)})" if unknown else f"the format {version}"
-        raise ValueError(f"The earlier index has {what}: it is not an index that this version can convert, "
+        what = f"is not laid out as versions 0.1 and 0.2 make it ({', '.join(unknown[:6])})" if unknown else f"has the format {version}"
+        raise ValueError(f"The earlier index {what}: it is not an index that this version can convert, "
                          "and it is left as it is")
 
 
 def strangers(old):
-    """The tables of an old index that an index of version 0.2 does not have: what they hold
-    would be neither converted nor counted in the print of the index."""
-    found = []
-    with rows(old, "SELECT name FROM sqlite_master WHERE type='table' ORDER BY name") as tables:
-        for row in tables:
-            name = row[0]
-            base, _, part = name.rpartition("_")
-            if name in TABLES or name in SEARCHED or name.startswith("sqlite_") \
-                    or (base in SEARCHED and part in ("config", "content", "data", "docsize", "idx")):
-                continue
-            found.append(name)
+    """What an old index holds beyond, or short of, the layout of versions 0.1 and 0.2: a table,
+    a column, an index, a trigger or a view of its own, or one that is missing. Such an index
+    is not converted, since what the layout does not name would be lost, and it is not deleted."""
+    found, seen = [], set()
+    with rows(old, "SELECT type,name FROM sqlite_master ORDER BY type,name") as objects:
+        listed = [(row[0], row[1]) for row in objects]
+    for kind, name in listed:
+        if name.startswith("sqlite_"):
+            continue                                # kept by SQLite itself
+        if kind == "table" and name in LAYOUT:
+            seen.add(name)
+            with rows(old, f"PRAGMA table_info({name})") as columns:
+                held = tuple(row[1] for row in columns)
+            if held != LAYOUT[name]:
+                found.append(f"the columns of {name}")
+        elif not ((kind == "table" and name in BESIDE) or f"{kind}:{name}" in OTHERS):
+            found.append(f"the {kind} {name}")
+    found += [f"no table {name}" for name in sorted(set(LAYOUT) - seen)]
     return found
 
 
@@ -180,6 +203,23 @@ def origin(directory):
         return None
 
 
+def usable(target):
+    """Raise unless the new index is one that this version can use. An index made by a trial
+    of this version is not: the earlier index kept beside it is then the only one from which
+    this version can start again, and must not be taken for a leftover."""
+    try:
+        new = sqlite3.connect(target.as_uri() + "?mode=ro", uri=True, timeout=30)
+        try:
+            version = new.execute("PRAGMA user_version").fetchone()[0]
+        finally:
+            new.close()
+    except sqlite3.Error as fault:
+        raise ValueError(f"The new index cannot be read ({fault}): {target}") from None
+    if version != store.FORMAT:
+        raise ValueError(f"{target} was not made by this version (format {version}) and cannot be used: move it away; "
+                         "the earlier index kept beside it, if any, is then converted again")
+
+
 def upgrade(directory, progress=lambda text: None, wait=20.0):
     """Convert the earlier index of `directory`. Returns the path of the new index, or None when
     there is nothing to convert. A new index that is there already is never touched, and says
@@ -191,6 +231,7 @@ def upgrade(directory, progress=lambda text: None, wait=20.0):
     with (directory / "migrate.lock").open("a") as lock:
         fcntl.flock(lock, fcntl.LOCK_EX)
         if target.exists() and target.stat().st_size > 0:
+            usable(target)
             return target
         earlier = store.earlier_format(directory)
         if earlier not in (1, RETIRED):
@@ -278,6 +319,7 @@ def discard_old(directory, wait=5.0):
             raise ValueError("The new index does not exist yet: nothing is deleted")
         if not (directory / store.EARLIER).is_file():
             return 0
+        usable(target)                          # the earlier index is not deleted beside a new one that cannot serve
         made_from = origin(directory)
         # The old index is this program's alone from its comparison to its deletion: nothing can
         # be added to it between the two, and no program that has it open is left writing into

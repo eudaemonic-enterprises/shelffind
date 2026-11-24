@@ -148,7 +148,8 @@ class Linked(Shelf):
         keys = lambda basis: {row[0] for row in self.db.execute("SELECT key FROM doc_keys WHERE basis=?", (basis,))}
         # After an inventory the book is known by the word of the library, kept under the
         # format and the size it was said of.
-        self.assertEqual((keys("source"), keys("content")), ({f"{self.checksum}@txt#{len(BOOK)}"}, set()))
+        self.assertEqual((keys("source"), keys("content")), ({self.checksum}, set()))
+        self.assertEqual(tuple(self.db.execute("SELECT format,size FROM doc_keys").fetchone()), ("txt", len(BOOK)))
         self.assertEqual(self.states(), {"scan-0042.txt": "covered", "notes.txt": "pending"})
         self.assertEqual(self.build(), (1, 0))
         self.assertEqual(self.read, ["notes.txt"])          # the book is not read for its text,
@@ -158,7 +159,7 @@ class Linked(Shelf):
                          [("scan-0042.txt", "Linear and Nonlinear Waves", "G. B. Whitham", "1974")])
         # but measured once, which proves what the library said: it is now known by that measure.
         self.assertEqual(keys("source"), set())
-        self.assertIn(self.checksum + "@txt", keys("content"))
+        self.assertIn(self.checksum, keys("content"))
         self.assertEqual(self.build(), (0, 0))              # nothing more to ask, nothing to read
         code, out, _ = self.run_cli("status", "--json")
         self.assertEqual(json.loads(out)[0]["states"], {"covered": 1, "indexed": 1})
@@ -276,6 +277,7 @@ class Linked(Shelf):
         with self.db:                                       # as an earlier version left it: pages, nothing measured
             self.db.execute("DELETE FROM doc_keys")
             self.db.execute("UPDATE files SET sum=NULL")
+            self.db.execute("UPDATE docs SET origin=NULL")
         copy = self.root / "Mechanics" / "elsewhere.txt"    # the same bytes under a name the library knows
         copy.parent.mkdir()
         copy.write_text(BOOK)

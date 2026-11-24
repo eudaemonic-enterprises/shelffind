@@ -138,7 +138,7 @@ class Likeness(Evidence):
         self.assertEqual(self.build(), (2, 0))
         self.assertEqual(sorted(self.read), ["notes.md", "notes.txt"])
         self.assertEqual(self.documents(), 2)
-        known = sorted(row["key"].rsplit("@", 1) for row in self.db.execute("SELECT key FROM doc_keys WHERE key LIKE 'md5:%'"))
+        known = sorted(tuple(row) for row in self.db.execute("SELECT key,format FROM doc_keys WHERE key LIKE 'md5:%'"))
         self.assertEqual((known[0][0], [fmt for _, fmt in known]), (known[1][0], ["md", "txt"]))     # one checksum, two readers
 
     def test_a_failed_reading_does_not_keep_a_copy_from_being_read(self):
@@ -491,9 +491,11 @@ class Words(Evidence):
         self.assertTrue(self.say("b/book.txt", "W2", other))    # then for another work, known by another checksum
         docs = self.docs()
         self.assertNotEqual(docs["a/book.txt"], docs["b/book.txt"])
-        held = lambda rel: sorted(row["key"] for row in self.db.execute("SELECT key FROM doc_keys WHERE doc=?", (docs[rel],)))
+        held = lambda rel: sorted(tuple(row) for row in self.db.execute(
+            "SELECT key,format,size,basis FROM doc_keys WHERE doc=?", (docs[rel],)))
         size = len(LARGE)                                   # a checksum that was only said is kept with the size it was said of
-        self.assertEqual((held("a/book.txt"), held("b/book.txt")), ([f"{key}@txt#{size}"], [f"{other}@txt#{size}"]))
+        self.assertEqual((held("a/book.txt"), held("b/book.txt")),
+                         ([(key, "txt", size, "source")], [(other, "txt", size, "source")]))
         self.assertEqual(self.documents(), 2)
 
     def test_a_file_brought_by_a_word_leaves_when_the_word_is_withdrawn(self):
@@ -537,8 +539,8 @@ class Words(Evidence):
             self.assertTrue(indexer.joined(self.db, file, true))                    # then the file is read in full
             self.assertFalse(indexer.joined(self.db, file, stale, local=False))
         self.assertEqual(self.db.execute("SELECT sum FROM files").fetchone()[0], " ".join(true))
-        self.assertEqual(sorted(row["key"] for row in self.db.execute("SELECT key FROM doc_keys")),
-                         sorted(key + "@txt" for key in true))
+        self.assertEqual(sorted(tuple(row) for row in self.db.execute("SELECT key,format,basis FROM doc_keys")),
+                         sorted((key, "txt", "content") for key in true))
 
     def test_a_file_said_to_have_the_checksum_measured_of_another_joins_it(self):
         self.write("a/book.txt")

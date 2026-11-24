@@ -37,14 +37,19 @@ def document(db, name, row, only=None):
             return None
         return min(found, key=lambda one: (one["format"] != wanted, not one["measured"], not one["filed"], one["doc"]))["doc"]
 
+    keys = [str(key) for key in row.get("keys") or ()]
     found = []
-    for key in row.get("keys") or ():
+    for key in keys:
         found += db.execute(f"SELECT k.doc,d.format,k.basis='content' AS measured,{filed} FROM doc_keys k "
-                            "JOIN docs d ON d.id=k.doc WHERE k.key>? AND k.key<?", (str(key) + "@", str(key) + "A")).fetchall()
+                            "JOIN docs d ON d.id=k.doc WHERE k.key=?", (key,)).fetchall()
     known = best(found)
     if known is None:
-        known = best(db.execute(f"SELECT r.doc,d.format,0 AS measured,{filed} FROM records r JOIN docs d ON d.id=r.doc "
-                                "WHERE r.source=? AND r.ref=?", (name, row["id"])).fetchall())
+        # By its reference, unless the checksums of the result are measured not to be those of
+        # the document that the reference was given to: the work has changed at the source.
+        known = best([one for one in db.execute(
+            f"SELECT r.doc,d.format,0 AS measured,{filed} FROM records r JOIN docs d ON d.id=r.doc "
+            "WHERE r.source=? AND r.ref=?", (name, row["id"])).fetchall()
+            if not store.against(keys, store.keys_of(db, one["doc"], "content"))])
     return known
 
 
