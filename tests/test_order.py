@@ -44,6 +44,22 @@ class Order(Shelf):
         self.assertEqual(sorted(first + rest), sorted(p.name for p in self.root.iterdir()))
         self.assertEqual(self.db.execute("SELECT count(*) FROM docs WHERE state='indexed'").fetchone()[0], 5)
 
+    def test_the_order_holds_in_every_pass_of_a_run(self):
+        self.write()
+        sizes = {p.name: p.stat().st_size for p in self.root.iterdir()}
+        for order, wanted in (("smallest", sorted), ("largest", lambda v: sorted(v, reverse=True))):
+            taken = []
+
+            def declining(db, root, row, *args, **kwargs):
+                taken.append(sizes[row["rel"]])
+                return False                        # nothing is read: the documents wait for a later pass
+            with patch("shelffind.indexer.update_text", declining):
+                self.build(order=order)
+            half = len(taken) // 2
+            self.assertGreaterEqual(len(taken), 2 * len(sizes) - 1, taken)          # a second pass was made
+            self.assertEqual(taken[:len(sizes)], wanted(sizes.values()), order)
+            self.assertEqual(taken[len(sizes):2 * len(sizes)], wanted(sizes.values()), order)
+
     def test_the_setting_and_the_flag(self):
         self.write()
         sizes = {p.name: p.stat().st_size for p in self.root.iterdir()}

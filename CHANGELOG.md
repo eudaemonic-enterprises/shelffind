@@ -45,7 +45,8 @@ or author) and its text finds the document: `whitham dispersion` where one word 
 and the other only in a page. The words are shared in every way that leaves each side
 something, the ways that give the name more words first (beyond five words, only the ways that
 give it one word, or all but one, and a query of more than eight words is not shared, so that a
-keystroke stays quick); such a document is listed after those
+keystroke stays quick; only documents that have text are looked into, the ways with the fewest
+candidates first, each with its share of a budget of looks); such a document is listed after those
 found by their names and before those found by their text alone, at the page that holds the
 words asked of the text. Among matches of the same kind, documents (the formats that are read, converters included) come
 before the programs, pictures and data that some folders hold, and a program whose name is the
@@ -54,8 +55,9 @@ query is no longer put before the documents that have it in their names.
 Formats. HTML, Word (`docx`), OpenDocument (`odt`), FB2, Typst and BibTeX documents are read.
 A document without pages is cut into passages of about six thousand characters made of whole
 paragraphs, each named after its section, and an archive that unpacks to more than 64 MB, or XML of more than 32 MB, is
-refused. What a word processor's file does not show (deleted words, field codes, the second copy
-of a text box) is not indexed, a footnote is a passage of its own, and an HTML page keeps its
+refused (the pictures of an FB2 book are put aside first). What a word processor's file does not
+show (deleted words and tracked deletions, field codes, the second copy of a text box) is not
+indexed, a footnote or a comment is a passage of its own, and an HTML page keeps its
 title and its body whether or not its head was closed. Any other format is read through a program named in the settings, `[convert.FORMAT]
 command = ["program", "{path}"]`, which prints the text. Files already listed in a format that
 is read since wait for their text from the next inventory on, and the documents of a format that is

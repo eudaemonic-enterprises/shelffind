@@ -156,6 +156,39 @@ class Faults(Shelf):
             with self.assertRaisesRegex(ValueError, "exceeds 32 MiB"):
                 list(extract.fb2_pages(self.root / "front.fb2"))
 
+    def test_an_fb2_book_with_large_pictures_is_read_and_its_text_is_what_the_limit_is_about(self):
+        body = "<section><p>Lanterns swing.</p></section>"
+        picture = '<binary id="cover.jpg" content-type="image/jpeg">' + "QUJD" * 2000 + "</binary>"
+        (self.root / "pictured.fb2").write_text(f"<FictionBook><body>{body}</body>{picture}</FictionBook>")
+        with patch.object(extract, "MAX_XML", 1000):
+            self.assertEqual(self.build(), (1, 0))
+            self.assertTrue(self.found("lanterns swing"))
+            (self.root / "wordy.fb2").write_text("<FictionBook><body><section><p>" + "word " * 400 + "</p></section></body></FictionBook>")
+            with self.assertRaisesRegex(ValueError, "exceeds 32 MiB"):
+                list(extract.fb2_pages(self.root / "wordy.fb2"))
+
+    def test_tracked_deletions_and_the_author_of_a_comment_are_not_text_of_the_odt_paragraph(self):
+        office = "urn:oasis:names:tc:opendocument:xmlns:office:1.0"
+        dc = "http://purl.org/dc/elements/1.1/"
+        body = (f'<office:document-content xmlns:office="{office}" xmlns:text="{T}" xmlns:dc="{dc}"><office:body><office:text>'
+                f'<text:tracked-changes><text:changed-region><text:deletion><text:change-info><dc:creator>Jones</dc:creator></text:change-info>'
+                f'<text:p>Deleted sentence about vortices.</text:p></text:deletion></text:changed-region></text:tracked-changes>'
+                f'<text:p>Kept text<office:annotation><dc:creator>Commenter Jones</dc:creator><dc:date>2026-03-04T11:00:00</dc:date>'
+                f'<text:p>The comment body.</text:p></office:annotation> after comment.</text:p></office:text></office:body></office:document-content>')
+        with ZipFile(self.root / "marked.odt", "w") as z:
+            z.writestr("content.xml", body)
+        self.assertEqual(self.build(), (1, 0))
+        text = "\n".join(store_text(self.db))
+        self.assertNotIn("vortices", text)
+        self.assertIn("Kept text after comment.", text)
+        self.assertNotIn("Jones2026", text)
+        self.assertEqual(text.count("The comment body."), 1)
+
+    def test_an_fb2_subtitle_is_text(self):
+        (self.root / "sub.fb2").write_text("<FictionBook><body><section><subtitle>Interlude of the tides</subtitle><p>Waves.</p></section></body></FictionBook>")
+        self.assertEqual(self.build(), (1, 0))
+        self.assertTrue(self.found("interlude of the tides"))
+
     def test_a_document_of_a_format_no_longer_read_is_not_read_as_plain_text(self):
         folder = self.fake_tool("shout", 'tr a-z A-Z < "$1"\n')
         extract.declare({"zzz": {"command": [str(folder / "shout"), "{path}"]}})

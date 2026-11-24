@@ -84,6 +84,24 @@ class Shared(Shelf):
         self.assertEqual(len(probes), 5)                     # it stops once the list is full
         self.db.set_trace_callback(None)
 
+    def test_pictures_without_text_do_not_use_up_the_looks_into_the_text(self):
+        for n in range(250):
+            (self.root / f"waves-{n:03d}.png").write_bytes(b"\x89PNG" + n.to_bytes(2, "big"))
+        (self.root / "Waves-Chapter-Of-Introduction-To-Shallow-Water-Theory.txt").write_text("These notes treat the shallow water theory.")
+        self.build()
+        for query in ("waves notes", "notes waves"):
+            found = [(r["name"], r["match"]) for r in search.search(self.db, query, where="all")]
+            self.assertIn(("Waves-Chapter-Of-Introduction-To-Shallow-Water-Theory.txt", "name and passage"), found, query)
+
+    def test_a_word_that_is_in_many_names_does_not_take_the_looks_of_the_word_that_is_in_one(self):
+        for n in range(400):
+            (self.root / f"waves-{n:03d}.txt").write_text(f"Chapter number {n} on tides and harbours.")
+        (self.root / "Whitham-Notes.txt").write_text("Notes on waves of every kind.")
+        self.build()
+        for query in ("waves whitham", "whitham waves"):
+            found = [(r["name"], r["match"]) for r in search.search(self.db, query, where="all")]
+            self.assertIn(("Whitham-Notes.txt", "name and passage"), found, query)
+
     def test_how_the_words_are_shared(self):
         self.assertEqual(search.shares(1), [])
         self.assertEqual(search.shares(2), [((0,), (1,)), ((1,), (0,))])

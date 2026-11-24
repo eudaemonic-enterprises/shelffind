@@ -1665,6 +1665,24 @@ class Turns(Two):
                 again = parcels.Exchange(machine_["data"], machine_["db"], sharing.Folder(self.shared))
             self.assertEqual(again.took, 600.0 if "99999" in bad else 0.0)
 
+    def test_a_damaged_record_of_times_is_not_believed_and_does_not_stop_a_run(self):
+        self.shelf()
+        machine_ = self.machines["office"]
+        for bad in ('{"took": ' + "9" * 400 + "}", '{"took": 1e999}', '{"took": 1e30}', "[]", "null"):
+            (machine_["data"] / parcels.TEXTS).write_text(bad)
+            with self.at("office"):
+                told = parcels.Exchange(machine_["data"], machine_["db"], sharing.Folder(self.shared))
+            self.assertEqual(told.took, 0.0, bad)
+
+    def test_what_could_not_be_put_in_its_place_leaves_no_temporary_file(self):
+        self.shelf()
+        data = self.machines["office"]["data"]
+        before = sorted(p.name for p in data.iterdir())
+        with patch("shelffind.machine.os.replace", side_effect=OSError("no room")):
+            with self.assertRaises(OSError):
+                machine.write(data, {"at": 1}, parcels.TEXTS)
+        self.assertEqual(sorted(p.name for p in data.iterdir()), before)
+
     def test_a_long_exchange_leaves_most_of_the_time_to_reading(self):
         self.shelf()
         machine_ = self.machines["office"]

@@ -379,8 +379,8 @@ class Exchange:
         try:
             told = json.loads((self.directory / TEXTS).read_text())
             took = told.get("took") if isinstance(told, dict) else None
-            return min(float(took), 600.0) if type(took) in (int, float) and took > 0 else 0.0
-        except (OSError, ValueError):
+            return min(float(took), 600.0) if type(took) in (int, float) and 0 < took < 10**12 else 0.0
+        except (OSError, ValueError, OverflowError):
             return 0.0
 
     def due(self):

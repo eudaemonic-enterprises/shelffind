@@ -871,13 +871,13 @@ def build(db, directory, selected, *, names_only=False, ocr=False, languages="en
                 if workers > 1 and ahead is None:
                     ahead = Ahead(hold, workers)
                 total, taken = len(candidates), False
-                order = list(candidates.items())
-                for seen, (doc, copies) in enumerate(order):
+                line = list(candidates.items())
+                for seen, (doc, copies) in enumerate(line):
                     if halted or (limit is not None and done >= limit):
                         break
                     if ahead is not None:
                         reach = 2 * workers if limit is None else max(0, min(2 * workers, limit - done))
-                        for _, later in order[seen:seen + reach]:
+                        for _, later in line[seen:seen + reach]:
                             if ahead.full():
                                 break
                             if later[0][0]["id"] not in offline:

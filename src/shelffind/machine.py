@@ -5,6 +5,7 @@ A machine is known by a label of sixteen hexadecimal digits drawn from its syste
 with a key of ShelfFind's own, so that the identifier itself never leaves the machine, and by
 a name for people. Both are kept in the data folder.
 """
+import contextlib
 import fcntl
 import hashlib
 import hmac
@@ -36,9 +37,15 @@ def system_label():
 
 def write(directory, told, name=NAME):
     directory.mkdir(mode=0o700, parents=True, exist_ok=True)
-    with tempfile.NamedTemporaryFile(mode="w", dir=directory, prefix=name + ".", delete=False) as out:
-        json.dump(told, out, indent=2)
-    os.replace(out.name, directory / name)
+    out = tempfile.NamedTemporaryFile(mode="w", dir=directory, prefix=name + ".", delete=False)
+    try:
+        with out:
+            json.dump(told, out, indent=2)
+        os.replace(out.name, directory / name)
+    except BaseException:
+        with contextlib.suppress(OSError):
+            os.unlink(out.name)             # what could not be put in its place is not left beside it
+        raise
 
 
 def read(path):

@@ -232,8 +232,9 @@ def member(archive, name, budget):
 
 
 BLANKS = frozenset({"s", "tab", "br", "line-break"})             # what a word processor writes for a blank
-UNSEEN = frozenset({"delText", "instrText", "Fallback", "note-body", "note-citation"})    # deleted words, field codes,
-                                                                    # the copy of a text box, a note, which is its own passage
+UNSEEN = frozenset({"delText", "instrText", "Fallback", "note-body", "note-citation", "deletion", "annotation"})
+# what a word processor's file holds but does not show in its paragraph: deleted words and field codes, the copy of a
+# text box, a note or a comment, which is a passage of its own, and the words that a tracked change took out
 MAX_XML = 32 << 20      # bytes of XML of a word processor's file or of FB2 that are read: a tree takes ten times that
 
 
@@ -261,7 +262,7 @@ def text_of(element, names, top=True):
 
 def paragraphs_of(root, names):
     """The paragraphs of a word processor's file, each once, in the order of the file."""
-    if local(root) == "Fallback":
+    if local(root) in {"Fallback", "deletion"}:
         return
     if local(root) in names:
         text = " ".join("".join(text_of(root, names)).split())
@@ -309,20 +310,26 @@ def office_pages(path, fmt):
 
 
 def fb2_pages(path):
-    if path.stat().st_size > MAX_XML:
+    if path.stat().st_size > MAX_TEXT:
+        raise ValueError("FB2 exceeds 64 MiB")
+    # The pictures of a book are text nodes of base64 that make no tree: they are put aside, and
+    # what is left is what the limit of the XML is about.
+    data = re.sub(rb"<(?:\w+:)?binary\b[^>]*>.*?</(?:\w+:)?binary>", b"", path.read_bytes(), flags=re.S)
+    if len(data) > MAX_XML:
         raise ValueError("The XML of the document exceeds 32 MiB")
-    root = ElementTree.fromstring(path.read_bytes())
+    root = ElementTree.fromstring(data)
     for body in root.iter():
         if local(body) != "body":
             continue
         # What stands in the body outside its sections (a title, an epigraph) comes first.
         front = [child for child in body if local(child) != "section"]
-        lines = [text for child in front for text in paragraphs_of(child, {"p", "v", "text-author"})]
+        lines = [text for child in front for text in paragraphs_of(child, {"p", "v", "text-author", "subtitle"})]
         if lines:
             yield from pieces(lines, "front", numbered=False)
         for number, section in enumerate(body.findall("{*}section") or [], 1):
             title = next((" ".join(paragraphs_of(t, {"p", "v"})) for t in section.iter() if local(t) == "title"), "")
-            yield from pieces(paragraphs_of(section, {"p", "v", "text-author"}), title or f"section {number}", numbered=False)
+            yield from pieces(paragraphs_of(section, {"p", "v", "text-author", "subtitle"}),
+                              title or f"section {number}", numbered=False)
 
 
 def converted(path, fmt, work):

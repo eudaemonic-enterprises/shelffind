@@ -423,23 +423,34 @@ def search(db, query, *, root=None, fmt=None, limit=25, exact=False, where="all"
         """Add the documents whose name, folder, title or author holds some words of the query
         and whose text holds the others (`whitham dispersion`: one in the name, one in the page).
         They come before the documents found by their text alone, and after those found by
-        their names, and the page shown is the one that holds the words asked of the text."""
+        their names, and the page shown is the one that holds the words asked of the text. Only
+        documents that have text are looked into. The ways of sharing the words are tried the
+        one with the fewest candidates first, each with its share of the budget of looks and
+        what the others left, so that a word that is in many names cannot take all of it."""
         if len(parts) > MOST:
             return
-        crossed, aimed, budget = set(), targets(parts, close, exact), SHARED
+        crossed, aimed, ways = set(), targets(parts, close, exact), []
         for chosen, rest in shares(len(parts)):
-            if len(crossed) >= limit or budget <= 0:
-                break
             names_expr = " AND ".join(clause(parts, close, index, exact) for index in chosen)
             text_expr = " AND ".join(clause(parts, close, index, exact, True) for index in rest)
             sql = (f"SELECT {COLUMNS} FROM names JOIN files f ON f.id=names.rowid JOIN docs d ON d.id=f.doc "
-                   "WHERE names MATCH ?" + filters + " ORDER BY bm25(names,10.0,3.0,6.0,3.0) LIMIT ?")
-            for row in db.execute(sql, (names_expr, *bindings, LISTED)).fetchall():
+                   "WHERE names MATCH ? AND EXISTS (SELECT 1 FROM pages WHERE pages.doc=d.id)" + filters
+                   + " ORDER BY bm25(names,10.0,3.0,6.0,3.0) LIMIT ?")
+            rows = db.execute(sql, (names_expr, *bindings, LISTED)).fetchall()
+            if rows:
+                ways.append((len(rows), -len(chosen), rest, text_expr, rows))
+        ways.sort(key=lambda way: way[:2])
+        share, carry = max(10, SHARED // max(1, len(ways))), 0
+        for _, _, rest, text_expr, rows in ways:
+            if len(crossed) >= limit:
+                break
+            allowance, spent = share + carry, 0
+            for row in rows:
                 if row["doc"] in crossed or len(crossed) >= limit:
                     continue
-                if budget <= 0:
+                if spent >= allowance:
                     break
-                budget -= 1
+                spent += 1
                 first, last = db.execute("SELECT min(id),max(id) FROM pages WHERE doc=?", (row["doc"],)).fetchone()
                 if first is None:
                     continue
@@ -455,6 +466,7 @@ def search(db, query, *, root=None, fmt=None, limit=25, exact=False, where="all"
                     found_page = db.execute("SELECT page,section FROM pages WHERE id=?", (page[0],)).fetchone()
                     spots[row["doc"]] = (page[0], [aimed[index] for index in rest])
                     item.update(page=found_page["page"], section=found_page["section"])
+            carry = allowance - spent
 
     def ranked():
         """The results so far, the best first, with their copies and their passages."""
