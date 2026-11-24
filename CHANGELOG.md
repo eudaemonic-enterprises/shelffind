@@ -6,7 +6,7 @@ ShelfFind follows semantic versioning. Before version 1.0 a minor version may ch
 JSON keys and the exit codes that other programs rely on are kept from one version to the next and
 are covered by tests.
 
-## 0.4.0 (in preparation)
+## 0.4.0
 
 The text that one machine reads travels to the others. With `share.texts`, each data folder puts
 the pages it read in the shared place of the journals, in parcels of at most 16 MB that unpack to
