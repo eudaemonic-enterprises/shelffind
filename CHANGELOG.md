@@ -20,11 +20,12 @@ gives without any reading when the folder has an rclone twin and which one full 
 otherwise; a file that was never measured is placed by the word of a source that knows the work
 by its checksum. A measure outranks a word: a statement that a measure refutes is dropped,
 whichever file was measured, and `shelffind index` proves what the sources said of each file,
-by the checksum of its storage or by one reading. What a source says is kept with the very file it was said of.
+by the checksum of its storage or by one reading; a statement without checksum only names a work. What a source says is kept with the very file it was said of.
 
 A document is read from a copy of its file made on this machine in one pass, during which the
 checksums are computed: the pages kept are those of the very bytes the checksums describe, and
-only a file measured to hold these bytes completes them. A copy that contradicts the checksum
+only a file measured to hold these bytes completes them. The copies are made in the data folder of
+ShelfFind and removed after use. A copy that contradicts the checksum
 of the storage is made a second time. A failed reading is the fault of the document that the
 file holds, and a file that cannot be copied leaves the document to its other files. An
 inventory alone opens no file. A document whose last file has gone keeps its text for a month,

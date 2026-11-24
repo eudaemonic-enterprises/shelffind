@@ -103,8 +103,11 @@ def structure(db):
             found.append(f"file {file['rel']} is in a document of another size or format")
         mine = (file["sum"] or "").split()
         for key in mine:
+            # (A storage that holds other bytes may give a file the checksum of a document of
+            # another size, or of one known by another checksum: the file cannot be that document.)
             known = holder(db, key, file["format"])
-            if known != file["doc"] and not (known is not None and against(mine, measured(db, known))):
+            if known != file["doc"] and not (known is not None and (
+                    against(mine, measured(db, known)) or docs[known]["size"] != file["size"])):
                 found.append(f"file {file['rel']} was measured {key} and its document is not the one known by it")
         if file["read"] and file["doc"] not in pages:
             found.append(f"file {file['rel']} is marked as read and its document has no pages")
