@@ -354,12 +354,13 @@ def execute(args, db, directory, settings):
                 sys.stderr.flush()
             live = report.Progress(write, lambda: shutil.get_terminal_size(), look(settings, sys.stderr))
         said = live.message if live else lambda s: print(safe(s), file=sys.stderr, flush=True)
+        step = live.document if live else report.Pace(said, PACE).document     # a log gets one line a minute
         place = sharing.carrier(settings) if settings["share.texts"] else None
         try:
             count, failures = indexer.build(
                 db, directory, roots, names_only=args.names_only, ocr=args.ocr, languages=args.lang,
                 retry=args.retry, limit=args.limit, paths=files, relink=args.relink, progress=said,
-                on_document=live.document if live else None,
+                on_document=step,
                 exchange=parcels.Exchange(directory, db, place, said) if place is not None else None)
         finally:
             if live:
@@ -394,6 +395,7 @@ def execute(args, db, directory, settings):
 
 
 SMALL_INDEX = 64 << 20          # an earlier index below this size is converted without being asked
+PACE = 60                       # seconds between two lines that a log gets of a reading
 
 
 def say(text):

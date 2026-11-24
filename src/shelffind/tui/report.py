@@ -126,6 +126,22 @@ def machines(here, last, theme, unicode=True, now=None):
     yield theme.render([("Machines".ljust(10), "muted"), (dot.join(told), None), (dot + when, "muted")])
 
 
+class Pace:
+    """What a log gets of the reading of documents: one line, with the time, when `seconds` have
+    passed since the last, so that a reading of hours can be followed and timed from its log."""
+
+    def __init__(self, say, seconds=60, clock=time.monotonic):
+        self.say, self.seconds, self.clock = say, seconds, clock
+        self.last = None
+
+    def document(self, done, total, name):
+        now = self.clock()
+        if self.last is None or now - self.last >= self.seconds:
+            self.last = now
+            share = f"{100 * done // total}%" if total else ""
+            self.say(f"{time.strftime('%H:%M:%S')}  reading {grouped(done + 1)} of {grouped(total)}  {share}  {safe(name)}")
+
+
 class Progress:
     """One line that follows the reading of documents; messages scroll above it."""
 

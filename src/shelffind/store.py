@@ -439,8 +439,14 @@ def remove_root(db, selector):
 
 
 def available(root):
+    """The folder is there, on the file system it was registered on. A network folder whose
+    program has died answers every question with an error ("Transport endpoint is not
+    connected"): it is unavailable, and that is never a fault of the program."""
     path = Path(root["path"])
-    return path.is_dir() and mount_point(path) == root["mount"]
+    try:
+        return path.is_dir() and mount_point(path) == root["mount"]
+    except OSError:
+        return False
 
 
 def current(db, root):
