@@ -318,6 +318,8 @@ class Exchange:
         self.told, self.entries, self.folders = set(), None, None
         self.began = time.time_ns()             # a file changed since then takes no pages in this run (`unchanged`)
         self.refused = set()                    # documents that took no pages, a file of theirs having changed
+        self.seen = {}                          # (folder, address) -> what told the file apart when this run listed it
+        self.weighed = set()                    # readings found too large, or refused, in this run
         self.bodies, self.kept = {}, 0          # parcels fetched and found whole, for the later rounds of this run
         db.create_function("shelf_crc", 1, crc, deterministic=True)
 
@@ -510,9 +512,10 @@ class Exchange:
             if state.startswith("newer:") and stamp is not None:
                 named[name] = row               # left to a newer version
                 continue
-            if state.startswith("awaited:") and stamp is not None and row["stamp"] == stamp:
+            if state.startswith("awaited:") and stamp is not None and row["stamp"] == stamp \
+                    and not self.again(state, now):
                 if self.awaited(name, told or row, state, stamp, now):
-                    named[name] = told or row   # still the bytes found wrong before: not read again
+                    named[name] = told or row   # still the bytes found wrong before: not read again this time
                 continue
             if state in ("taken", "sending") and stamp is not None and self.whole(row):
                 with self.db:                   # read back, or touched with the same bytes, or put and never named
@@ -520,6 +523,14 @@ class Exchange:
                 named[name] = row
                 if state == "sending":
                     self.counts["sent"] += row["documents"]
+                continue
+            if state == "taken" and stamp is not None and told and told["sha256"] != row["sha256"] and self.whole(told):
+                with self.db:                   # put anew, and named so in the list: what the list says of it stands
+                    self.forget(self.writer, name)
+                if self.take(self.writer, told):
+                    with self.db:
+                        self.db.execute(taken, (stamp, self.writer, name))
+                named[name] = told              # taken, or left to a newer version, or cut: as the list says
                 continue
             if state == "sending":
                 with self.db:                   # never put whole: its documents are given again
@@ -544,6 +555,18 @@ class Exchange:
         if listed is None and (named or spoilt) or listed is not None and (spoilt or fields(listed) != fields(named)
                                                                            or last < self.number):
             self.publish()
+
+    @staticmethod
+    def again(state, now):
+        """Whether a parcel that waits, and is there, is read again at this exchange although
+        nothing of it seems to have changed: at the exchanges numbered by the powers of two, so
+        that a reading that came short is not the last word, and always before it would be named
+        no more."""
+        parts = state.split(":")
+        if len(parts) != 3 or not parts[1].isdigit() or not parts[2].isdigit():
+            return True
+        since, seen = int(parts[1]), int(parts[2])
+        return seen & (seen - 1) == 0 or now - since >= AWAIT and seen + 1 >= AWAITED
 
     def awaited(self, name, parcel, state, stamp, now):
         """Keep a parcel of this data folder named while it is not there, or not as it was put:
@@ -837,9 +860,10 @@ class Exchange:
         """False when a file of the document may hold other bytes than when this run looked at it:
         a file copied for its reading must still be the one copied, and every file of a folder at
         hand must still be a file, not a link, with the size and the date that the inventory
-        saw, and nothing of it may have changed since this run began, which the time of its last
-        change says. A file that is no longer there shows no text, and the next inventory forgets
-        it; a folder out of reach is taken at its word."""
+        saw, nothing of it may have changed since this run began, which the time of its last
+        change says, and it must still be the very file that this run listed, whatever was done
+        to its folder. A file that this run did not list and that is no longer there shows no
+        text, and the next inventory forgets it; a folder out of reach is taken at its word."""
         if self.folders is None:
             self.folders = {root["id"]: Path(root["path"]) if store.available(root) else None for root in store.roots(self.db)}
         for file in self.db.execute("SELECT id,root,rel,size,mtime FROM files WHERE doc=?", (doc,)).fetchall():
@@ -849,14 +873,17 @@ class Exchange:
             folder = self.folders.get(file["root"])
             if folder is None:
                 continue
+            itself = self.seen.get((file["root"], file["rel"]))
             try:
                 info = os.lstat(folder / file["rel"])
             except FileNotFoundError:
+                if itself is not None:
+                    return False                # there when this run listed it, and gone since
                 continue
             except OSError:
                 return False
             if stat.S_ISLNK(info.st_mode) or (info.st_size, info.st_mtime_ns) != (file["size"], file["mtime"]) \
-                    or info.st_ctime_ns > self.began:
+                    or info.st_ctime_ns > self.began or itself is not None and (info.st_dev, info.st_ino) != itself:
                 return False
         return True
 
@@ -891,8 +918,11 @@ class Exchange:
         once."""
         if not self.writing:
             return
+        # A reading found too large, or refused, is weighed again once in each run: what tells it
+        # apart from another of the same bytes counts the text of a page by its compressed length.
         compared = {(row[0], row[1], row[2], row[3]): row[4]
-                    for row in self.db.execute("SELECT md5,sha256,size,format,reading FROM exchange.compared").fetchall()}
+                    for row in self.db.execute("SELECT md5,sha256,size,format,reading,verdict FROM exchange.compared").fetchall()
+                    if row[5] not in ("large", "refused") or (row[0], row[1], row[2], row[3]) in self.weighed}
         changed = []
         for doc in self.db.execute(
                 f"SELECT d.id,d.origin,d.size,d.format,r.reading FROM docs d JOIN ({READING}) r ON r.doc=d.id "
@@ -926,6 +956,7 @@ class Exchange:
                 continue                        # changed meanwhile: compared at the next exchange
             if len(rows) > PAGES:
                 seen.append((*bytes_, reading, "large"))
+                self.weighed.add(bytes_)
                 continue
             shape = store.shape((row["page"], row["section"]) for row in rows)
             recognised = {index for index, row in enumerate(rows) if not row["needs_ocr"]}
@@ -937,6 +968,7 @@ class Exchange:
                              ensure_ascii=False, separators=(",", ":")).encode("utf-8", "replace") + b"\n"
             if document(raw) is None:
                 seen.append((*bytes_, reading, "refused"))
+                self.weighed.add(bytes_)
                 continue                        # what no version that reads it could take
             line = (*bytes_, shape, len(rows), written(set(range(len(rows))) - recognised), reading)
             packer = packer or Packer(self.writer)
@@ -948,6 +980,7 @@ class Exchange:
                     packer, given = Packer(self.writer), []
                 if not packer.add(raw):
                     seen.append((*bytes_, reading, "large"))
+                    self.weighed.add(bytes_)
                     continue                    # too large for a parcel of its own
             given.append(line)
             shipped.setdefault((*bytes_, shape), set()).update(recognised)
@@ -978,7 +1011,7 @@ class Exchange:
             self.tell("The list of this data folder is full: its texts are no longer given")
             return
         with self.db:                           # the number is never given again, whatever is lost afterwards
-            self.db.execute("INSERT OR REPLACE INTO exchange.notes(key,value) VALUES('number',?)", (str(number),))
+            self.db.execute("INSERT OR REPLACE INTO exchange.notes(key,value) VALUES(?,?)", (f"number:{self.writer}", str(number)))
             self.remember(self.writer, parcel, "sending")
             self.db.executemany("INSERT INTO exchange.entries(writer,name,line,md5,sha256,size,format,layout,pages,blanks) "
                                 "VALUES(?,?,?,?,?,?,?,?,?,?)", [(self.writer, parcel["name"], line, *told[:7])

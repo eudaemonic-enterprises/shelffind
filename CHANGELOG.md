@@ -43,6 +43,9 @@ exit codes 3 and 4 mean that something is not there, and a list of files that ca
 stops the exchange. The comparison of readings rests on a mixing that tells apart readings that
 differ only by which pages are recognised, and each document takes first the reading that
 leaves the fewest pages to recognise. Parcels found whole are kept for the later rounds of a run.
+A file must still be the very file that the inventory of the run listed, whatever was done to its
+folder, a parcel that waits is read again from time to time and before it is named no more, and
+a reading found too large or refused is weighed again in each run.
 
 When a file read by version 0.2 joins a document read since, the two readings are joined page by
 page when they have the same pages, and otherwise the one that recognised more pages is kept: a

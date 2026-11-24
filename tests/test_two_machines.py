@@ -1404,6 +1404,101 @@ class Fifth(Two):
         self.assertEqual(self.build("office", limit=0)[1]["received"], 1)
 
 
+class Sixth(Two):
+    """What the sixth reviews of the exchange found."""
+
+    def test_a_known_parcel_put_anew_in_a_newer_format_keeps_what_its_list_says(self):
+        self.shelf()
+        self.build("home")
+        self.assertTrue(self.exchange("home").run("receive"))         # read back, and known by its size and date
+        writer = self.writer("home")
+        parcel = self.parcels_of("home")[0]
+        with patch.object(parcels, "FORMAT", 2):        # put anew by a newer version of this data folder
+            packer = parcels.Packer(writer)
+        packer.add(json.dumps(self.line("Waves/tides.txt", [[None, None, TEXTS["Waves/tides.txt"], 0]])).encode() + b"\n")
+        data = packer.close()
+        parcel.write_bytes(data)
+        listing = self.shared / "texts" / f"{writer}.json"
+        told = json.loads(listing.read_text())
+        told["parcels"][0].update(size=len(data), sha256=hashlib.sha256(data).hexdigest(), documents=1)
+        listing.write_text(json.dumps(told))
+        self.assertTrue(self.exchange("home").run("receive", "send"))
+        named = {entry["name"][-15:]: entry for entry in self.listed("home")["parcels"]}
+        self.assertEqual(named["000001.jsonl.gz"]["sha256"], hashlib.sha256(data).hexdigest())
+
+    def test_a_folder_put_in_place_of_another_while_pages_come_gives_its_files_none(self):
+        self.shelf()
+        self.build("home")
+        office = self.machines["office"]
+        self.measure("office")
+        prepared = self.base / "prepared" / "Waves"     # made before the run: the same names, sizes and dates
+        prepared.mkdir(parents=True)
+        for rel, text in (("tides.txt", TEXTS["Waves/tides.txt"].replace("northern", "southern")),
+                          ("winds.txt", TEXTS["Waves/winds.txt"])):
+            (prepared / rel).write_text(text)
+            os.utime(prepared / rel, (WHEN, WHEN))
+        real, done = parcels.Exchange.fetch, []
+
+        def fetch(exchange, parcel):
+            if not done:
+                done.append(True)
+                (office["shelf"] / "Waves").rename(self.base / "Waves-before")
+                prepared.rename(office["shelf"] / "Waves")
+            return real(exchange, parcel)
+
+        self.forbidden.add("office")
+        with patch.object(parcels.Exchange, "fetch", fetch):
+            self.assertEqual(self.build("office", names_only=True)[1], counts(received=2))
+        self.assertEqual((self.pages("office", "Waves/tides.txt"), self.found("office", "northern harbours")), ([], []))
+
+    def test_a_parcel_that_waits_after_a_short_reading_is_read_again_and_stays_named(self):
+        self.shelf()
+        self.build("home")
+        parcel = self.parcels_of("home")[0]
+        whole = parcel.read_bytes()
+        for path in self.machines["home"]["data"].glob(parcels.KEEPING + "*"):
+            path.unlink()                               # the bookkeeping lost,
+        with self.at("home"):                           # and the documents gone from this machine
+            store.remove_root(self.machines["home"]["db"], "Shelf")
+        real = sharing.Folder.get
+
+        def get(place, name, limit=None):
+            return whole[:-1] if name.endswith(".jsonl.gz") else real(place, name, limit)
+
+        with patch.object(sharing.Folder, "get", get):  # read short, twice, at the first look
+            self.assertTrue(self.exchange("home").run("receive"))
+        self.assertTrue(self.exchange("home").run("receive"))        # read again, and found whole
+        later = time.time() + parcels.AWAIT + 60
+        with patch("shelffind.parcels.time.time", return_value=later), patch.object(parcels, "AWAITED", 1):
+            self.assertTrue(self.exchange("home").run("receive"))
+        self.assertEqual(len(self.listed("home")["parcels"]), 1)
+        self.forbidden.add("office")
+        self.assertEqual(self.build("office")[1], counts(received=4))
+
+    def test_a_reading_found_too_large_is_weighed_again_in_another_run(self):
+        self.shelf(on=("home",))
+        home = self.machines["home"]
+        with self.at("home"):                           # read, with nothing shared yet
+            indexer.build(home["db"], home["data"], store.roots(home["db"]), progress=lambda _: None)
+        told = self.exchange("home")
+        self.assertTrue(told.run("receive"))            # the bookkeeping is made: a reading was once found too large
+        with contextlib.closing(sqlite3.connect(home["data"] / parcels.KEEPING)) as db, db:
+            tides = home["db"].execute("SELECT d.id,d.origin,d.size,d.format FROM docs d JOIN files f ON f.doc=d.id "
+                                       "WHERE f.rel='Waves/tides.txt'").fetchone()
+            reading = home["db"].execute(f"SELECT reading FROM ({parcels.READING}) WHERE doc=?", (tides["id"],)).fetchone()[0]
+            keys = store.sums(tides["origin"])
+            db.execute("INSERT INTO compared(md5,sha256,size,format,reading,verdict) VALUES(?,?,?,?,?,'large')",
+                       (keys["md5"], keys["sha256"], tides["size"], tides["format"], reading))
+        self.assertEqual(self.build("home")[1]["sent"], 4)          # weighed again in this run, and given
+
+    def test_the_last_number_given_is_kept_under_the_name_of_its_writer(self):
+        self.shelf()
+        self.build("home")
+        with contextlib.closing(sqlite3.connect(self.machines["home"]["data"] / parcels.KEEPING)) as db:
+            notes = dict(db.execute("SELECT key,value FROM notes WHERE key LIKE 'number%'").fetchall())
+        self.assertEqual(notes, {f"number:{self.writer('home')}": "1"})
+
+
 class Counting(sharing.Folder):
     """A shared folder that counts the parcels fetched from it."""
 

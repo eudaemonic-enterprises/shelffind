@@ -454,7 +454,9 @@ def terms_for_name(name):
     return name if divided == name else name + " " + divided
 
 
-def inventory(root, exclude):
+def inventory(root, exclude, seen=None):
+    """The regular files of a folder, as relative address -> (size, date); with `seen`, what tells
+    each file itself apart from another put at its address is kept there too: (device, inode)."""
     base = Path(root["path"])
     if not available(root):
         raise OSError(f"Root unavailable: {base}")
@@ -473,6 +475,8 @@ def inventory(root, exclude):
                 # SQLite TEXT expects Unicode. Files with undecodable names get a visible error.
                 relative.encode("utf-8")
                 entries[relative] = (info.st_size, info.st_mtime_ns)
+                if seen is not None:
+                    seen[relative] = (info.st_dev, info.st_ino)
     if not available(root) or not os.path.samestat(initial, base.stat()):
         raise OSError(f"Root changed while reading: {base}")
     return entries
@@ -1101,9 +1105,13 @@ def tend_orphans(db, root=None, now=None, forget=True):
             f"SELECT id FROM docs WHERE gone IS NOT NULL AND (({bare}) OR gone<?)", (now - KEEP,)).fetchall()))
 
 
-def scan(db, root, directory):
-    """Only a complete enumeration may retire an indexed path."""
-    entries = inventory(root, directory.resolve())
+def scan(db, root, directory, seen=None):
+    """Only a complete enumeration may retire an indexed path. With `seen`, what tells each file
+    of the folder apart from another put at its address is kept there, by (folder, address)."""
+    found = {} if seen is not None else None
+    entries = inventory(root, directory.resolve(), found)
+    if seen is not None:
+        seen.update({(root["id"], rel): itself for rel, itself in found.items()})
     existing = {r["rel"]: r for r in db.execute("SELECT * FROM files WHERE root=?", (root["id"],))}
     known = set()
     with db:

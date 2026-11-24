@@ -550,7 +550,7 @@ def build(db, directory, selected, *, names_only=False, ocr=False, languages="en
                 failures += 1
                 continue
             try:
-                count = store.scan(db, root, directory)
+                count = store.scan(db, root, directory, exchange.seen if exchange is not None else None)
                 ready.append(root)
                 progress(f"{root['path']}: {count:,} file names")
             except (OSError, UnicodeError) as exc:
