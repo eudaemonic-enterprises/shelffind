@@ -185,13 +185,13 @@ class Journals(Machines):
         with self.assertRaises(ValueError):
             sharing.Rclone("cloud:Shared", program=str(self.base / "no-such-program")).names("machines")
 
-    @unittest.skipUnless(shutil.which("rclone"), "rclone is not installed")
     def test_what_rclone_says_went_wrong_is_its_last_line_and_not_a_notice(self):
         notice = "2026/11/24 09:42:05 NOTICE: Config file \"rclone.conf\" not found - using defaults"
         self.assertEqual(sharing.Rclone.fault(notice), "rclone: it stopped without saying why")
         self.assertEqual(sharing.Rclone.fault(notice + "\n2026/11/24 09:42:06 ERROR : write: no space left on device\n"),
                          "rclone: 2026/11/24 09:42:06 ERROR : write: no space left on device")
 
+    @unittest.skipUnless(shutil.which("rclone"), "rclone is not installed")
     def test_the_real_rclone_on_a_folder_of_this_machine(self):
         place = sharing.Rclone(str(self.base / "by-rclone"))
         self.assertEqual((place.names("machines"), place.get("machines/none.json")), ([], None))
