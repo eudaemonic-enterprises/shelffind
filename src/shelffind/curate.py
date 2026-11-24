@@ -3,8 +3,7 @@
 no source knows, and the files whose name does not show the work that a source says they are."""
 from pathlib import Path
 
-from . import fuzzy, store
-from .extract import SUPPORTED
+from . import extract, fuzzy, store
 
 
 def places(db, root=None):
@@ -38,7 +37,7 @@ def unlinked(db, root=None, source=None):
             "SELECT f.root,f.rel,f.size,f.format,d.state FROM files f JOIN docs d ON d.id=f.doc WHERE NOT EXISTS "
             f"(SELECT 1 FROM records r WHERE r.doc=f.doc{only}) ORDER BY f.root,f.rel",
             (source,) if source else ()):
-        if row["root"] in wanted and row["format"] in SUPPORTED:
+        if row["root"] in wanted and row["format"] in extract.formats():
             found.append({"path": str(Path(wanted[row["root"]]) / row["rel"]), "size": row["size"], "state": row["state"]})
     return found
 

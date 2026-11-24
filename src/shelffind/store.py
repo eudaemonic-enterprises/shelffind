@@ -49,9 +49,9 @@ import time
 import zlib
 from pathlib import Path
 
-from . import fuzzy
+from . import extract, fuzzy
 from .config import expand
-from .extract import SUPPORTED, file_format
+from .extract import file_format
 
 INDEX, EARLIER = "index2.sqlite3", "index.sqlite3"
 FORMAT = 3
@@ -490,7 +490,7 @@ def inventory(root, exclude, seen=None):
 
 def new_document(db, size, fmt):
     """A document of its own for a file whose content no known document is proved to share."""
-    state = "pending" if fmt in SUPPORTED else "name-only"
+    state = "pending" if fmt in extract.formats() else "name-only"
     return db.execute("INSERT INTO docs(size,format,state) VALUES(?,?,?)", (size, fmt, state)).lastrowid
 
 
@@ -608,8 +608,8 @@ def blanks(db, doc):
 def unread(db, doc):
     """A document has lost its pages: it waits for a reading again."""
     db.execute("UPDATE docs SET state=CASE WHEN state='covered' THEN 'covered' WHEN format IN "
-               f"({','.join('?' * len(SUPPORTED))}) THEN 'pending' ELSE 'name-only' END,error=NULL,origin=NULL WHERE id=?",
-               (*sorted(SUPPORTED), doc))
+               f"({','.join('?' * len(extract.formats()))}) THEN 'pending' ELSE 'name-only' END,error=NULL,origin=NULL WHERE id=?",
+               (*sorted(extract.formats()), doc))
     db.execute("UPDATE files SET read=0 WHERE doc=?", (doc,))
 
 
@@ -868,7 +868,7 @@ def taker(db, keys, size, fmt, holding=()):
     `keys` (an MD5 and a SHA-256), of this size and format: the one that a measure knows by
     them, with a file, waiting for its text, and whose text no source among `holding` answers
     for. None when there is none, or when a measure contradicts these checksums."""
-    if fmt not in SUPPORTED:
+    if fmt not in extract.formats():
         return None
     wrong, doc = refuted(db, size, fmt, keys)
     if wrong or doc is None:
@@ -1121,6 +1121,10 @@ def scan(db, root, directory, seen=None):
     existing = {r["rel"]: r for r in db.execute("SELECT * FROM files WHERE root=?", (root["id"],))}
     known = set()
     with db:
+        # A format that is read since the files were listed (a new version, or a converter that
+        # the settings now name): its documents wait for their text.
+        marks = ",".join("?" * len(extract.formats()))
+        db.execute(f"UPDATE docs SET state='pending' WHERE state='name-only' AND format IN ({marks})", sorted(extract.formats()))
         fresh = []
         for rel, (size, mtime) in entries.items():
             old = existing.pop(rel, None)

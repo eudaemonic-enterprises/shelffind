@@ -11,8 +11,8 @@ import time
 from contextlib import closing
 from pathlib import Path
 
-from . import (__version__, config, curate, desktop, doctor, helptext, indexer, machine, migrate, parcels, sharing, shell,
-               sources, store)
+from . import (__version__, config, curate, desktop, doctor, extract, helptext, indexer, machine, migrate, parcels, sharing,
+               shell, sources, store)
 from .picker import panel
 from .text import json_text, safe
 from .tui import report, style
@@ -430,6 +430,7 @@ def configuration(args, directory, explicit):
     settings = config.load(directory, explicit)
     sources.declare(settings.tables["sources"])
     store.declare(settings.tables["roots"])
+    extract.declare(settings.tables["convert"])
     settings.keymap()
     for name, roles in settings.tables["theme"].items():
         for role, spec in roles.items():
@@ -482,6 +483,7 @@ def main(argv=None):
                 settings = config.load(directory, explicit)
                 sources.declare(settings.tables["sources"])
                 store.declare(settings.tables["roots"])
+                extract.declare(settings.tables["convert"])
             except ValueError as fault:
                 if args.command in ("search", "pick"):
                     raise

@@ -67,6 +67,7 @@ TABLES = {
     "theme": "Colours by role, one table per theme.",
     "sources": "Outside sources: [sources.NAME] command = [\"program\", \"argument\"].",
     "roots": "Document folders: [roots.NAME] path = \"~/Books\", and remote = \"cloud:Books\" for its rclone twin.",
+    "convert": "Formats read by a program: [convert.doc] command = [\"antiword\", \"{path}\"], which prints the text.",
 }
 VARIABLE = re.compile(r"\$(?:\{(\w+)\}|(\w+))")
 
@@ -200,7 +201,11 @@ class Settings:
                              "sources": isinstance(content, dict),
                              "roots": isinstance(content, dict) and isinstance(content.get("path"), str)
                              and content["path"] and all(isinstance(v, str) for v in content.values())
-                             and set(content) <= {"path", "remote"}}[name]
+                             and set(content) <= {"path", "remote"},
+                             "convert": isinstance(content, dict) and set(content) == {"command"} and isinstance(
+                                 content["command"], list) and content["command"] and all(
+                                 isinstance(w, str) for w in content["command"]) and any(
+                                 "{path}" in w for w in content["command"])}[name]
                     if not sound:
                         raise ConfigError(f"{origin}: [{name}] {inner} = {content!r} is not valid")
                     self.tables[name][inner] = content

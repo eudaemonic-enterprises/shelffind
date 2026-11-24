@@ -227,7 +227,7 @@ def document(raw):
     except (ValueError, KeyError, TypeError, RecursionError):
         return None
     if not (isinstance(md5, str) and MD5.match(md5) and isinstance(sha, str) and SHA.match(sha)
-            and type(size) is int and 0 <= size < BIG and isinstance(fmt, str) and fmt in extract.SUPPORTED
+            and type(size) is int and 0 <= size < BIG and isinstance(fmt, str) and fmt in extract.formats()
             and isinstance(pages, list) and 0 < len(pages) <= PAGES):
         return None
     clean = []
@@ -942,7 +942,7 @@ class Exchange:
                 "WHERE instr(d.origin,?)>0 AND instr(d.origin,?)=0 AND EXISTS (SELECT 1 FROM files f WHERE f.doc=d.id) "
                 "ORDER BY d.id", (store.SEALED, store.INHERITED)).fetchall():
             keys = store.sums(doc["origin"])
-            if set(keys) != {"md5", "sha256"} or doc["format"] not in extract.SUPPORTED:
+            if set(keys) != {"md5", "sha256"} or doc["format"] not in extract.formats():
                 continue
             bytes_ = (keys["md5"], keys["sha256"], doc["size"], doc["format"])
             if compared.get(bytes_) != doc["reading"]:
