@@ -1,6 +1,7 @@
 # Copyright 2026 Eudaemonic Enterprises Inc.
 """HTML, Word, OpenDocument, FB2, Typst and BibTeX documents, and formats read by a program of the
 user's choice."""
+import os
 import unittest
 from pathlib import Path
 from unittest.mock import patch
@@ -88,6 +89,134 @@ class Formats(Shelf):
             self.assertEqual(self.db.execute("SELECT state FROM docs").fetchone()[0], "name-only")
         self.assertEqual(self.build(), (1, 0))
         self.assertTrue(self.found("lanterns swing"))
+
+
+class Faults(Shelf):
+    """What a review found: readers that lost or doubled text, and what a removed converter left."""
+
+    def found(self, query):
+        return [(row["name"], row["section"]) for row in search(self.db, query, where="text")]
+
+    def test_an_html_page_whose_head_is_not_closed_keeps_its_body_and_its_title(self):
+        (self.root / "open.html").write_text("<html><head><title>Tide tables</title><body><p>Hello world body text</p>")
+        self.assertEqual(self.build(), (1, 0))
+        self.assertTrue(self.found('"hello world body text"'))
+        self.assertTrue(self.found("tide tables"))
+
+    def test_html_blocks_do_not_run_their_words_together(self):
+        (self.root / "blocks.html").write_text(
+            "<table><tr><th>Name</th><th>Age</th></tr></table><dl><dt>Term</dt><dd>Definition</dd></dl>"
+            "<h4>Subsection</h4>Following text<blockquote>Quoted</blockquote>after<pre>code</pre>tail"
+            "<template><p>hidden template</p></template><noscript>hidden fallback</noscript>")
+        self.assertEqual(self.build(), (1, 0))
+        for word in ("age", "definition", "following", "after", "tail"):
+            self.assertTrue(self.found(word), word)
+        self.assertFalse(self.found("nameage") or self.found("termdefinition") or self.found("subsectionfollowing"))
+        self.assertFalse(self.found("template") or self.found("fallback"))
+
+    def test_a_text_box_a_nested_paragraph_deleted_words_and_field_codes_in_a_docx(self):
+        mc = "http://schemas.openxmlformats.org/markup-compatibility/2006"
+        body = (f'<w:document xmlns:w="{W}" xmlns:mc="{mc}"><w:body>'
+                f'<w:p><w:r><w:t>Before box.</w:t></w:r><mc:AlternateContent><mc:Choice><w:txbxContent>'
+                f'<w:p><w:r><w:t>Box text</w:t></w:r></w:p></w:txbxContent></mc:Choice><mc:Fallback><w:pict>'
+                f'<w:p><w:r><w:t>Box text</w:t></w:r></w:p></w:pict></mc:Fallback></mc:AlternateContent>'
+                f'<w:r><w:t>After box.</w:t></w:r></w:p>'
+                f'<w:p><w:del><w:r><w:delText>deleted words</w:delText></w:r></w:del><w:r><w:instrText>PAGEREF _Toc12345</w:instrText></w:r>'
+                f'<w:r><w:t>Kept words</w:t></w:r></w:p></w:body></w:document>')
+        with ZipFile(self.root / "box.docx", "w") as z:
+            z.writestr("word/document.xml", body)
+        self.assertEqual(self.build(), (1, 0))
+        text = " ".join(store_text(self.db))
+        self.assertEqual(text.count("Box text"), 1)
+        self.assertNotIn("box.Box", text)
+        self.assertIn("Before box.", text)
+        self.assertIn("After box.", text)
+        self.assertIn("Kept words", text)
+        self.assertFalse(self.found("deleted") or self.found("pageref"))
+
+    def test_an_odt_footnote_is_a_passage_of_its_own_and_does_not_glue_to_its_paragraph(self):
+        body = (f'<office:document-content xmlns:office="urn:oasis:names:tc:opendocument:xmlns:office:1.0" xmlns:text="{T}">'
+                f'<office:body><office:text><text:p>The wave equation<text:note><text:note-citation>1</text:note-citation>'
+                f'<text:note-body><text:p>See Whitham</text:p></text:note-body></text:note> is hyperbolic.</text:p>'
+                f'</office:text></office:body></office:document-content>')
+        with ZipFile(self.root / "note.odt", "w") as z:
+            z.writestr("content.xml", body)
+        self.assertEqual(self.build(), (1, 0))
+        text = "\n".join(store_text(self.db))
+        self.assertIn("The wave equation is hyperbolic.", text)
+        self.assertEqual(text.count("See Whitham"), 1)
+        self.assertNotIn("equation1See", text)
+
+    def test_an_fb2_title_outside_its_sections_is_kept_and_a_large_one_is_refused_by_its_size(self):
+        (self.root / "front.fb2").write_text(
+            '<FictionBook><body><title><p>Collected tales</p></title><section><p>Lanterns swing.</p></section></body></FictionBook>')
+        self.assertEqual(self.build(), (1, 0))
+        self.assertTrue(self.found("collected tales"))
+        with patch.object(extract, "MAX_XML", 100):
+            with self.assertRaisesRegex(ValueError, "exceeds 32 MiB"):
+                list(extract.fb2_pages(self.root / "front.fb2"))
+
+    def test_a_document_of_a_format_no_longer_read_is_not_read_as_plain_text(self):
+        folder = self.fake_tool("shout", 'tr a-z A-Z < "$1"\n')
+        extract.declare({"zzz": {"command": [str(folder / "shout"), "{path}"]}})
+        self.addCleanup(extract.declare, {})
+        (self.root / "note.zzz").write_bytes(b"\x00\x01\x02 binary")
+        self.build(names_only=True)
+        self.assertEqual(self.db.execute("SELECT state FROM docs").fetchone()[0], "pending")
+        extract.declare({})
+        self.build(names_only=True)
+        self.assertEqual(self.db.execute("SELECT state FROM docs").fetchone()[0], "name-only")
+        self.assertEqual(self.build(), (0, 0))
+        with self.assertRaisesRegex(ValueError, "No program reads the format zzz"):
+            list(extract.passages(self.root / "note.zzz", "zzz", self.base))
+
+    def test_a_format_read_through_a_converter_ranks_like_the_documents_that_ShelfFind_reads(self):
+        folder = self.fake_tool("keep", 'cat "$1"\n')
+        extract.declare({"xlsx": {"command": [str(folder / "keep"), "{path}"]}})
+        self.addCleanup(extract.declare, {})
+        (self.root / "weak.txt").write_text("lantern " + "filler " * 800)
+        (self.root / "strong.xlsx").write_text("lantern lantern lantern lantern")
+        self.assertEqual(self.build(), (2, 0))
+        order = [r["name"] for r in search(self.db, "lantern", where="text")]
+        self.assertEqual(order[0], "strong.xlsx")
+
+    def test_a_converter_given_by_a_relative_address_is_found_from_where_it_was_asked_for(self):
+        folder = self.fake_tool("hello", "echo hello from the converter\n")
+        here = os.getcwd()
+        os.chdir(folder)
+        self.addCleanup(os.chdir, here)
+        elsewhere = self.base / "elsewhere"
+        elsewhere.mkdir()
+        self.assertEqual(extract.run_tool(["./hello"], elsewhere).strip(), "hello from the converter")
+
+    def test_several_programs_run_at_once_only_where_they_are_limited_by_prlimit(self):
+        with patch("shelffind.extract.shutil.which", return_value="/usr/bin/prlimit"):
+            self.assertEqual(extract.threads(4), 4)
+        with patch("shelffind.extract.shutil.which", return_value=None):
+            self.assertEqual(extract.threads(4), 1)
+
+    def test_the_words_of_a_long_query_are_shared_with_all_but_one_first_and_a_query_of_many_is_not_shared(self):
+        from shelffind import search as engine
+        six = engine.shares(6)
+        self.assertEqual(six[0], ((1, 2, 3, 4, 5), (0,)))
+        self.assertEqual(six[6], ((0,), (1, 2, 3, 4, 5)))
+        (self.root / "Whitham-Notes.txt").write_text("dispersion " * 3)
+        self.build()
+        words = " ".join(["whitham dispersion"] + [f"extra{n}" for n in range(engine.MOST)])
+        self.assertFalse([r for r in search(self.db, words) if r["match"] == "name and passage"])
+
+    def test_the_empty_query_keeps_the_order_of_the_most_recent_files(self):
+        newest, second = self.root / "zzz-newest.py", self.root / "aaa-second.png"
+        for path, when in ((self.root / "old.txt", 1_600_000_000), (second, 1_700_000_000), (newest, 1_800_000_000)):
+            path.write_text("x " + path.name)
+            os.utime(path, (when, when))
+        self.build()
+        self.assertEqual([r["name"] for r in search(self.db, "", limit=3)], ["zzz-newest.py", "aaa-second.png", "old.txt"])
+
+
+def store_text(db):
+    """The text of every page of an index, in the order of the pages."""
+    return [store.inflate(row["ztext"]) for row in db.execute("SELECT ztext FROM pages ORDER BY id")]
 
 
 class Converters(Shelf):

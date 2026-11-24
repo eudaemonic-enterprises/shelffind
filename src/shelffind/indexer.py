@@ -579,6 +579,7 @@ def recognised(source, fmt, work, blanks, languages, workers):
     """The pages to recognise with their text, in the order of the pages. With `workers` above
     one, the next pages are recognised while the one before is kept; a fault, or an interruption,
     comes in its turn, after the pages before it have been kept, and what is not begun is given up."""
+    workers = extract.threads(workers)
     if workers <= 1:
         for page in blanks:
             yield page, extract.recognize(source, fmt, work, page["page"], languages)

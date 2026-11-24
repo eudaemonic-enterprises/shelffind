@@ -15,7 +15,12 @@ reading spent most of its time waiting. The files of the documents that come nex
 copied, four at a time by default (`index.workers`, from 1 to 16), while a document is read; each
 copy is checked as before, against the checksum of the storage and against the file as the
 inventory saw it, and the index that results is the one of a reading that copies one file at a
-time, which the tests verify on the same shelves and on random histories. The pages of a
+time, which the tests verify on the same shelves and on random histories. The copies held ahead
+are at most a quarter of the room that is free and never more files than the limit of the run
+allows; a copy that could not be placed is made again, alone, once the others are given up, so that
+a disk with little room does not stop a reading that one file at a time finishes. The copy of a
+file is named after it with every character that a shell would take for an order put down, so
+that a file name cannot run a command through a converter written with a shell. The pages of a
 scanned document are recognised several at once and kept in the order of the pages, so that an
 interruption keeps all those before it, and the DjVu pages that must be asked for one by one are
 read at once. Programs are limited by `prlimit` where it exists, which lets several run at
@@ -38,18 +43,23 @@ its work kept.
 Search. A query whose words are shared between the name of a document (its name, folder, title
 or author) and its text finds the document: `whitham dispersion` where one word is in the name
 and the other only in a page. The words are shared in every way that leaves each side
-something, the ways that give the name more words first; such a document is listed after those
+something, the ways that give the name more words first (beyond five words, only the ways that
+give it one word, or all but one, and a query of more than eight words is not shared, so that a
+keystroke stays quick); such a document is listed after those
 found by their names and before those found by their text alone, at the page that holds the
-words asked of the text. Among matches of the same kind, documents come before the programs,
-pictures and data that some folders hold, and a program whose name is the query is no longer
-put before the documents that have it in their names.
+words asked of the text. Among matches of the same kind, documents (the formats that are read, converters included) come
+before the programs, pictures and data that some folders hold, and a program whose name is the
+query is no longer put before the documents that have it in their names.
 
 Formats. HTML, Word (`docx`), OpenDocument (`odt`), FB2, Typst and BibTeX documents are read.
 A document without pages is cut into passages of about six thousand characters made of whole
-paragraphs, each named after its section, and an archive that unpacks to more than 64 MB is
-refused. Any other format is read through a program named in the settings, `[convert.FORMAT]
+paragraphs, each named after its section, and an archive that unpacks to more than 64 MB, or XML of more than 32 MB, is
+refused. What a word processor's file does not show (deleted words, field codes, the second copy
+of a text box) is not indexed, a footnote is a passage of its own, and an HTML page keeps its
+title and its body whether or not its head was closed. Any other format is read through a program named in the settings, `[convert.FORMAT]
 command = ["program", "{path}"]`, which prints the text. Files already listed in a format that
-is read since wait for their text from the next inventory on.
+is read since wait for their text from the next inventory on, and the documents of a format that is
+no longer read, a converter removed from the settings, go back to their names.
 
 Machines. The line of `status` on the machines also says when this data folder last exchanged
 texts, apart from the journals. The settings can name the machines by label, `[machines] LABEL = "office"`, so that

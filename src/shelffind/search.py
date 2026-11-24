@@ -4,7 +4,7 @@ import itertools
 import re
 from pathlib import Path
 
-from . import fuzzy, store
+from . import extract, fuzzy, store
 
 # Passages are ranked exactly when at most this many pages match. Beyond it the words are too
 # common for that to be done in good time: pages taken at regular intervals across the whole
@@ -22,6 +22,7 @@ LISTED = 300
 DOCUMENTS = frozenset("pdf djvu ps ps.gz epub txt md rst tex bib typ doc docx odt rtf html htm fb2 mobi azw3 chm "
                       "ppt pptx".split())
 SHARES = 5              # beyond this many words, only one word, or all but one, goes to the name
+MOST = 8                # a query of more words than this is not shared between the name and the text
 # In the text only the last word of a query may be the beginning of a longer one, and only
 # from this many letters: completing every short word of a large collection costs seconds.
 PREFIX = 4
@@ -77,7 +78,7 @@ def shares(count):
     if count <= SHARES:
         names = [chosen for size in range(count - 1, 0, -1) for chosen in itertools.combinations(indexes, size)]
     else:
-        names = [(index,) for index in indexes] + [tuple(other for other in indexes if other != index) for index in indexes]
+        names = [tuple(other for other in indexes if other != index) for index in indexes] + [(index,) for index in indexes]
     return [(chosen, tuple(index for index in indexes if index not in chosen)) for chosen in names]
 
 
@@ -423,6 +424,8 @@ def search(db, query, *, root=None, fmt=None, limit=25, exact=False, where="all"
         and whose text holds the others (`whitham dispersion`: one in the name, one in the page).
         They come before the documents found by their text alone, and after those found by
         their names, and the page shown is the one that holds the words asked of the text."""
+        if len(parts) > MOST:
+            return
         crossed, aimed, budget = set(), targets(parts, close, exact), SHARED
         for chosen, rest in shares(len(parts)):
             if len(crossed) >= limit or budget <= 0:
@@ -459,12 +462,14 @@ def search(db, query, *, root=None, fmt=None, limit=25, exact=False, where="all"
             # A document opened often moves up among the matches of its own kind, never past
             # a better kind of match.
             score, item = entry
-            kind = int(score)
-            plain = item["format"] not in DOCUMENTS
+            base = kind = int(score)
+            plain = item["format"] not in DOCUMENTS and item["format"] not in extract.formats()
             # A program or a picture whose name is the query is not put before the documents that
             # have it in their names.
-            return (max(kind, 1) if plain else kind, plain,
-                    score - kind - min(0.9, 0.3 * (often or {}).get(item["doc"], 0)), item["path"])
+            if plain and base == 0 and item["match"] == "name or path":
+                kind = 1
+            return (kind, plain,
+                    score - base - min(0.9, 0.3 * (often or {}).get(item["doc"], 0)), item["path"])
         listed = sorted(found.values(), key=order)
         if where == "all" and len(listed) > limit:
             # Names would fill the list alone: a third of it is kept for passages, which no key

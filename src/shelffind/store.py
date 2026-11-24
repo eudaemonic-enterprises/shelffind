@@ -1125,6 +1125,10 @@ def scan(db, root, directory, seen=None):
         # the settings now name): its documents wait for their text.
         marks = ",".join("?" * len(extract.formats()))
         db.execute(f"UPDATE docs SET state='pending' WHERE state='name-only' AND format IN ({marks})", sorted(extract.formats()))
+        # And the reverse: a format that is no longer read (a converter removed from the settings)
+        # leaves its documents that were never read, or failed, to their names.
+        db.execute(f"UPDATE docs SET state='name-only',error=NULL WHERE state IN ('pending','error') AND format NOT IN ({marks}) "
+                   "AND NOT EXISTS (SELECT 1 FROM pages WHERE pages.doc=docs.id)", sorted(extract.formats()))
         fresh = []
         for rel, (size, mtime) in entries.items():
             old = existing.pop(rel, None)

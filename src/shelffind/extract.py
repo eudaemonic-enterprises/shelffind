@@ -26,6 +26,12 @@ CHUNK = 6000            # characters of a passage of a document that has no page
 CONVERTERS = {}
 
 
+def threads(wanted):
+    """How many programs may run at once: as many as wanted where `prlimit` limits them, and
+    one where a hook in each new process would do it, which Python does not allow among threads."""
+    return wanted if shutil.which("prlimit") else 1
+
+
 def declare(converters):
     """Take the [convert.FORMAT] tables of the settings: command = ["program", "{path}"]."""
     CONVERTERS.clear()
@@ -56,8 +62,10 @@ def run_tool(argv, work):
     """Run a program on a document and return what it printed. Its output file and its dumps of
     memory are limited: by `prlimit` where it exists, which leaves the program free to run several
     at once, and otherwise by a hook that runs in the new process."""
-    if shutil.which(argv[0]) is None:
+    found = shutil.which(argv[0])
+    if found is None:
         raise ValueError(f"Required program is missing: {argv[0]}")
+    argv = [os.path.abspath(found), *argv[1:]] if os.sep in argv[0] else argv    # the program runs in another folder
     limit = shutil.which("prlimit")
     command = [limit, f"--fsize={512 << 20}", "--core=0", "--", *argv] if limit else argv
     # Tesseract works with as many threads as it finds processors; the pages are read in parallel here.
@@ -86,26 +94,50 @@ class Passage:
     needs_ocr: bool = False
 
 
+BLOCKS = frozenset("p div br hr li ul ol dl dt dd h1 h2 h3 h4 h5 h6 tr th td table thead tbody tfoot caption blockquote "
+                   "pre section article header footer nav aside main figure figcaption address form fieldset details "
+                   "summary".split())     # where a line ends: the words on either side are not one word
+HIDDEN = frozenset({"script", "style", "template", "noscript"})     # what is not text of the page
+IN_HEAD = frozenset({"title", "meta", "link", "base", "script", "style", "noscript", "template"})
+
+
 class ChapterText(HTMLParser):
+    """The text of an HTML page or of a chapter of an EPUB, in lines: its scripts, styles, templates
+    and metadata are left out, and its title is kept. The head ends at its end tag, or where a tag
+    that cannot be in a head begins, since the end tag may be omitted."""
+
     def __init__(self):
         super().__init__()
         self.parts = []
         self.hidden = 0
+        self.head = False
+        self.title = False
 
     def handle_starttag(self, tag, attrs):
-        if tag in {"script", "style", "head"}:
+        if tag == "head":
+            self.head = True
+        elif self.head and tag not in IN_HEAD:
+            self.head = False
+        if tag == "title":
+            self.title = True
+        if tag in HIDDEN:
             self.hidden += 1
-        if tag in {"p", "div", "br", "li", "h1", "h2", "h3", "tr"}:
+        if tag in BLOCKS:
             self.parts.append("\n")
 
     def handle_endtag(self, tag):
-        if tag in {"script", "style", "head"}:
+        if tag == "head":
+            self.head = False
+        if tag == "title":
+            self.title = False
+            self.parts.append("\n")
+        if tag in HIDDEN:
             self.hidden = max(0, self.hidden - 1)
-        if tag in {"p", "div", "li", "td"}:
-            self.parts.append(" ")
+        if tag in BLOCKS:
+            self.parts.append("\n")
 
     def handle_data(self, data):
-        if not self.hidden:
+        if not self.hidden and (not self.head or self.title):
             self.parts.append(data)
 
 
@@ -199,26 +231,44 @@ def member(archive, name, budget):
     return archive.read(entry)
 
 
-def text_of(element):
-    """The text of an element and what is in it, in reading order; a space, a tab or a line break
-    of a word processor's file is a blank."""
-    name = element.tag.rpartition("}")[2]
-    if name in {"s", "tab", "br", "line-break"}:
+BLANKS = frozenset({"s", "tab", "br", "line-break"})             # what a word processor writes for a blank
+UNSEEN = frozenset({"delText", "instrText", "Fallback", "note-body", "note-citation"})    # deleted words, field codes,
+                                                                    # the copy of a text box, a note, which is its own passage
+MAX_XML = 32 << 20      # bytes of XML of a word processor's file or of FB2 that are read: a tree takes ten times that
+
+
+def local(element):
+    return element.tag.rpartition("}")[2]
+
+
+def text_of(element, names, top=True):
+    """The text of a paragraph, in reading order. What is not seen on the page (deleted words, field
+    codes), the second copy of a text box, and the paragraphs and notes within it, which are passages of
+    their own, give a blank; a space, a tab or a line break of a word processor's file is a blank."""
+    name = local(element)
+    if not top and (name in names or name in UNSEEN):
         yield " "
-    if element.text and name not in {"s", "tab", "br", "line-break"}:
+        return
+    if name in BLANKS:
+        yield " "
+    elif element.text:
         yield element.text
     for child in element:
-        yield from text_of(child)
+        yield from text_of(child, names, False)
         if child.tail:
             yield child.tail
 
 
 def paragraphs_of(root, names):
-    for element in root.iter():
-        if element.tag.rpartition("}")[2] in names:
-            text = "".join(text_of(element)).strip()
-            if text:
-                yield text
+    """The paragraphs of a word processor's file, each once, in the order of the file."""
+    if local(root) == "Fallback":
+        return
+    if local(root) in names:
+        text = " ".join("".join(text_of(root, names)).split())
+        if text:
+            yield text
+    for child in root:
+        yield from paragraphs_of(child, names)
 
 
 def html_text(data):
@@ -239,26 +289,40 @@ def html_text(data):
     return "".join(parser.parts)
 
 
+def xml_member(archive, name, budget):
+    entry = archive.getinfo(name)
+    if entry.file_size > MAX_XML:
+        raise ValueError("The XML of the document exceeds 32 MiB")
+    return member(archive, name, budget)
+
+
 def office_pages(path, fmt):
     with ZipFile(path) as archive:
         budget = [0]
         if fmt == "docx":
-            root = ElementTree.fromstring(member(archive, "word/document.xml", budget))
+            root = ElementTree.fromstring(xml_member(archive, "word/document.xml", budget))
             names = {"p"}
         else:
-            root = ElementTree.fromstring(member(archive, "content.xml", budget))
+            root = ElementTree.fromstring(xml_member(archive, "content.xml", budget))
             names = {"p", "h"}
         yield from pieces(paragraphs_of(root, names), "part")
 
 
 def fb2_pages(path):
-    root = ElementTree.fromstring(path.read_bytes() if path.stat().st_size <= MAX_TEXT else b"")
+    if path.stat().st_size > MAX_XML:
+        raise ValueError("The XML of the document exceeds 32 MiB")
+    root = ElementTree.fromstring(path.read_bytes())
     for body in root.iter():
-        if body.tag.rpartition("}")[2] != "body":
+        if local(body) != "body":
             continue
-        for number, section in enumerate(body.findall("{*}section") or [body], 1):
-            title = next(("".join(text_of(t)).strip() for t in section.iter() if t.tag.rpartition("}")[2] == "title"), "")
-            yield from pieces(paragraphs_of(section, {"p", "v"}), title or f"section {number}", numbered=False)
+        # What stands in the body outside its sections (a title, an epigraph) comes first.
+        front = [child for child in body if local(child) != "section"]
+        lines = [text for child in front for text in paragraphs_of(child, {"p", "v", "text-author"})]
+        if lines:
+            yield from pieces(lines, "front", numbered=False)
+        for number, section in enumerate(body.findall("{*}section") or [], 1):
+            title = next((" ".join(paragraphs_of(t, {"p", "v"})) for t in section.iter() if local(t) == "title"), "")
+            yield from pieces(paragraphs_of(section, {"p", "v", "text-author"}), title or f"section {number}", numbered=False)
 
 
 def converted(path, fmt, work):
@@ -293,17 +357,19 @@ def passages(path, fmt, work):
             if count != len(pages):
                 # The text of the whole document does not divide into its pages: each is asked for,
                 # a few at once, and they come back in the order of the pages.
-                with ThreadPoolExecutor(PAGES) as pool:
+                with ThreadPoolExecutor(threads(PAGES)) as pool:
                     pages = list(pool.map(lambda n: run_tool(["djvutxt", f"--page={n}", str(path)], work).strip("\f"),
                                           range(1, count + 1)))
         for number, body in enumerate(pages, 1):
             yield Passage(number, None, body, not any(c.isalnum() for c in body))
-    else:
+    elif fmt in PLAIN:
         with path.open("rb") as source:
             data = source.read(MAX_TEXT + 1)
         if len(data) > MAX_TEXT:
             raise ValueError("Plain text exceeds 64 MiB")
         yield Passage(None, None, data.decode("utf-8-sig", "replace"))
+    else:
+        raise ValueError(f"No program reads the format {fmt}: name one under [convert.{fmt}]")
 
 
 def recognize(path, fmt, work, number, languages):
