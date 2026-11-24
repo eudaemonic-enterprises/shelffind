@@ -51,7 +51,8 @@ refused. Any other format is read through a program named in the settings, `[con
 command = ["program", "{path}"]`, which prints the text. Files already listed in a format that
 is read since wait for their text from the next inventory on.
 
-Machines. The settings can name the machines by label, `[machines] LABEL = "office"`, so that
+Machines. The line of `status` on the machines also says when this data folder last exchanged
+texts, apart from the journals. The settings can name the machines by label, `[machines] LABEL = "office"`, so that
 one shared file names them all although they call themselves by one hostname; the line of
 `status` and the command `machine` show that name.
 

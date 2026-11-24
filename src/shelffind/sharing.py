@@ -334,6 +334,15 @@ def sync(directory, place, name=None, now=None, journals=True):
             "machines": sorted(other["name"] for other in others.values())}
 
 
+def texts_last(directory):
+    """When the texts were last exchanged by this data folder, as seconds since the epoch, or None."""
+    try:
+        told = json.loads((directory / "texts.json").read_text())
+        return told["at"] if isinstance(told, dict) and type(told.get("at")) is int else None
+    except (OSError, ValueError):
+        return None
+
+
 def last(directory):
     """What the last exchange left: {"synced": time, "machines": {label: {"name", "updated"}}}."""
     try:

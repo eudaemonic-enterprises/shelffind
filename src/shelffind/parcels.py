@@ -68,6 +68,7 @@ LISTED = 16 << 20       # bytes of a list of parcels at most
 PAGES = 100_000         # pages of one document at most
 LAST = 999_999          # the number of the last parcel of a writer
 BIG = 1 << 53           # no size, page number or count goes beyond this
+TEXTS = "texts.json"    # in the data folder: when the texts were last exchanged, for `status`
 EVERY = 120             # seconds between two exchanges while documents are being read
 SHARE = 10              # and at least this many times what the last exchange took, so that reading gets most of the time
 WAIT = 120              # seconds that a run waits for an exchange of another process to end
@@ -415,6 +416,10 @@ class Exchange:
         self.failing = False
         self.took = time.monotonic() - began
         self.last = time.monotonic()
+        try:
+            machine.write(self.directory, {"at": int(time.time())}, TEXTS)    # what `status` says of the last exchange
+        except OSError:
+            pass
         return True
 
     def put(self, name, data):

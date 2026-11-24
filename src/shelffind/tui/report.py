@@ -115,7 +115,7 @@ def ago(seconds):
     return f"{int(max(0, seconds))} s"
 
 
-def machines(here, last, theme, unicode=True, now=None, names=None):
+def machines(here, last, theme, unicode=True, now=None, names=None, texts=None):
     """The line of `status` on the machines that share their journals with this one. `names` gives
     the names that the settings choose, by label, over those that the machines give themselves."""
     now = time.time() if now is None else now
@@ -126,6 +126,8 @@ def machines(here, last, theme, unicode=True, now=None, names=None):
     told = [f"{safe(names.get(here['id']) or here['name'])} (here)"] + [
         f"{safe(name)}, shared {ago(now - card.get('updated', 0))} ago" for name, card in others]
     when = f"last exchange {ago(now - last['synced'])} ago" if last.get("synced") else "no exchange yet: shelffind sync"
+    if texts:
+        when += f", texts {ago(now - texts)} ago"
     yield theme.render([("Machines".ljust(10), "muted"), (dot.join(told), None), (dot + when, "muted")])
 
 

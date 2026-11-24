@@ -1634,6 +1634,18 @@ class Turns(Two):
             with patch("shelffind.parcels.time.monotonic", return_value=start + later):
                 self.assertEqual(told.due(), due)
 
+    def test_an_exchange_leaves_the_time_at_which_it_was_made_for_the_status(self):
+        self.shelf()
+        machine_ = self.machines["office"]
+        with self.at("office"):
+            told = parcels.Exchange(machine_["data"], machine_["db"], sharing.Folder(self.shared))
+        self.assertIsNone(sharing.texts_last(machine_["data"]))
+        before = int(time.time())
+        self.assertTrue(told.run("receive"))
+        self.assertGreaterEqual(sharing.texts_last(machine_["data"]), before)
+        (machine_["data"] / parcels.TEXTS).write_text("{")
+        self.assertIsNone(sharing.texts_last(machine_["data"]))
+
     def test_a_long_exchange_leaves_most_of_the_time_to_reading(self):
         self.shelf()
         machine_ = self.machines["office"]

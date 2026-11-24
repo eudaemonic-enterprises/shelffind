@@ -175,7 +175,8 @@ def status(args, rows, directory, settings):
             print(line)
         if sharing.carrier(settings) is not None:
             for line in report.machines(machine.identity(directory), sharing.last(directory), theme,
-                                        unicode_signs(settings, sys.stdout), names=settings.tables["machines"]):
+                                        unicode_signs(settings, sys.stdout), names=settings.tables["machines"],
+                                        texts=sharing.texts_last(directory)):
                 print(line)
     else:
         for row in rows:
