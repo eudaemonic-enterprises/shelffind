@@ -1352,6 +1352,58 @@ class Fourth(Two):
         self.assertEqual(self.found("office", "northern harbours"), ["tides.txt"])
 
 
+class Fifth(Two):
+    """What the fifth reviews of the exchange found."""
+
+    def test_a_parcel_of_its_own_of_a_newer_format_stays_named_beyond_any_waiting(self):
+        self.shelf(on=("home",))
+        with patch.object(parcels, "FORMAT", 2):        # written by a newer ShelfFind of this data folder
+            self.gift(self.writer("home"), [self.line("Waves/tides.txt", [[None, None, TEXTS["Waves/tides.txt"], 0]])])
+        before = self.listed("home")["parcels"]
+        self.assertTrue(self.exchange("home").run("receive"))
+        later = time.time() + parcels.AWAIT + 60       # longer than any waiting
+        with patch("shelffind.parcels.time.time", return_value=later), patch.object(parcels, "AWAITED", 1):
+            for _ in range(3):
+                self.assertTrue(self.exchange("home").run("receive"))
+        self.assertEqual(self.listed("home")["parcels"], before)
+
+    def test_a_parcel_kept_from_a_round_serves_only_the_description_it_was_found_whole_for(self):
+        self.shelf()
+        self.build("home")
+        listing = self.shared / "texts" / f"{self.writer('home')}.json"
+        told = json.loads(listing.read_text())
+        office = self.exchange("office")
+        self.assertTrue(office.run("receive"))          # taken: found whole and kept
+        told["parcels"][0]["size"] += 1                 # the list now says another size, with the same checksum
+        listing.write_text(json.dumps(told))
+        self.assertTrue(office.run("receive"))
+        self.assertEqual(office.counts["damaged"], 1)
+
+    def test_other_limits_compare_every_reading_again(self):
+        self.shelf()
+        self.build("home")
+        office = self.machines["office"]
+        with self.at("office"):                         # the office reads for itself, and gives nothing that home offers
+            indexer.build(office["db"], office["data"], store.roots(office["db"]), progress=lambda _: None)
+        self.assertTrue(self.exchange("office").run("receive", "send"))
+        compared = lambda: sqlite3.connect(office["data"] / parcels.KEEPING).execute("SELECT count(*) FROM compared").fetchone()[0]
+        self.assertEqual(compared(), 4)
+        with patch.object(parcels, "PAGES", parcels.PAGES + 1):
+            self.assertTrue(self.exchange("office").run("receive"))
+        self.assertEqual(compared(), 0)
+
+    def test_a_good_offer_behind_many_that_fail_is_taken_in_the_same_run(self):
+        self.shelf(on=("office",))
+        self.measure("office")
+        line = self.line("Waves/tides.txt", [[None, None, TEXTS["Waves/tides.txt"], 0]])
+        names = [self.gift(f"{number:x}" * 16, [line]) for number in range(1, 11)]
+        self.assertTrue(self.exchange("office").run("receive"))      # all ten offers known
+        for name in names[:-1]:
+            (self.shared / name).unlink()               # nine of them gone before they are used
+        self.forbidden.add("office")
+        self.assertEqual(self.build("office", limit=0)[1]["received"], 1)
+
+
 class Counting(sharing.Folder):
     """A shared folder that counts the parcels fetched from it."""
 

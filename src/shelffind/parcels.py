@@ -359,9 +359,9 @@ class Exchange:
                     self.db.executemany("INSERT OR REPLACE INTO exchange.notes(key,value) VALUES(?,?)",
                                         [("layout", LAYOUT), ("place", self.place.identity)])
             limits = f"{LIMIT} {UNPACKED} {PAGES}"
-            if notes.get("limits") != limits:   # under other limits, what was too large is compared again and
-                with self.db:                   # the parcels of the others are taken again, lines refused before included
-                    self.db.execute("DELETE FROM exchange.compared WHERE verdict='large'")
+            if notes.get("limits") != limits:   # under other limits the parcels of the others are taken again, lines
+                with self.db:                   # refused before included, and every reading is compared again
+                    self.db.execute("DELETE FROM exchange.compared")
                     self.db.execute("DELETE FROM exchange.entries WHERE writer!=?", (self.writer or "",))
                     self.db.execute("DELETE FROM exchange.parcels WHERE writer!=?", (self.writer or "",))
                     self.db.execute("INSERT OR REPLACE INTO exchange.notes(key,value) VALUES('limits',?)", (limits,))
@@ -528,16 +528,14 @@ class Exchange:
             described = told if not row or state.startswith("awaited:") else row
             if described is None:
                 described = row                 # the list lost: the bookkeeping remembers it
-            if stamp is not None and not state.startswith("awaited:") and row is None and self.take(self.writer, described):
-                with self.db:                   # the bookkeeping having been deleted: taken again
-                    self.db.execute(taken, (stamp, self.writer, name))
-                named[name] = described
-                continue
-            if stamp is not None and state.startswith("awaited:") and self.whole(described):
+            if stamp is not None and (row is None or state.startswith("awaited:") and self.whole(described)):
                 if self.take(self.writer, described):
-                    with self.db:               # what was awaited is there, whole
+                    with self.db:               # taken again, the bookkeeping having been deleted, or awaited and come
                         self.db.execute(taken, (stamp, self.writer, name))
                     named[name] = described
+                    continue
+                if self.later(name):
+                    named[name] = described     # left to a newer version, for as long as it is there
                     continue
             if self.awaited(name, described, state, stamp, now):
                 named[name] = described         # not there, or not as it was put: it may yet be
@@ -564,6 +562,11 @@ class Exchange:
                 self.forget(self.writer, name)  # its documents are given again elsewhere
             self.remember(self.writer, parcel, f"awaited:{since}:{seen + 1}", stamp)
         return True
+
+    def later(self, name):
+        """True when a parcel of this data folder was found to be of a newer format."""
+        row = self.db.execute("SELECT state FROM exchange.parcels WHERE writer=? AND name=?", (self.writer, name)).fetchone()
+        return row is not None and row["state"].startswith("newer:")
 
     def whole(self, parcel):
         """True when the shared place holds a parcel of this data folder as it was put. A reading
@@ -647,7 +650,7 @@ class Exchange:
         (counted as damaged), or is of a newer format (counted, and remembered). A shared place
         that fails raises OSError or ValueError, as it does at any other step."""
         writer = NAME.match(parcel["name"]).group(1)
-        data = self.bodies.get((parcel["name"], parcel["sha256"]))
+        data = self.bodies.get((parcel["name"], parcel["sha256"], parcel["size"]))
         if data is None:
             try:
                 data = self.place.get(parcel["name"], parcel["size"])
@@ -659,7 +662,7 @@ class Exchange:
             while self.bodies and self.kept + len(data) > BODIES:
                 self.kept -= len(self.bodies.pop(next(iter(self.bodies))))
             if len(data) <= BODIES:
-                self.bodies[(parcel["name"], parcel["sha256"])] = data
+                self.bodies[(parcel["name"], parcel["sha256"], parcel["size"])] = data
                 self.kept += len(data)
         try:
             lines = unpack(data)
@@ -777,9 +780,8 @@ class Exchange:
         take a reading further are fetched, each once, so an exchange with nothing new fetches
         nothing."""
         self.folders = None
-        for _ in range(8):                      # an offer whose parcel failed leaves the next one
-            if not self.give(self.candidates(skip=self.fresh | self.refused)):
-                break
+        while self.give(self.candidates(skip=self.fresh | self.refused)):
+            pass                                # a parcel that failed was forgotten: the next offers are taken
 
     def give(self, found):
         """Fetch the parcels of the offers `found` and give their pages, the first offer of each
