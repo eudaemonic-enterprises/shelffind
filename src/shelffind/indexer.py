@@ -27,6 +27,7 @@ import queue
 import subprocess
 import tempfile
 import threading
+import time
 from concurrent.futures import Future, ThreadPoolExecutor
 from pathlib import Path
 
@@ -143,6 +144,7 @@ def private_copy(path, row, hold, known=None):
 
 
 ROOM = 1 << 30          # bytes of copies that a run may hold ahead of the document it reads
+LEAVE = 30              # seconds that the end of a run waits, in all, for the copies that are being made
 running = threading.local()     # the copying threads of a run put there the event that ends their copies
 
 
@@ -231,8 +233,9 @@ class Ahead:
         self.stop.set()
         for _ in self.threads:
             self.jobs.put(None)
+        end = time.monotonic() + LEAVE         # a folder that does not answer holds a thread back: it is left behind
         for thread in self.threads:
-            thread.join(timeout=120)
+            thread.join(timeout=max(0.0, end - time.monotonic()))
         for future, _ in self.tasks.values():
             if not future.cancel() and future.done() and future.exception() is None:
                 future.result()[0].cleanup()
