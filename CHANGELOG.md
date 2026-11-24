@@ -45,7 +45,9 @@ differ only by which pages are recognised, and each document takes first the rea
 leaves the fewest pages to recognise. Parcels found whole are kept for the later rounds of a run.
 A file must still be the very file that the inventory of the run listed, whatever was done to its
 folder, a parcel that waits is read again from time to time and before it is named no more, and
-a reading found too large or refused is weighed again in each run.
+a reading found too large or refused is weighed again in each run. A file refused at placement is
+measured anew, whatever stands at its address later, and a parcel left to a newer version follows
+its list when the list describes the bytes there.
 
 When a file read by version 0.2 joins a document read since, the two readings are joined page by
 page when they have the same pages, and otherwise the one that recognised more pages is kept: a

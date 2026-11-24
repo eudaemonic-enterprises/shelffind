@@ -509,7 +509,7 @@ class Exchange:
             if state == "taken" and stamp is not None and row["stamp"] == stamp:
                 named[name] = row               # as it was found whole
                 continue
-            if state.startswith("newer:") and stamp is not None:
+            if state.startswith("newer:") and stamp is not None and not (told and told["sha256"] != row["sha256"]):
                 named[name] = row               # left to a newer version
                 continue
             if state.startswith("awaited:") and stamp is not None and row["stamp"] == stamp \
@@ -524,7 +524,8 @@ class Exchange:
                 if state == "sending":
                     self.counts["sent"] += row["documents"]
                 continue
-            if state == "taken" and stamp is not None and told and told["sha256"] != row["sha256"] and self.whole(told):
+            if (state == "taken" or state.startswith("newer:")) and stamp is not None and told \
+                    and told["sha256"] != row["sha256"] and self.whole(told):
                 with self.db:                   # put anew, and named so in the list: what the list says of it stands
                     self.forget(self.writer, name)
                 if self.take(self.writer, told):
@@ -862,14 +863,20 @@ class Exchange:
         hand must still be a file, not a link, with the size and the date that the inventory
         saw, nothing of it may have changed since this run began, which the time of its last
         change says, and it must still be the very file that this run listed, whatever was done
-        to its folder. A file that this run did not list and that is no longer there shows no
-        text, and the next inventory forgets it; a folder out of reach is taken at its word."""
+        to its folder. A file that fails is left to be measured anew (`store.afresh`), so that what
+        stands at its address later is not taken for it by its size and date. A file that this run
+        did not list and that is no longer there shows no text, and the next inventory forgets it;
+        a folder out of reach is taken at its word."""
         if self.folders is None:
             self.folders = {root["id"]: Path(root["path"]) if store.available(root) else None for root in store.roots(self.db)}
+        def refused(file):
+            store.afresh(self.db, file["id"])   # whatever stands there now is measured anew, whatever its size and date
+            return False
+
         for file in self.db.execute("SELECT id,root,rel,size,mtime FROM files WHERE doc=?", (doc,)).fetchall():
             held = self.held.get(file["id"])
             if held is not None and not held[1]():
-                return False
+                return refused(file)
             folder = self.folders.get(file["root"])
             if folder is None:
                 continue
@@ -878,13 +885,13 @@ class Exchange:
                 info = os.lstat(folder / file["rel"])
             except FileNotFoundError:
                 if itself is not None:
-                    return False                # there when this run listed it, and gone since
+                    return refused(file)        # there when this run listed it, and gone since
                 continue
             except OSError:
                 return False
             if stat.S_ISLNK(info.st_mode) or (info.st_size, info.st_mtime_ns) != (file["size"], file["mtime"]) \
                     or info.st_ctime_ns > self.began or itself is not None and (info.st_dev, info.st_ino) != itself:
-                return False
+                return refused(file)
         return True
 
     def offer(self, doc, file=None, still=None):

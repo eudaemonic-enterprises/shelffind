@@ -1451,6 +1451,28 @@ class Sixth(Two):
             self.assertEqual(self.build("office", names_only=True)[1], counts(received=2))
         self.assertEqual((self.pages("office", "Waves/tides.txt"), self.found("office", "northern harbours")), ([], []))
 
+    def test_a_file_gone_while_pages_come_and_put_back_with_its_date_is_measured_anew(self):
+        self.shelf()
+        self.build("home")
+        office = self.machines["office"]
+        self.measure("office")
+        tides = office["shelf"] / "Waves/tides.txt"
+        real, done = parcels.Exchange.fetch, []
+
+        def fetch(exchange, parcel):
+            if not done:
+                done.append(True)
+                tides.unlink()                          # gone while the pages come
+            return real(exchange, parcel)
+
+        with patch.object(parcels.Exchange, "fetch", fetch):
+            self.assertEqual(self.build("office", names_only=True)[1], counts(received=3))
+        tides.write_text(TEXTS["Waves/tides.txt"].replace("northern", "southern"))
+        os.utime(tides, (WHEN, WHEN))                   # put back: other bytes, the same size and date
+        self.build("office")
+        self.assertEqual((self.found("office", "northern harbours"), self.found("office", "southern harbours")), ([], ["tides.txt"]))
+        self.sound("office")
+
     def test_a_parcel_that_waits_after_a_short_reading_is_read_again_and_stays_named(self):
         self.shelf()
         self.build("home")
@@ -1490,6 +1512,30 @@ class Sixth(Two):
             db.execute("INSERT INTO compared(md5,sha256,size,format,reading,verdict) VALUES(?,?,?,?,?,'large')",
                        (keys["md5"], keys["sha256"], tides["size"], tides["format"], reading))
         self.assertEqual(self.build("home")[1]["sent"], 4)          # weighed again in this run, and given
+
+    def test_a_parcel_left_to_a_newer_version_and_put_anew_keeps_what_its_list_says(self):
+        self.shelf()
+        self.build("home")
+        writer = self.writer("home")
+        parcel = self.parcels_of("home")[0]
+        listing = self.shared / "texts" / f"{writer}.json"
+
+        def put_anew(text):                             # a newer version of this data folder puts it again
+            with patch.object(parcels, "FORMAT", 2):
+                packer = parcels.Packer(writer)
+            packer.add(json.dumps(self.line("Waves/tides.txt", [[None, None, text, 0]])).encode() + b"\n")
+            data = packer.close()
+            parcel.write_bytes(data)
+            told = json.loads(listing.read_text())
+            told["parcels"][0].update(size=len(data), sha256=hashlib.sha256(data).hexdigest(), documents=1)
+            listing.write_text(json.dumps(told))
+            return hashlib.sha256(data).hexdigest()
+
+        for text in (TEXTS["Waves/tides.txt"], TEXTS["Waves/tides.txt"].replace("northern", "southern")):
+            checksum = put_anew(text)
+            self.assertTrue(self.exchange("home").run("receive", "send"))
+            named = {entry["name"][-15:]: entry["sha256"] for entry in self.listed("home")["parcels"]}
+            self.assertEqual(named["000001.jsonl.gz"], checksum)
 
     def test_the_last_number_given_is_kept_under_the_name_of_its_writer(self):
         self.shelf()
