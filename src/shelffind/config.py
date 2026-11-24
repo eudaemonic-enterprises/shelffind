@@ -51,6 +51,8 @@ SETTINGS = {
     "search.exact": (bool, False, "Whether the panel opens on exact search: the words as typed, with no "
                                   "completion, no spelling help and no letters in order."),
     "index.refresh": (int, 60, "Minutes after which opening the panel refreshes the list of files; 0 never."),
+    "index.workers": (int, 4, "Files copied at the same time, from 1 to 16, while a document is read: the waits "
+                              "of a network folder then overlap; 1 copies one at a time."),
     "history.record": (bool, True, "Remember the searches made and the documents opened."),
     "share.history": (bool, False, "Share that journal between your machines; off unless asked for."),
     "share.texts": (bool, False, "Share the text that each of your machines reads with the others, so that "

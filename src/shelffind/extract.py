@@ -1,10 +1,13 @@
 # Copyright 2026 Eudaemonic Enterprises Inc.
 """Read document text locally. The original document is always opened read-only."""
 import gzip
+import os
 import posixpath
 import resource
+import shutil
 import subprocess
 import tempfile
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
 from dataclasses import dataclass
 from html.parser import HTMLParser
@@ -16,6 +19,7 @@ from zipfile import ZipFile
 SUPPORTED = {"pdf", "djvu", "ps", "ps.gz", "epub", "txt", "md", "rst", "tex"}
 PLAIN = {"txt", "md", "rst", "tex"}     # read as they are, up to MAX_TEXT
 MAX_TEXT = 64 * 1024 * 1024
+PAGES = 4               # pages of one document read at the same time when a program must be asked for each
 
 
 def file_format(path):
@@ -31,10 +35,19 @@ def tool_limits():
 
 
 def run_tool(argv, work):
+    """Run a program on a document and return what it printed. Its output file and its dumps of
+    memory are limited: by `prlimit` where it exists, which leaves the program free to run several
+    at once, and otherwise by a hook that runs in the new process."""
+    if shutil.which(argv[0]) is None:
+        raise ValueError(f"Required program is missing: {argv[0]}")
+    limit = shutil.which("prlimit")
+    command = [limit, f"--fsize={512 << 20}", "--core=0", "--", *argv] if limit else argv
+    # Tesseract works with as many threads as it finds processors; the pages are read in parallel here.
+    env = {**os.environ, "OMP_THREAD_LIMIT": "1"} if argv[0] == "tesseract" else None
     with tempfile.TemporaryFile(dir=work) as out, tempfile.TemporaryFile(dir=work) as err:
         try:
-            result = subprocess.run(argv, cwd=work, stdout=out, stderr=err, stdin=subprocess.DEVNULL,
-                                    timeout=240, preexec_fn=tool_limits, check=False)
+            result = subprocess.run(command, cwd=work, stdout=out, stderr=err, stdin=subprocess.DEVNULL, env=env,
+                                    timeout=240, preexec_fn=None if limit else tool_limits, check=False)
         except FileNotFoundError:
             raise ValueError(f"Required program is missing: {argv[0]}") from None
         if result.returncode:
@@ -154,8 +167,11 @@ def passages(path, fmt, work):
         if fmt == "djvu":
             count = int(run_tool(["djvused", str(path), "-e", "n"], work).strip())
             if count != len(pages):
-                pages = [run_tool(["djvutxt", f"--page={n}", str(path)], work).strip("\f")
-                         for n in range(1, count + 1)]
+                # The text of the whole document does not divide into its pages: each is asked for,
+                # a few at once, and they come back in the order of the pages.
+                with ThreadPoolExecutor(PAGES) as pool:
+                    pages = list(pool.map(lambda n: run_tool(["djvutxt", f"--page={n}", str(path)], work).strip("\f"),
+                                          range(1, count + 1)))
         for number, body in enumerate(pages, 1):
             yield Passage(number, None, body, not any(c.isalnum() for c in body))
     else:
@@ -167,12 +183,17 @@ def passages(path, fmt, work):
 
 
 def recognize(path, fmt, work, number, languages):
+    """The text of one page, recognised from its image. Each page has an image of its own in
+    `work`, so that several pages can be recognised at once."""
     if fmt == "djvu":
-        image = work / "page.pgm"
+        image = work / f"page{number}.pgm"
         run_tool(["ddjvu", f"-page={number}", "-size=2200x3200", "-format=pgm",
                   str(path), str(image)], work)
     else:
-        image = work / "page.png"
+        image = work / f"page{number}.png"
         run_tool(["pdftoppm", "-f", str(number), "-l", str(number), "-scale-to", "2600",
-                  "-png", "-singlefile", str(path), str(work / "page")], work)
-    return run_tool(["tesseract", str(image), "stdout", "-l", languages], work)
+                  "-png", "-singlefile", str(path), str(work / f"page{number}")], work)
+    try:
+        return run_tool(["tesseract", str(image), "stdout", "-l", languages], work)
+    finally:
+        image.unlink(missing_ok=True)

@@ -13,6 +13,7 @@ copies, and what their reading writes, are kept in a folder that the run makes f
 the data folder of ShelfFind, and nowhere else; the index names that folder for as long as it
 exists, and nothing is ever removed that the index does not name.
 """
+import collections
 import contextlib
 import datetime
 import hashlib
@@ -22,8 +23,11 @@ import os
 import re
 import shutil
 import sqlite3
+import queue
 import subprocess
 import tempfile
+import threading
+from concurrent.futures import Future, ThreadPoolExecutor
 from pathlib import Path
 
 from . import extract, fuzzy, link, store
@@ -40,6 +44,10 @@ class Unreadable(Exception):
 
 class Unplaced(Exception):
     """The copy of a file could not be written on this machine: nothing is wrong with the file."""
+
+
+class Stopped(Exception):
+    """A copy that was being made was given up, the run having ended: it is never taken."""
 
 
 def check_stamp(path, row, same=None):
@@ -72,7 +80,9 @@ def whole_checksums(path, row, copy=None):
     checksums are then those of that copy, whatever happens to the file afterwards. The copy
     is written without a buffer and closed here, so that a fault of the place where it is made
     shows as what it is: Unplaced is raised when the copy cannot be made, written or closed,
-    and nothing is then said against the file."""
+    and nothing is then said against the file. A copying thread of a run (see `Ahead`) gives the
+    reading up (Stopped) between two blocks once the run has ended."""
+    stop = getattr(running, "stop", None)
     same = check_stamp(path, row)
     found = hashlib.md5(), hashlib.sha256()
     target = None
@@ -88,6 +98,8 @@ def whole_checksums(path, row, copy=None):
                 raise ValueError(CHANGED)
             taken = 0
             while block := source.read(1 << 20):
+                if stop is not None and stop.is_set():
+                    raise Stopped()
                 taken += len(block)
                 for one in found:
                     one.update(block)
@@ -128,6 +140,104 @@ def private_copy(path, row, hold, known=None):
         measured = again
     check_stamp(path, row, same)
     return copy, measured, same
+
+
+ROOM = 1 << 30          # bytes of copies that a run may hold ahead of the document it reads
+running = threading.local()     # the copying threads of a run put there the event that ends their copies
+
+
+def prepare(path, row, hold, known):
+    """What `update_text` makes first, made in advance: the folder of the copy, the copy, its
+    checksums, and what tells the file itself apart from another: (folder, copy, checksums,
+    itself). A fault is raised as `update_text` would have met it."""
+    try:
+        folder = tempfile.TemporaryDirectory(prefix="copy-", dir=hold, ignore_cleanup_errors=True)
+    except OSError as fault:
+        raise Unplaced(str(fault)) from None
+    try:
+        copy, measured, same = private_copy(path, row, Path(folder.name), known)
+    except BaseException:
+        folder.cleanup()
+        raise
+    return folder, copy, measured, same
+
+
+class Ahead:
+    """The copies of the files that come next, made while the document before them is read.
+    A folder on a network answers each request after a wait: a few copies made at once let the
+    waits overlap instead of adding up. Nothing is decided here. A copy is only made earlier
+    than `update_text` would have made it, with the same checks, and `update_text` takes it in
+    its turn; what is not taken is removed with the folder of the run. The copies held ahead
+    are limited in number and in bytes, and the threads are those of this run alone."""
+
+    def __init__(self, hold, workers, room=ROOM):
+        self.hold, self.workers, self.room = hold, workers, room
+        self.stop = threading.Event()
+        self.jobs = queue.SimpleQueue()
+        self.tasks = {}                     # file id -> (future, size) of the copies asked for and not taken
+        self.kept = 0
+        self.threads = [threading.Thread(target=self.work, daemon=True, name="shelffind-copy") for _ in range(workers)]
+        for thread in self.threads:
+            thread.start()
+
+    def work(self):
+        running.stop = self.stop
+        while not self.stop.is_set():
+            job = self.jobs.get()
+            if job is None:
+                return
+            future, arguments = job
+            if not future.set_running_or_notify_cancel():
+                continue
+            try:
+                future.set_result(prepare(*arguments))
+            except BaseException as fault:      # Unplaced, a fault of the file, or Stopped
+                future.set_exception(fault)
+
+    def full(self):
+        return len(self.tasks) >= 2 * self.workers
+
+    def start(self, db, root, row):
+        """Ask for the copy of a file, unless it is asked for, or there is no room for it."""
+        if self.stop.is_set() or row["id"] in self.tasks or self.full() or (self.kept and self.kept + row["size"] > self.room):
+            return
+        if row["format"] in extract.PLAIN and row["size"] > extract.MAX_TEXT:
+            return                          # `update_text` says so before any copy is made
+        file = db.execute("SELECT sum FROM files WHERE id=? AND root=? AND rel=?", (row["id"], root["id"], row["rel"])).fetchone()
+        if file is None:
+            return
+        future = Future()
+        self.tasks[row["id"]] = (future, row["size"])
+        self.kept += row["size"]
+        stamp = {key: row[key] for key in row.keys()}
+        self.jobs.put((future, (Path(root["path"]) / row["rel"], stamp, self.hold, store.sums(file["sum"]).get("md5"))))
+
+    def take(self, file):
+        """The copy asked for a file, as a future, or None when none was asked for."""
+        future, size = self.tasks.pop(file, (None, 0))
+        self.kept -= size
+        return future
+
+    def discard(self, future):
+        """Give up a copy that was taken from here and will not be used: it is removed when made."""
+        def remove(done):
+            if not done.cancelled() and done.exception() is None:
+                done.result()[0].cleanup()
+        if future is not None and not future.cancel():
+            future.add_done_callback(remove)
+
+    def close(self):
+        """Give up the copies not yet taken, and wait for the threads, which stop at the next block."""
+        self.stop.set()
+        for _ in self.threads:
+            self.jobs.put(None)
+        for thread in self.threads:
+            thread.join(timeout=120)
+        for future, _ in self.tasks.values():
+            if not future.cancel() and future.done() and future.exception() is None:
+                future.result()[0].cleanup()
+        self.tasks.clear()
+        self.kept = 0
 
 
 def storage(arguments, listing, remote, seconds):
@@ -419,7 +529,29 @@ def forget_copies(db, directory, progress):
     return problems
 
 
-def update_text(db, root, row, ocr, languages, wanted=None, hold=None, offered=None):
+def recognised(source, fmt, work, blanks, languages, workers):
+    """The pages to recognise with their text, in the order of the pages. With `workers` above
+    one, the next pages are recognised while the one before is kept; a fault, or an interruption,
+    comes in its turn, after the pages before it have been kept, and what is not begun is given up."""
+    if workers <= 1:
+        for page in blanks:
+            yield page, extract.recognize(source, fmt, work, page["page"], languages)
+        return
+    pool, waiting = ThreadPoolExecutor(workers), collections.deque()
+    try:
+        pages = iter(blanks)
+        while True:
+            while len(waiting) < workers + 1 and (page := next(pages, None)) is not None:
+                waiting.append((page, pool.submit(extract.recognize, source, fmt, work, page["page"], languages)))
+            if not waiting:
+                return
+            page, future = waiting.popleft()
+            yield page, future.result()
+    finally:
+        pool.shutdown(wait=True, cancel_futures=True)
+
+
+def update_text(db, root, row, ocr, languages, wanted=None, hold=None, offered=None, ahead=None, workers=1):
     """Read one document through one of its files, and return True when pages were written.
 
     The file is first copied to this machine, in the folder `hold`, and its checksums are
@@ -434,22 +566,35 @@ def update_text(db, root, row, ocr, languages, wanted=None, hold=None, offered=N
     to its folder is a failure of the document. `offered(document, file, unchanged)` tells,
     once the copy has measured the bytes and before anything is extracted, whether the document
     is to wait for what another data folder read of these very bytes (see `parcels.Exchange.offer`),
-    `unchanged()` saying later whether the file is still the one copied: it is then not read."""
+    `unchanged()` saying later whether the file is still the one copied: it is then not read.
+    With `ahead` (an `Ahead`), the copy may have been made already, with the same checks. With
+    `workers` above one, the pages of a document that are recognised are recognised that many at
+    once, and kept in the order of the pages as before."""
     path = Path(root["path"]) / row["rel"]
+    made = ahead.take(row["id"]) if ahead is not None else None
     file = db.execute("SELECT id,sum FROM files WHERE id=? AND root=? AND rel=?", (row["id"], root["id"], row["rel"])).fetchone()
     if file is None:
+        if ahead is not None:
+            ahead.discard(made)
         return False
     if row["format"] in extract.PLAIN and row["size"] > extract.MAX_TEXT:
         raise ValueError("Plain text exceeds 64 MiB")       # said before a copy of that size is made
-    try:                                            # what cannot be removed afterwards goes with the folder of the run
-        folder = tempfile.TemporaryDirectory(prefix="copy-", dir=hold, ignore_cleanup_errors=True)
-    except OSError as fault:
-        raise Unplaced(str(fault)) from None
-    with folder as held:
+    if made is not None:
         try:
-            copy, measured, same = private_copy(path, row, Path(held), store.sums(file["sum"]).get("md5"))
+            folder, copy, measured, same = made.result()
         except (OSError, ValueError) as fault:
             raise Unreadable(str(fault)) from None
+    else:
+        try:                                        # what cannot be removed afterwards goes with the folder of the run
+            folder = tempfile.TemporaryDirectory(prefix="copy-", dir=hold, ignore_cleanup_errors=True)
+        except OSError as fault:
+            raise Unplaced(str(fault)) from None
+    with folder as held:
+        if made is None:
+            try:
+                copy, measured, same = private_copy(path, row, Path(held), store.sums(file["sum"]).get("md5"))
+            except (OSError, ValueError) as fault:
+                raise Unreadable(str(fault)) from None
 
         def still():
             """The file is still the one that was copied: what is kept is kept for it."""
@@ -486,8 +631,7 @@ def update_text(db, root, row, ocr, languages, wanted=None, hold=None, offered=N
                 # with the state of the document, so that a run cut there leaves nothing to mend.
                 blanks = db.execute("SELECT id,page FROM pages WHERE doc=? AND needs_ocr=1 "
                                     "ORDER BY page", (doc,)).fetchall()
-                for page in blanks:
-                    text = extract.recognize(source, fmt, work, page["page"], languages)
+                for page, text in recognised(source, fmt, work, blanks, languages, workers):
                     with db:
                         db.execute("UPDATE pages SET ztext=?,needs_ocr=0 WHERE id=?", (store.deflate(text), page["id"]))
                         fuzzy.remember_more(db, (text,))
@@ -515,7 +659,8 @@ def update_text(db, root, row, ocr, languages, wanted=None, hold=None, offered=N
 
 
 def build(db, directory, selected, *, names_only=False, ocr=False, languages="eng",
-          retry=False, limit=None, progress=print, paths=(), on_document=None, relink=False, exchange=None):
+          retry=False, limit=None, progress=print, paths=(), on_document=None, relink=False, exchange=None,
+          workers=1):
     """Refresh the inventory, compare the files with the documents already known, ask the
     sources which files they know, then read the waiting documents. `selected` is the list of
     folders, or a function that gives it once no other build can change them.
@@ -538,7 +683,11 @@ def build(db, directory, selected, *, names_only=False, ocr=False, languages="en
     exchange is more than two minutes old, and gives what it read at the end. Pages given make
     documents known by more checksums: the files are then compared and the sources asked
     again, for as long as that teaches something. The exchange concerns the whole index,
-    whatever the folders or the files chosen."""
+    whatever the folders or the files chosen.
+
+    With `workers` above one, the files of the documents that come next are copied, that many
+    at once, while a document is read, so that the waits of a network folder overlap (see
+    `Ahead`); each copy is checked as it would be, and the result is the one of a run with one."""
     done = failures = 0
     ready = []
     with store.index_lock(directory):
@@ -616,6 +765,7 @@ def build(db, directory, selected, *, names_only=False, ocr=False, languages="en
         waiting_of = lambda file: db.execute(
             f"SELECT d.id FROM files f JOIN docs d ON d.id=f.doc WHERE f.id=? AND d.state IN ({marks})", (file, *states)).fetchone()
         charged, tried, measured, halted = set(), set(), set(), False
+        ahead = None
         wanted = lambda doc, state: state in states and doc not in charged
         try:
             while not halted and (limit is None or done < limit):
@@ -656,10 +806,19 @@ def build(db, directory, selected, *, names_only=False, ocr=False, languages="en
                         progress(f"No folder for the copies of the documents could be made in {directory}: {exc}")
                         failures += 1
                         break
+                if workers > 1 and ahead is None:
+                    ahead = Ahead(hold, workers)
                 total, taken = len(candidates), False
-                for seen, (doc, copies) in enumerate(candidates.items()):
+                order = list(candidates.items())
+                for seen, (doc, copies) in enumerate(order):
                     if halted or (limit is not None and done >= limit):
                         break
+                    if ahead is not None:
+                        for _, later in order[seen:seen + 2 * workers]:
+                            if ahead.full():
+                                break
+                            if later[0][0]["id"] not in offline:
+                                ahead.start(db, *later[0])
                     if on_document:
                         on_document(seen, total, copies[0][1]["rel"])
                     untaken, replaced, before = {}, None, done
@@ -680,7 +839,7 @@ def build(db, directory, selected, *, names_only=False, ocr=False, languages="en
                         try:
                             taken = True
                             if update_text(db, root, row, ocr, languages, wanted, hold,
-                                           exchange.offer if exchange is not None else None):
+                                           exchange.offer if exchange is not None else None, ahead, workers):
                                 done += 1
                                 tried.add(row["id"])
                             else:
@@ -728,6 +887,9 @@ def build(db, directory, selected, *, names_only=False, ocr=False, languages="en
                         finally:
                             if exchange is not None:
                                 exchange.measured(row["id"])        # its document waits for the sources to be asked
+                    if ahead is not None:               # a copy made for a file that was passed over is not kept
+                        for _, row in copies:
+                            ahead.discard(ahead.take(row["id"]))
                     # A document of which no file could be taken waits for a retry when all its
                     # files were tried; one that was not among those chosen may still be read.
                     stuck = {}
@@ -765,5 +927,7 @@ def build(db, directory, selected, *, names_only=False, ocr=False, languages="en
             if exchange is not None:
                 exchange.run("send", wait=True)
         finally:
+            if ahead is not None:
+                ahead.close()
             failures += forget_copies(db, directory, progress)
     return done, failures

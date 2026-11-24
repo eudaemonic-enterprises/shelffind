@@ -360,7 +360,7 @@ def execute(args, db, directory, settings):
             count, failures = indexer.build(
                 db, directory, roots, names_only=args.names_only, ocr=args.ocr, languages=args.lang,
                 retry=args.retry, limit=args.limit, paths=files, relink=args.relink, progress=said,
-                on_document=step,
+                on_document=step, workers=max(1, min(16, settings["index.workers"])),
                 exchange=parcels.Exchange(directory, db, place, said) if place is not None else None)
         finally:
             if live:

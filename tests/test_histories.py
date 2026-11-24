@@ -55,6 +55,7 @@ class World:
 
     def __init__(self, seed, base):
         self.dice = random.Random(seed)
+        self.workers = 1 + 2 * (seed % 2)           # half of the histories copy several files at once
         self.base = base = base.resolve()
         self.rooms = {"Room": base / "Room", "Shed": base / "Shed", "Vault": base / "Vault"}
         for folder in self.rooms.values():
@@ -334,7 +335,8 @@ class World:
         before = len(self.extracted)
         self.liars |= self.misled()                         # what it says of them now may be kept for long
         exchange = parcels.Exchange(self.data, self.db, sharing.Folder(self.shared))
-        done = indexer.build(self.db, self.data, store.roots(self.db), progress=lambda _: None, exchange=exchange, **options)
+        done = indexer.build(self.db, self.data, store.roots(self.db), progress=lambda _: None, exchange=exchange,
+                               workers=self.workers, **options)
         return done, self.extracted[before:]
 
 
