@@ -207,7 +207,6 @@ def find(args, db, directory, settings):
             code = code if code >= 128 else 0       # leaving the panel is not a failure
         if text:
             print(text)
-        exchange_later(args, directory, settings)
         return code
     opts = {"root": args.root, "fmt": args.fmt, "exact": args.exact, "limit": args.limit or 25,
             "source": args.source, "where": args.where or "all"}
@@ -228,9 +227,6 @@ def find(args, db, directory, settings):
         for line in listing(hits, False):
             print(line)
     return int(bool(problem) and not hits)
-
-
-EXCHANGE = 600          # seconds between two exchanges started by the panel
 
 
 def apart(args, *command):
@@ -256,14 +252,15 @@ def refresh_later(args, db, settings):
 
 
 def exchange(args, directory, settings):
-    """The command sync: the journals, then the texts, when the settings share them: parcels
-    are taken and given, while their pages wait for the next run of the index, which gives
-    them once its inventory is made. Exits with 1 when the shared place failed; a parcel that
-    arrived damaged is said, and taken again at a later exchange."""
+    """The command sync: the journals, then the texts, when the settings share them. Parcels
+    are taken and given, and the pages just taken are placed, without walking the shelves,
+    when each file is still the one the last inventory listed. Exits with 1 when the shared
+    place failed; a parcel that arrived damaged is said, and taken again at a later exchange.
+    When an indexing holds the search, the pages wait for it."""
     place = sharing.carrier(settings)
     if place is None:
         raise ValueError("Nothing is shared: set share.history or share.texts, and share.folder or share.remote")
-    failed = False
+    failed, held = False, False
     with sharing.alone(directory) as free:
         if not free:
             if not args.quiet:
@@ -272,12 +269,24 @@ def exchange(args, directory, settings):
         done = sharing.sync(directory, place, journals=settings["share.history"])
         damaged, texts = done["damaged"], None
         if settings["share.texts"]:
-            # The parcels are carried both ways; their pages are given by the next run of the
-            # index, once its inventory is made, which the panel starts by itself.
+            # The parcels travel both ways without the search being held. The pages are placed
+            # afterwards, and only while no indexing holds the search.
             try:
                 with closing(store.connect(directory, upgrade=False)) as db:
                     texts = parcels.Exchange(directory, db, place, lambda text: print(safe(text), file=sys.stderr))
                     failed = not texts.steps("receive", "send")
+                    if not failed:
+                        try:
+                            with store.index_lock(directory):
+                                failed = not texts.steps("apply")
+                        except ValueError:
+                            held = True
+                            note = machine.read(directory / parcels.TEXTS)
+                            note["held"] = True
+                            try:
+                                machine.write(directory, note, parcels.TEXTS)
+                            except OSError:
+                                pass
                     damaged += texts.counts["damaged"]
             except store.NeedsUpgrade:
                 pass                            # the texts wait for the conversion of the index
@@ -285,19 +294,13 @@ def exchange(args, directory, settings):
         others = ", ".join(done["machines"]) or "no other machine yet"
         told = [f"{done['sent']} sent, {done['received']} received ({others})"]
         if texts is not None:
-            told.append(f"texts of {texts.counts['sent']:,} documents given")
+            told.append(f"texts of {texts.counts['sent']:,} documents given, {texts.counts['received']:,} taken")
+        if held:
+            told.append("the pages wait until the indexing under way has finished")
         if damaged:
             told.append(f"{damaged} could not be taken and will be asked again")
         print("; ".join(told))
     return int(failed)
-
-
-def exchange_later(args, directory, settings):
-    """After the panel, when journals are shared and the last exchange is not recent: start
-    one in a process of its own, which outlives this one and delays nothing."""
-    if sharing.carrier(settings) is None or time.time() - sharing.last(directory).get("synced", 0) < EXCHANGE:
-        return
-    apart(args, "sync", "--quiet")
 
 
 def look(settings, stream):

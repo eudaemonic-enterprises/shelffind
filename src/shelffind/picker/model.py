@@ -45,6 +45,9 @@ class Model:
     formats: list = field(default_factory=lambda: [None])
     channels: list = field(default_factory=lambda: [None, "files"])
     files: int = 0
+    waiting: int = 0                     # documents that still have no text
+    company: str = ""                    # the machines, and how long ago their texts were taken
+    notice: str = ""                     # a line of the band, such as pages that wait for an indexing
     bottom: bool = True                  # the prompt is under the list, best match next to it
     page: int = 10                       # rows of the list, for PgUp and PgDn
 
@@ -130,7 +133,16 @@ def update(model, event, keymap):
             # it, and from then on stays on the document chosen.
             current = None if model.fresh else model.hit()
             model.results, model.busy, model.seconds = event.rows, False, event.seconds
-            model.message = event.message or ("" if event.rows or not model.query.strip() else "No matches")
+            if event.message:
+                model.message = event.message
+            elif event.rows or not model.query.strip():
+                model.message = ""
+            elif model.options.get("where") != "name" and model.waiting:
+                noun = "document" if model.waiting == 1 else "documents"
+                verb = "has" if model.waiting == 1 else "have"
+                model.message = f"No matches. {model.waiting} {noun} still {verb} no text"
+            else:
+                model.message = "No matches"
             model.selected = 0
             if current:
                 same = lambda hit: (hit["source"], hit.get("id"), hit["path"]) == \

@@ -115,6 +115,21 @@ def ago(seconds):
     return f"{int(max(0, seconds))} s"
 
 
+def company(here, last, now=None, names=None, texts=None, unicode=True):
+    """The machines and how long ago this one took their texts, as one clause for the band."""
+    now = time.time() if now is None else now
+    names = names or {}
+    dot = " · " if unicode else " - "
+    others = sorted(((names.get(label) or card.get("name") or "?", card)
+                     for label, card in last.get("machines", {}).items()), key=lambda found: found[0])
+    told = [f"{safe(names.get(here['id']) or here['name'])} (here)"] + [
+        f"{safe(name)}, shared {ago(now - card.get('updated', 0))} ago" for name, card in others]
+    when = f"last exchange {ago(now - last['synced'])} ago" if last.get("synced") else "no exchange yet"
+    if texts:
+        when += f", texts {ago(now - texts)} ago"
+    return dot.join(told) + dot + when
+
+
 def machines(here, last, theme, unicode=True, now=None, names=None, texts=None):
     """The line of `status` on the machines that share their journals with this one. `names` gives
     the names that the settings choose, by label, over those that the machines give themselves."""

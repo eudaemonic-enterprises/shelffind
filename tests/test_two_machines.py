@@ -2044,14 +2044,87 @@ class Carriage(Two):
         self.forbidden.add("office")
         with self.at("office"):
             code, out, _ = run_main(self.machines["office"]["data"], "sync")
-            self.assertEqual((code, out.strip()), (0, "0 sent, 0 received (no other machine yet); texts of 0 documents given"))
-            self.assertEqual(self.found("office", "northern harbours"), [])     # a sync carries parcels and gives no pages
+            self.assertEqual((code, out.strip()),
+                             (0, "0 sent, 0 received (no other machine yet); texts of 0 documents given, 0 taken"))
+            self.assertEqual(self.found("office", "northern harbours"), [])     # nothing is known of the files yet
             code, _, err = run_main(self.machines["office"]["data"], "index")
         self.assertEqual((code, err.splitlines()[-1]), (0, "0 documents processed, 0 problems"))
         self.assertEqual(self.found("office", "northern harbours"), ["tides.txt"])
         with self.at("office"):
             code, out, _ = run_main(self.machines["office"]["data"], "sync", "--quiet")
         self.assertEqual((code, out), (0, ""))
+
+    def test_an_exchange_places_the_pages_without_reading_or_walking(self):
+        self.write("Waves/tides.txt")
+        self.assertEqual(self.build("home")[0], (1, 0))
+        self.forbidden.add("office")
+        self.measure("office")
+        with self.at("office"):
+            told = self.exchange("office")
+            self.assertTrue(told.steps("receive", "apply"))
+        self.assertEqual(told.counts["received"], 1)
+        self.assertEqual(self.found("office", "northern harbours"), ["tides.txt"])
+        self.assertEqual(self.read["office"], [])
+        self.sound("office")
+
+    def test_a_file_replaced_at_the_same_size_and_date_takes_nothing(self):
+        rel = "Waves/tides.txt"
+        self.write(rel)
+        self.assertEqual(self.build("home")[0], (1, 0))
+        self.forbidden.add("office")
+        self.measure("office")
+        path = self.machines["office"]["shelf"] / rel
+        db = self.machines["office"]["db"]
+        before = path.stat()
+        remembered = db.execute("SELECT dev,ino FROM files WHERE rel=?", (rel,)).fetchone()
+        self.assertEqual((remembered["dev"], remembered["ino"]), (before.st_dev, before.st_ino))
+        other = TEXTS[rel].replace("northern", "southern")
+        self.assertEqual(len(other), len(TEXTS[rel]))
+        swapped = path.with_name(".tides-next.txt")
+        swapped.write_text(other)
+        os.utime(swapped, (WHEN, WHEN))
+        os.replace(swapped, path)
+        os.utime(path, (WHEN, WHEN))
+        self.assertNotEqual(path.stat().st_ino, before.st_ino)
+        with self.at("office"):
+            told = self.exchange("office")
+            self.assertTrue(told.steps("receive", "apply"))
+        self.assertEqual(told.counts["received"], 0)
+        self.assertEqual(self.found("office", "northern harbours"), [])
+        self.assertEqual(self.read["office"], [])
+        self.sound("office")
+
+    def test_pages_wait_until_the_inventory_has_recorded_an_identity(self):
+        rel = "Waves/tides.txt"
+        self.write(rel)
+        self.build("home")
+        self.forbidden.add("office")
+        self.measure("office")
+        db = self.machines["office"]["db"]
+        with db:
+            db.execute("UPDATE files SET dev=NULL,ino=NULL WHERE rel=?", (rel,))
+        with self.at("office"):
+            told = self.exchange("office")
+            self.assertTrue(told.steps("receive", "apply"))
+        self.assertEqual((told.counts["received"], self.found("office", "northern harbours")), (0, []))
+        self.assertTrue(db.execute("SELECT sum FROM files WHERE rel=?", (rel,)).fetchone()["sum"])
+        self.sound("office")
+
+    def test_an_index_of_the_previous_format_gains_the_identity_of_its_files(self):
+        data = self.base / "previous"
+        data.mkdir()
+        text = store.SCHEMA.replace(", dev INTEGER, ino INTEGER", "").replace(
+            f"PRAGMA user_version={store.FORMAT};", f"PRAGMA user_version={store.PREVIOUS};")
+        old = sqlite3.connect(data / store.INDEX)
+        old.execute("PRAGMA journal_mode=WAL")
+        old.executescript(text)
+        old.close()
+        opened = store.connect(data)
+        self.addCleanup(opened.close)
+        columns = [row[1] for row in opened.execute("PRAGMA table_info(files)")]
+        self.assertEqual(opened.execute("PRAGMA user_version").fetchone()[0], store.FORMAT)
+        self.assertEqual(columns[-2:], ["dev", "ino"])
+        self.assertTrue(store.suits(opened))
 
     def test_a_sync_whose_transfer_fails_says_so_in_its_exit_code(self):
         self.shelf()

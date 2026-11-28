@@ -6,21 +6,56 @@ import os
 import shlex
 import sqlite3
 import subprocess
+import sys
 import threading
+import time
 from dataclasses import dataclass
 
-from .. import desktop, history, search, sources, store
+from .. import desktop, history, machine, parcels, search, sharing, sources, store
 from ..config import KEYS
 from ..query import split
 from ..text import safe
-from ..tui import style
+from ..tui import report, style
 from ..tui.app import App, Terminal
 from ..tui.keys import Key
 from .model import Model, update
 from .view import Look, frame
 from .worker import Reply, Searches
 
+EXCHANGE = 600          # seconds between two exchanges started by the panel, as on the command line
+
 __all__ = ["panel"]
+
+
+@dataclass(frozen=True)
+class Brought:
+    """An exchange started by the panel has written something: the band looks again."""
+
+
+def stamps(directory):
+    """The dates of the two notes an exchange rewrites, so a change can be seen without reading them."""
+    found = []
+    for name in ("share.json", parcels.TEXTS):
+        try:
+            found.append((directory / name).stat().st_mtime_ns)
+        except OSError:
+            found.append(0)
+    return tuple(found)
+
+
+def follow_exchange(directory, settings):
+    """Start an exchange when the last one is old, in a process that outlives the band.
+    Returns the dates of the notes as they were before it, or None when none was started."""
+    if sharing.carrier(settings) is None or time.time() - sharing.last(directory).get("synced", 0) < EXCHANGE:
+        return None
+    seen = stamps(directory)
+    try:
+        subprocess.Popen([sys.executable, "-m", "shelffind", "--data-dir", str(directory), "sync", "--quiet"],
+                         start_new_session=True, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                         stderr=subprocess.DEVNULL)
+    except OSError:
+        return None
+    return seen
 
 
 @dataclass(frozen=True)
@@ -46,6 +81,14 @@ def prepare(db, directory, query, options, settings):
     model.formats = [None] + [r[0] for r in db.execute(
         "SELECT DISTINCT format FROM files WHERE format!='' ORDER BY format")]
     model.files = db.execute("SELECT count(*) FROM files").fetchone()[0]
+    model.waiting = db.execute("SELECT count(*) FROM docs WHERE state IN ('pending','error')").fetchone()[0]
+    if sharing.carrier(settings) is not None:
+        try:
+            model.company = report.company(machine.identity(directory), sharing.last(directory),
+                                           names=settings.tables["machines"], texts=sharing.texts_last(directory),
+                                           unicode=unicode_signs(settings))
+        except OSError:
+            pass
     try:
         model.channels.extend(sources.registered(directory))
     except (OSError, ValueError):
@@ -203,6 +246,22 @@ def panel(db, directory, query, options, settings, enter="open", quote=False, wi
     def handle(event):
         if isinstance(event, Done):
             return finished(event)
+        if isinstance(event, Brought):
+            try:
+                model.company = report.company(machine.identity(directory), sharing.last(directory),
+                                               names=settings.tables["machines"], texts=sharing.texts_last(directory),
+                                               unicode=look.unicode)
+            except OSError:
+                pass
+            note = machine.read(directory / parcels.TEXTS)
+            if note.get("held"):
+                model.notice = "An indexing is running, so the pages from the other machines wait"
+            elif note.get("received"):
+                model.notice = ""
+                if model.mode == "search":
+                    model.version = searches.submit(model.query, model.options)
+                    model.busy, model.fresh, model.message = True, True, ""
+            return False
         if isinstance(event, Reply):
             model.offers = sources.offers(directory)    # a source just asked may have told its actions
         for effect in update(model, event, keymap):
@@ -230,11 +289,26 @@ def panel(db, directory, query, options, settings, enter="open", quote=False, wi
     def draw(cols, rows):
         return [theme.render(pieces, base) for pieces, base in frame(model, cols, rows, look)]
 
+    stop = threading.Event()
+    seen = follow_exchange(directory, settings)
+
+    def follow():
+        current = seen
+        while not stop.wait(0.3):
+            now = stamps(directory)
+            if now != current:
+                current = now
+                app.post(Brought())
+
+    watcher = threading.Thread(target=follow, daemon=True) if seen is not None else None
     try:
         model.version = searches.submit(model.query, model.options)
         model.busy = True
+        if watcher is not None:
+            watcher.start()
         app.run(handle, draw)
     finally:
+        stop.set()
         searches.close()
         terminal.close()
     if app.stopped_by:

@@ -148,6 +148,15 @@ class Keys(unittest.TestCase):
         model.query = "nothing"
         update(model, Reply(7, [], "", 0.01), KEYMAP)
         self.assertEqual(model.message, "No matches")
+        model.waiting = 4
+        update(model, Reply(7, [], "", 0.01), KEYMAP)
+        self.assertEqual(model.message, "No matches. 4 documents still have no text")
+        model.waiting = 1
+        update(model, Reply(7, [], "", 0.01), KEYMAP)
+        self.assertEqual(model.message, "No matches. 1 document still has no text")
+        model.options["where"] = "name"
+        update(model, Reply(7, [], "", 0.01), KEYMAP)
+        self.assertEqual(model.message, "No matches")
 
 
 class Frames(unittest.TestCase):
@@ -184,6 +193,12 @@ class Frames(unittest.TestCase):
             "│ ~/Books/Waves/Lamb-Hydrodynamics-CUP-1932.pdf",
             "│ 1.2 MB · 2023-11-14 · passage",
         ])
+
+    def test_the_first_line_names_the_machines(self):
+        model = self.model(company="home (here) · texts 2 h ago", notice="An indexing is running, so the pages from the other machines wait")
+        line = plain(frame(model, 160, 10, self.look))[1]
+        self.assertIn("home (here)", line)
+        self.assertIn("pages from the other machines wait", line)
 
     def test_the_prompt_says_when_the_search_is_exact(self):
         model = self.model()

@@ -326,6 +326,10 @@ def header(model, look, width):
         extra = [c for c in model.channels if c not in (None, "files")]
         if extra:
             left.append((dot + ", ".join(safe(c) for c in extra), "muted"))
+        if model.company:
+            left.append((dot + model.company, "muted"))
+        if model.notice:
+            left.append((dot + model.notice, "warning"))
         hints = [("open", "open"), ("address", "address"), ("scope", "scope"), ("help", "keys")]
     left = cut(left, max(1, width * 2 // 3 if model.mode in ("passages", "reading") else width), look.sign("dots"))
     words = [f"{look.key(action)} {word}" for action, word in hints if look.key(action)]

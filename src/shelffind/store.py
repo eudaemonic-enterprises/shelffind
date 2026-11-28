@@ -54,7 +54,8 @@ from .config import expand
 from .extract import file_format
 
 INDEX, EARLIER = "index2.sqlite3", "index.sqlite3"
-FORMAT = 3
+FORMAT = 4
+PREVIOUS = 3          # an index of this format gains the identity of each file and is then this one
 RETIRED = 101           # the format number of an earlier index once it has been converted
 KEEP = 30 * 86400       # seconds a document keeps its text after its last file has gone
 SUMS = ("md5:", "sha256:")      # the checksums of a whole file that documents are known by
@@ -87,7 +88,8 @@ CREATE TABLE files (
     id INTEGER PRIMARY KEY, root INTEGER NOT NULL REFERENCES roots ON DELETE CASCADE,
     rel TEXT NOT NULL, name TEXT NOT NULL, folded TEXT NOT NULL, format TEXT NOT NULL, size INTEGER NOT NULL,
     mtime INTEGER NOT NULL, doc INTEGER NOT NULL REFERENCES docs,
-    read INTEGER NOT NULL DEFAULT 0, sum TEXT, asked TEXT NOT NULL DEFAULT '', UNIQUE(root, rel)
+    read INTEGER NOT NULL DEFAULT 0, sum TEXT, asked TEXT NOT NULL DEFAULT '', dev INTEGER, ino INTEGER,
+    UNIQUE(root, rel)
 );
 CREATE INDEX files_doc ON files(doc);
 CREATE VIRTUAL TABLE names USING fts5(name, folder, title, byline, tokenize='unicode61 remove_diacritics 2');
@@ -130,7 +132,7 @@ CREATE TABLE record_keys (
     key TEXT NOT NULL, record INTEGER NOT NULL REFERENCES records ON DELETE CASCADE, PRIMARY KEY (key, record)
 ) WITHOUT ROWID;
 CREATE INDEX record_keys_record ON record_keys(record);
-PRAGMA user_version=3;
+PRAGMA user_version=4;
 """
 
 
@@ -214,6 +216,8 @@ def connect(directory, upgrade=True):
             if db.execute("PRAGMA user_version").fetchone()[0] == 0:
                 db.execute("PRAGMA journal_mode=WAL")
                 db.executescript("BEGIN IMMEDIATE;\n" + SCHEMA + "\nCOMMIT;")
+    elif version == PREVIOUS and remember_identity(directory, db) and suits(db):
+        pass
     elif not suits(db):
         db.close()
         raise unusable(filename, version)
@@ -230,6 +234,37 @@ def layout(db):
     words = {name for kind, name, sql in listed if sql.upper().startswith("CREATE VIRTUAL TABLE")}
     beside = lambda name: name.rpartition("_")[0] in words and name.rpartition("_")[2] in ("config", "content", "data", "docsize", "idx")
     return sorted(one for one in listed if not one[1].startswith("sqlite_") and not beside(one[1]))
+
+
+def previous_layout():
+    """What an index of the previous format declares, so that one can gain the identity of
+    its files. Computed once from the schema of this version with those columns taken out."""
+    if not hasattr(previous_layout, "found"):
+        model = open_index(":memory:")
+        try:
+            text = SCHEMA.replace(", dev INTEGER, ino INTEGER", "").replace(
+                f"PRAGMA user_version={FORMAT};", f"PRAGMA user_version={PREVIOUS};")
+            model.executescript(text)
+            previous_layout.found = layout(model)
+        finally:
+            model.close()
+    return previous_layout.found
+
+
+def remember_identity(directory, db):
+    """Give an index of the previous format the device and the inode of each file. The columns
+    are empty until the next inventory, which is what an exchange compares. An index laid out
+    otherwise is left untouched. Returns whether this index is now one of the present format."""
+    with (Path(directory) / "schema.lock").open("a") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        if db.execute("PRAGMA user_version").fetchone()[0] != PREVIOUS or layout(db) != previous_layout():
+            return False
+        db.execute("BEGIN IMMEDIATE")
+        db.execute("ALTER TABLE files ADD COLUMN dev INTEGER")
+        db.execute("ALTER TABLE files ADD COLUMN ino INTEGER")
+        db.execute(f"PRAGMA user_version={FORMAT}")
+        db.execute("COMMIT")
+        return True
 
 
 def suits(db):
@@ -1114,10 +1149,10 @@ def tend_orphans(db, root=None, now=None, forget=True):
 def scan(db, root, directory, seen=None):
     """Only a complete enumeration may retire an indexed path. With `seen`, what tells each file
     of the folder apart from another put at its address is kept there, by (folder, address)."""
-    found = {} if seen is not None else None
-    entries = inventory(root, directory.resolve(), found)
+    idents = {}
+    entries = inventory(root, directory.resolve(), idents)
     if seen is not None:
-        seen.update({(root["id"], rel): itself for rel, itself in found.items()})
+        seen.update({(root["id"], rel): itself for rel, itself in idents.items()})
     existing = {r["rel"]: r for r in db.execute("SELECT * FROM files WHERE root=?", (root["id"],))}
     known = set()
     with db:
@@ -1132,15 +1167,21 @@ def scan(db, root, directory, seen=None):
         fresh = []
         for rel, (size, mtime) in entries.items():
             old = existing.pop(rel, None)
-            if not old or (size, mtime) != (old["size"], old["mtime"]):
-                fresh.append((rel, size, mtime, old))
+            identity = idents[rel]
+            # The same size and the same date with another identity on the disk is another file
+            # put at that address. It starts again, as a file that changed does.
+            replaced = old is not None and old["dev"] is not None and (old["dev"], old["ino"]) != identity
+            if not old or (size, mtime) != (old["size"], old["mtime"]) or replaced:
+                fresh.append((rel, size, mtime, identity, old))
+            elif old["dev"] is None:
+                db.execute("UPDATE files SET dev=?,ino=? WHERE id=?", (*identity, old["id"]))
         # A file is new at its address, changed there, or gone from it. Each document that
         # lost a file is put in order once, when all the addresses have been gone through.
         left = set()
         for old in existing.values():
             left.add(leave(db, old["id"]))
             db.execute("DELETE FROM files WHERE id=?", (old["id"],))
-        for rel, size, mtime, old in fresh:
+        for rel, size, mtime, identity, old in fresh:
             # New at its address, or changed there: a document of its own, whatever its name,
             # its size and its date resemble. What it holds is compared afterwards.
             path = Path(rel)
@@ -1149,13 +1190,15 @@ def scan(db, root, directory, seen=None):
                 # What was measured of the file, and what was said of it, was of other bytes.
                 left.add(leave(db, old["id"]))
                 doc = new_document(db, size, fmt)
-                db.execute("UPDATE files SET size=?,mtime=?,format=?,doc=?,read=0,sum=NULL,asked='' WHERE id=?",
-                           (size, mtime, fmt, doc, old["id"]))
+                db.execute("UPDATE files SET size=?,mtime=?,dev=?,ino=?,format=?,doc=?,read=0,sum=NULL,asked='' "
+                           "WHERE id=?", (size, mtime, identity[0], identity[1], fmt, doc, old["id"]))
                 db.execute("UPDATE names SET title='',byline='' WHERE rowid=?", (old["id"],))
                 continue
             doc = new_document(db, size, fmt)
-            cur = db.execute("INSERT INTO files(root,rel,name,folded,format,size,mtime,doc) VALUES(?,?,?,?,?,?,?,?)",
-                             (root["id"], rel, path.name, fuzzy.fold(path.name), fmt, size, mtime, doc))
+            cur = db.execute("INSERT INTO files(root,rel,name,folded,format,size,mtime,dev,ino,doc) "
+                             "VALUES(?,?,?,?,?,?,?,?,?,?)",
+                             (root["id"], rel, path.name, fuzzy.fold(path.name), fmt, size, mtime,
+                              identity[0], identity[1], doc))
             folder = str(Path(Path(root["path"]).name) / path.parent)
             fuzzy.remember_names(db, (terms_for_name(path.name), terms_for_name(folder)), known)
             db.execute("INSERT INTO names(rowid,name,folder,title,byline) VALUES(?,?,?,'','')",

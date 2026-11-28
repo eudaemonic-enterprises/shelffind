@@ -44,6 +44,7 @@ Folders and index
   shelffind roots add FOLDER...   |  roots remove FOLDER  |  roots list
   shelffind index                             refresh names, then read the text of new documents
   shelffind index --names-only  |  --limit N  |  --retry  |  --ocr --lang eng+fra
+  shelffind sync                              bring the journal and the pages read elsewhere into this search
   shelffind status [--json] [--errors]        what is read, what waits, what failed
   shelffind upgrade [--discard-old]           convert an index of the earlier format
   shelffind sources add NAME PROGRAM | remove NAME | list | check NAME [WORDS]

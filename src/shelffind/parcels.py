@@ -25,11 +25,14 @@ another time, and one of a newer format waits for a newer version of ShelfFind. 
 parcel names a file or a folder; its pages carry the whole text that was read. The shared place
 is trusted: anyone who may write there may put texts there.
 
-Taking a parcel only remembers what it offers. The pages are given by a run of the index, once
-its inventory is made and its sources asked, to the document that a measure of this machine
-knows by the same checksums, when that document has a file, waits for its text, and is not
-left to a source that holds its text (`store.taker`, `store.take_pages`): a document without
-pages takes the reading whole; one with pages takes, page by page, the pages it still has to
+Taking a parcel only remembers what it offers. The pages are given by an exchange, and by a run
+of the index once its inventory is made and its sources asked, to the document that a measure
+of this machine knows by the same checksums, when that document has a file, waits for its text,
+and is not left to a source that holds its text (`store.taker`, `store.take_pages`). An exchange
+gives them without walking the shelves: every file of the document that is at hand must still
+be the one the last inventory listed, the same size, the same date and the same identity on
+the disk, and a file whose identity has not been recorded yet waits for that inventory. A
+document without pages takes the reading whole; one with pages takes, page by page, the pages it still has to
 recognise from a reading of the same pages, so that the recognised pages of several machines
 add up. What cannot be given yet stays offered: a complete run compares the files of the sizes
 and formats offered (`indexer.waiting`), and a file copied for its reading, whose bytes another
@@ -427,7 +430,8 @@ class Exchange:
         self.took = time.monotonic() - began
         self.last = time.monotonic()
         try:
-            machine.write(self.directory, {"at": int(time.time()), "took": round(self.took, 1)}, TEXTS)   # for `status`, and the next run
+            machine.write(self.directory, {"at": int(time.time()), "took": round(self.took, 1),
+                                            "received": self.counts["received"]}, TEXTS)
         except OSError:
             pass
         return True
@@ -894,7 +898,8 @@ class Exchange:
             store.afresh(self.db, file["id"])   # whatever stands there now is measured anew, whatever its size and date
             return False
 
-        for file in self.db.execute("SELECT id,root,rel,size,mtime FROM files WHERE doc=?", (doc,)).fetchall():
+        unknown = False
+        for file in self.db.execute("SELECT id,root,rel,size,mtime,dev,ino FROM files WHERE doc=?", (doc,)).fetchall():
             held = self.held.get(file["id"])
             if held is not None and not held[1]():
                 return refused(file)
@@ -910,10 +915,17 @@ class Exchange:
                 continue
             except OSError:
                 return False
+            identity = (info.st_dev, info.st_ino)
+            known = file["dev"] is not None and file["ino"] is not None
             if stat.S_ISLNK(info.st_mode) or (info.st_size, info.st_mtime_ns) != (file["size"], file["mtime"]) \
-                    or info.st_ctime_ns > self.began or itself is not None and (info.st_dev, info.st_ino) != itself:
+                    or info.st_ctime_ns > self.began or itself is not None and identity != itself \
+                    or itself is None and known and identity != (file["dev"], file["ino"]):
                 return refused(file)
-        return True
+            # No identity was recorded: the pages wait for an inventory, and the file is not
+            # started again, since nothing yet says that another file stands there.
+            if itself is None and not known:
+                unknown = True
+        return not unknown
 
     def offer(self, doc, file=None, still=None):
         """Whether a document whose file `file` was just copied for its reading, and measured,

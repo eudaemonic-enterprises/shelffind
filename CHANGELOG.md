@@ -6,6 +6,22 @@ ShelfFind follows semantic versioning. Before version 1.0 a minor version may ch
 JSON keys and the exit codes that other programs rely on are kept from one version to the next and
 are covered by tests.
 
+## 0.6.0
+
+An exchange places the pages it has just taken into the search on this disk, so a page read on one
+machine is found on the others without a further indexing and without walking the shelves. The page
+goes to the document that a measure of this machine already knows by the same checksums, when that
+document waits for its text and no source holds it, and when every file of it that is at hand is
+still the one the last inventory listed: the same size, the same date, and the same identity on the
+disk. A file replaced by other bytes of the same size and the same date is refused, and measured
+anew at the next indexing. A file whose identity the inventory has not yet recorded waits for that
+inventory. An index of the previous format gains the two columns at its next opening, empty until
+then. The panel starts the exchange when it opens, when the last one is more than ten minutes old,
+and answers at once from what is already here; when the pages have been placed and the question has
+not changed, it searches again. The first line of the band names the machines and says how long ago
+this one took their texts. While an indexing holds the search, the pages wait and the band says so.
+A search that finds no passage says how many documents still have no text.
+
 ## 0.5.1
 
 The languages of the recognition of scanned pages are a setting, `index.ocr` (`eng` by default, for
